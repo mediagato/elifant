@@ -1,0 +1,41 @@
+{
+  "name": "@mediagato/elifant",
+  "version": "0.3.0-dev.3",
+  "description": "Local-first PGlite database kernel for persistent state, memories, and seed templates in Node.js applications. Signed export/import portability plus snapshot/rollback/health primitives. Reference implementation of the Elifantic protocol v0.1 storage layer.",
+  "main": "src/index.js",
+  "types": "src/index.d.ts",
+  "files": [
+    "src/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "keywords": [
+    "pglite",
+    "postgres",
+    "memory",
+    "local-first",
+    "mcp",
+    "mediagato"
+  ],
+  "author": "Steve Kingsley <steve@mediagato.com>",
+  "license": "BUSL-1.1",
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com",
+    "access": "restricted"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mediagato/elifant.git"
+  },
+  "homepage": "https://github.com/mediagato/elifant",
+  "bugs": "https://github.com/mediagato/elifant/issues",
+  "dependencies": {
+    "@electric-sql/pglite": "^0.2.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
