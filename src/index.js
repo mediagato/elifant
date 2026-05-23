@@ -38,11 +38,15 @@ let _ready = false;
  */
 async function init(dataDir) {
   const { PGlite } = require('@electric-sql/pglite');
+  const { vector } = require('@electric-sql/pglite/vector');
 
   _dbPath = path.join(dataDir, 'brain');
   fs.mkdirSync(_dbPath, { recursive: true });
 
-  _db = new PGlite(_dbPath);
+  _db = new PGlite(_dbPath, { extensions: { vector } });
+
+  // pgvector must be enabled before any vector(N) columns are declared.
+  await _db.exec(`CREATE EXTENSION IF NOT EXISTS vector;`);
 
   await _db.exec(`
     CREATE TABLE IF NOT EXISTS state (
@@ -60,7 +64,8 @@ async function init(dataDir) {
       updated_by TEXT,
       updated_at TEXT NOT NULL,
       layer TEXT DEFAULT 'instance',
-      anonymizable BOOLEAN DEFAULT true
+      anonymizable BOOLEAN DEFAULT true,
+      embedding vector(384)
     );
 
     CREATE TABLE IF NOT EXISTS steering (
@@ -90,6 +95,10 @@ async function init(dataDir) {
       value TEXT NOT NULL
     );
   `);
+
+  // Migration: add embedding column if upgrading from a 0.3.x database that
+  // pre-dates pgvector. Idempotent.
+  await _db.exec(`ALTER TABLE memories ADD COLUMN IF NOT EXISTS embedding vector(384);`);
 
   _ready = true;
   // _debug writes to stderr (never stdout) so MCP servers using stdio transport
@@ -169,23 +178,113 @@ async function getMemory(filename) {
   return result.rows[0] || null;
 }
 
-async function setMemory(filename, content, updatedBy = 'brain', layer = 'instance') {
+// Format a JS number[] as the canonical pgvector literal string '[1,2,3]'.
+// Rejects non-finite values so we don't poison the index with NaN/Infinity.
+function _vectorLiteral(arr) {
+  if (!Array.isArray(arr)) throw new Error('embedding must be a number array');
+  for (const x of arr) {
+    if (typeof x !== 'number' || !Number.isFinite(x)) {
+      throw new Error('embedding contains non-finite values');
+    }
+  }
+  return `[${arr.join(',')}]`;
+}
+
+async function setMemory(filename, content, updatedBy = 'brain', layer = 'instance', embedding = null) {
   _ensure();
+  if (embedding == null) {
+    await _db.query(`
+      INSERT INTO memories (filename, content, updated_by, updated_at, layer)
+      VALUES ($1, $2, $3, $4, $5)
+      ON CONFLICT(filename) DO UPDATE SET
+        content = EXCLUDED.content,
+        updated_by = EXCLUDED.updated_by,
+        updated_at = EXCLUDED.updated_at,
+        layer = EXCLUDED.layer
+    `, [filename, content, updatedBy, _ts(), layer]);
+    return;
+  }
+  const vec = _vectorLiteral(embedding);
   await _db.query(`
-    INSERT INTO memories (filename, content, updated_by, updated_at, layer)
-    VALUES ($1, $2, $3, $4, $5)
+    INSERT INTO memories (filename, content, updated_by, updated_at, layer, embedding)
+    VALUES ($1, $2, $3, $4, $5, $6::vector)
     ON CONFLICT(filename) DO UPDATE SET
       content = EXCLUDED.content,
       updated_by = EXCLUDED.updated_by,
       updated_at = EXCLUDED.updated_at,
-      layer = EXCLUDED.layer
-  `, [filename, content, updatedBy, _ts(), layer]);
+      layer = EXCLUDED.layer,
+      embedding = EXCLUDED.embedding
+  `, [filename, content, updatedBy, _ts(), layer, vec]);
+}
+
+// Update only the embedding for an existing memory. Used by callers that
+// embed asynchronously (after save) or by backfill workers running over
+// memories that pre-date the embedding column. Silently no-ops if the
+// memory doesn't exist.
+async function setMemoryEmbedding(filename, embedding) {
+  _ensure();
+  const vec = _vectorLiteral(embedding);
+  await _db.query(
+    'UPDATE memories SET embedding = $1::vector WHERE filename = $2',
+    [vec, filename]
+  );
+}
+
+// Return up to `limit` memories that don't have an embedding yet, oldest
+// first (so backfill makes steady progress over the long tail). Returns
+// {filename, content} pairs the caller can embed and feed back via
+// setMemoryEmbedding.
+async function getMemoriesNeedingEmbedding(limit = 50) {
+  _ensure();
+  const result = await _db.query(
+    'SELECT filename, content FROM memories WHERE embedding IS NULL ORDER BY updated_at ASC LIMIT $1',
+    [limit]
+  );
+  return result.rows;
 }
 
 async function getAllMemories() {
   _ensure();
   const result = await _db.query('SELECT filename, layer, updated_at FROM memories ORDER BY filename');
   return result.rows;
+}
+
+// Semantic search over memories. Returns top-K rows ordered by cosine
+// distance to the query embedding (smaller = more similar). Memories
+// without an embedding are excluded from results. Optional filters narrow
+// by layer ('instance' | 'pattern') and/or filename prefix.
+//
+// Returns: [{ filename, content, layer, updated_at, distance }]
+//   - distance is the raw pgvector cosine distance (0 = identical,
+//     2 = opposite). Score-as-similarity = 1 - distance/2.
+async function searchMemories({ queryEmbedding, k = 5, layer = null, prefix = null } = {}) {
+  _ensure();
+  if (!queryEmbedding) throw new Error('searchMemories: queryEmbedding is required');
+  const vec = _vectorLiteral(queryEmbedding);
+
+  const where = ['embedding IS NOT NULL'];
+  const params = [vec];
+  let nextParam = 2;
+  if (layer) { where.push(`layer = $${nextParam++}`); params.push(layer); }
+  if (prefix) { where.push(`filename LIKE $${nextParam++}`); params.push(`${prefix}%`); }
+  params.push(k);
+
+  const sql = `
+    SELECT filename, content, layer, updated_at,
+           (embedding <=> $1::vector) AS distance
+    FROM memories
+    WHERE ${where.join(' AND ')}
+    ORDER BY embedding <=> $1::vector
+    LIMIT $${nextParam}
+  `;
+  const result = await _db.query(sql, params);
+  return result.rows.map(r => ({
+    filename: r.filename,
+    content: r.content,
+    layer: r.layer,
+    updated_at: r.updated_at,
+    distance: Number(r.distance),
+  }));
 }
 
 async function deleteMemory(filename) {
@@ -902,6 +1001,9 @@ module.exports = {
   deleteState,
   getMemory,
   setMemory,
+  setMemoryEmbedding,
+  getMemoriesNeedingEmbedding,
+  searchMemories,
   deleteMemory,
   getAllMemories,
   seedFromSpore,

@@ -87,9 +87,16 @@ await brain.close();
 
 ### Memories
 - `getMemory(filename)` — return `{ content, layer, updated_at }` or `null`.
-- `setMemory(filename, content, updatedBy?, layer?)` — upsert. Layer defaults to `'instance'`.
+- `setMemory(filename, content, updatedBy?, layer?, embedding?)` — upsert. Layer defaults to `'instance'`. Optional embedding is a `number[]` of dimension 384.
 - `getAllMemories()` — return metadata for all memories (filename, layer, updated_at).
 - `deleteMemory(filename)` — remove by filename.
+
+### Semantic search (v0.4+)
+Powered by pgvector. The memories table has an `embedding vector(384)` column; callers supply the embeddings (the kernel itself never runs a model -- bring your own embedder, e.g. `Xenova/all-MiniLM-L6-v2` for 384-d vectors).
+
+- `setMemoryEmbedding(filename, embedding)` — update only the embedding for an existing memory. Use after async embed-on-save flows.
+- `getMemoriesNeedingEmbedding(limit?)` — return up to `limit` memories with NULL embeddings, oldest first. Use for backfill workers.
+- `searchMemories({ queryEmbedding, k?, layer?, prefix? })` — return top-K hits ordered by cosine distance. Hits include `filename`, `content`, `layer`, `updated_at`, and the raw pgvector `distance` (0 = identical, 2 = opposite). Memories without an embedding are excluded.
 
 ### Seed
 - `seedFromSpore(sporeData)` — idempotent insert of pattern-layer templates. Pass `{ state, memories, steering }`. Returns the count of rows attempted.

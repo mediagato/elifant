@@ -385,18 +385,53 @@ export function getAllState(): Promise<StateListRow[]>;
 /** Delete a state row. No-op if it doesn't exist. */
 export function deleteState(key: string): Promise<void>;
 
-// ── Memory (filename/content) ─────────────────────────────────────────────
+// -- Memory (filename/content) ---------------------------------------------
 
 /** Get a memory by filename. Returns null if not found. */
 export function getMemory(filename: string): Promise<MemoryRow | null>;
 
-/** Upsert a memory. */
+/**
+ * Upsert a memory. An optional embedding (number[] of dim 384) can be
+ * supplied at write time; if omitted, the row is stored without one and
+ * can be filled in later via setMemoryEmbedding.
+ */
 export function setMemory(
   filename: string,
   content: string,
   updatedBy?: string,
-  layer?: Layer
+  layer?: Layer,
+  embedding?: number[] | null
 ): Promise<void>;
+
+/** Update only the embedding column for an existing memory. No-op if filename doesn't exist. */
+export function setMemoryEmbedding(filename: string, embedding: number[]): Promise<void>;
+
+/**
+ * Return memories that don't have an embedding yet (oldest first).
+ * Use for backfill workers that compute embeddings asynchronously.
+ */
+export function getMemoriesNeedingEmbedding(limit?: number): Promise<{ filename: string; content: string }[]>;
+
+/** A row returned from searchMemories. distance is pgvector cosine distance (0=identical, 2=opposite). */
+export interface MemorySearchHit {
+  filename: string;
+  content: string;
+  layer: Layer;
+  updated_at: string;
+  distance: number;
+}
+
+/**
+ * Semantic search over memories. Returns top-k hits ordered by cosine
+ * distance to queryEmbedding. Memories without an embedding are excluded.
+ * Optional filters narrow by layer and/or filename prefix.
+ */
+export function searchMemories(options: {
+  queryEmbedding: number[];
+  k?: number;
+  layer?: Layer | null;
+  prefix?: string | null;
+}): Promise<MemorySearchHit[]>;
 
 /** Return all memory metadata (NO content) ordered by filename. */
 export function getAllMemories(): Promise<MemoryListRow[]>;

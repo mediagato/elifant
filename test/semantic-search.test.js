@@ -1,0 +1,172 @@
+/**
+ * Tests for v0.4.0 semantic-search additions: pgvector init, embedding
+ * column on memories, setMemoryEmbedding, getMemoriesNeedingEmbedding,
+ * and searchMemories ordering + filters.
+ *
+ * Embeddings are synthetic (not from a real model) -- we only need
+ * controlled cosine-distance relationships to verify ordering. Real
+ * models live in the consuming app, not the kernel.
+ *
+ * Run with: node --test test/semantic-search.test.js
+ */
+const { test } = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+
+const brain = require('../src/index.js');
+
+const DIM = 384;
+
+function tmpDir() {
+  return fs.mkdtempSync(path.join(os.tmpdir(), 'brain-vec-'));
+}
+
+// Build a synthetic embedding: place magnitude `weight` on axis `axis`,
+// zeros elsewhere. Used to construct controlled cosine relationships.
+function axisVec(axis, weight = 1.0, dim = DIM) {
+  const v = new Array(dim).fill(0);
+  v[axis] = weight;
+  return v;
+}
+
+// Normalize so cosine distance from pgvector is well-behaved (the model
+// in production also returns normalized embeddings).
+function normalize(v) {
+  const norm = Math.sqrt(v.reduce((s, x) => s + x * x, 0));
+  if (norm === 0) return v;
+  return v.map((x) => x / norm);
+}
+
+test('init enables pgvector + memories.embedding column exists', async () => {
+  const dir = tmpDir();
+  await brain.init(dir);
+  // If pgvector wasn't loaded, a CREATE EXTENSION vector statement would
+  // have thrown during init. Verify the column is there + can accept a vector.
+  await brain.setMemory('probe.md', 'probe body', 'test', 'instance', normalize(axisVec(0)));
+  await brain.close();
+});
+
+test('setMemory stores embedding when supplied', async () => {
+  const dir = tmpDir();
+  await brain.init(dir);
+
+  const vec = normalize(axisVec(5, 1.0));
+  await brain.setMemory('with-vec.md', 'content', 'test', 'instance', vec);
+
+  // searchMemories with the same vector should put with-vec.md first.
+  const hits = await brain.searchMemories({ queryEmbedding: vec, k: 1 });
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].filename, 'with-vec.md');
+  assert.ok(hits[0].distance < 0.001, `expected tiny distance, got ${hits[0].distance}`);
+  await brain.close();
+});
+
+test('setMemory without embedding stores NULL embedding (searchable via backfill)', async () => {
+  const dir = tmpDir();
+  await brain.init(dir);
+
+  await brain.setMemory('no-vec.md', 'just text');
+
+  // searchMemories excludes NULL-embedding rows
+  const hits = await brain.searchMemories({ queryEmbedding: normalize(axisVec(0)), k: 5 });
+  assert.equal(hits.length, 0, 'NULL-embedding rows must be excluded from search');
+
+  // ...but it shows up in the backfill queue
+  const todo = await brain.getMemoriesNeedingEmbedding(10);
+  assert.equal(todo.length, 1);
+  assert.equal(todo[0].filename, 'no-vec.md');
+  assert.equal(todo[0].content, 'just text');
+  await brain.close();
+});
+
+test('setMemoryEmbedding fills in a missing embedding + memory becomes searchable', async () => {
+  const dir = tmpDir();
+  await brain.init(dir);
+
+  await brain.setMemory('late-vec.md', 'late content');
+  const vec = normalize(axisVec(42));
+  await brain.setMemoryEmbedding('late-vec.md', vec);
+
+  const hits = await brain.searchMemories({ queryEmbedding: vec, k: 1 });
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].filename, 'late-vec.md');
+
+  // And it should be gone from the backfill queue
+  const todo = await brain.getMemoriesNeedingEmbedding(10);
+  assert.equal(todo.length, 0);
+  await brain.close();
+});
+
+test('searchMemories returns top-k ordered by cosine distance', async () => {
+  const dir = tmpDir();
+  await brain.init(dir);
+
+  // Put three memories on three different axes. Query along axis 0 with a
+  // small noise component on axis 1 so the ordering is unambiguous.
+  await brain.setMemory('close.md', 'on axis 0', 'test', 'instance', normalize(axisVec(0)));
+  await brain.setMemory('orthogonal.md', 'on axis 1', 'test', 'instance', normalize(axisVec(1)));
+  await brain.setMemory('far.md', 'on axis 2', 'test', 'instance', normalize(axisVec(2)));
+
+  const hits = await brain.searchMemories({
+    queryEmbedding: normalize(axisVec(0)),
+    k: 3,
+  });
+  assert.equal(hits.length, 3);
+  assert.equal(hits[0].filename, 'close.md', 'closest should rank first');
+  // The two orthogonal vectors are tied at distance ~1; just assert close.md beats them.
+  assert.ok(hits[0].distance < hits[1].distance);
+  assert.ok(hits[0].distance < hits[2].distance);
+  await brain.close();
+});
+
+test('searchMemories filters by layer', async () => {
+  const dir = tmpDir();
+  await brain.init(dir);
+  const vec = normalize(axisVec(0));
+
+  await brain.setMemory('inst.md', 'instance row', 'test', 'instance', vec);
+  await brain.setMemory('pat.md', 'pattern row', 'test', 'pattern', vec);
+
+  const instHits = await brain.searchMemories({ queryEmbedding: vec, k: 5, layer: 'instance' });
+  assert.equal(instHits.length, 1);
+  assert.equal(instHits[0].filename, 'inst.md');
+
+  const patHits = await brain.searchMemories({ queryEmbedding: vec, k: 5, layer: 'pattern' });
+  assert.equal(patHits.length, 1);
+  assert.equal(patHits[0].filename, 'pat.md');
+  await brain.close();
+});
+
+test('searchMemories filters by filename prefix', async () => {
+  const dir = tmpDir();
+  await brain.init(dir);
+  const vec = normalize(axisVec(0));
+
+  await brain.setMemory('students/sam.md', 'sam', 'test', 'instance', vec);
+  await brain.setMemory('students/lin.md', 'lin', 'test', 'instance', vec);
+  await brain.setMemory('meetings/tuesday.md', 'tue', 'test', 'instance', vec);
+
+  const hits = await brain.searchMemories({ queryEmbedding: vec, k: 10, prefix: 'students/' });
+  assert.equal(hits.length, 2);
+  for (const h of hits) {
+    assert.ok(h.filename.startsWith('students/'), `unexpected hit outside prefix: ${h.filename}`);
+  }
+  await brain.close();
+});
+
+test('searchMemories rejects non-finite or missing queryEmbedding', async () => {
+  const dir = tmpDir();
+  await brain.init(dir);
+
+  await assert.rejects(
+    brain.searchMemories({ k: 1 }),
+    /queryEmbedding is required/
+  );
+  await assert.rejects(
+    brain.searchMemories({ queryEmbedding: [1, NaN, 3], k: 1 }),
+    /non-finite/
+  );
+  await brain.close();
+});
