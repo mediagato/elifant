@@ -582,7 +582,7 @@ async function exportBrain(options = {}) {
       name: process.env.MEDIAGATO_ELIFANT_PRODUCER || 'mediagato-elifant',
       version: PACKAGE_VERSION,
       // Hostname is opt-in. By default it's redacted because the manifest may
-      // travel to other keyholders' Watering holes, and many Windows / macOS
+      // travel to other keyholders' shared spaces, and many Windows / macOS
       // hostnames include the user's real name, employer, or device serial.
       // Set MEDIAGATO_ELIFANT_REVEAL_HOST exactly to '1' or 'true' to embed the
       // real os.hostname(). Or pass a chosen string in MEDIAGATO_ELIFANT_PRODUCER_HOST.
@@ -926,7 +926,7 @@ async function listSnapshots(filter = {}) {
 }
 
 /**
- * Substrate self-diagnostic. The "I think I'm fucked up" gesture. Returns a
+ * Substrate self-diagnostic. The "is something off?" health-check gesture. Returns a
  * baseline-delta report covering capture volume, director changes, pattern-layer
  * additions from unknown sources, recall-distribution shifts, etc.
  *
