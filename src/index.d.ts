@@ -439,6 +439,54 @@ export function getAllMemories(): Promise<MemoryListRow[]>;
 /** Delete a memory by filename. No-op if it doesn't exist. */
 export function deleteMemory(filename: string): Promise<void>;
 
+// ── Captures (event stream / projection sink, v0.5.0-dev) ─────────────────
+
+/** A capture row — one structured event from a substrate-conformant source. */
+export interface CaptureRow {
+  id: string;
+  source: string;
+  type: string | null;
+  ts: string;
+  data: Record<string, unknown> | null;
+}
+
+export interface AddCaptureInput {
+  source: string;
+  type?: string | null;
+  data?: Record<string, unknown> | null;
+  ts?: string | null;
+}
+
+export interface GetCapturesOptions {
+  since?: string;
+  until?: string;
+  source?: string;
+  type?: string;
+  limit?: number;
+}
+
+export interface DeleteCapturesOptions {
+  until?: string;
+  source?: string;
+  type?: string;
+}
+
+/**
+ * Append a capture event. Source-specific fields go on `data`; top-level
+ * columns are the protocol contract. Designed so any process that can POST
+ * JSON can append events without depending on this library directly.
+ */
+export function addCapture(cap: AddCaptureInput): Promise<{ id: string; ts: string }>;
+
+/** Read captures, newest first. Returns at most `limit` rows (default 1000, max 10000). */
+export function getCaptures(opts?: GetCapturesOptions): Promise<CaptureRow[]>;
+
+/**
+ * Delete captures matching the filter. At least one filter (until/source/type)
+ * is required to prevent accidental full-table wipes.
+ */
+export function deleteCaptures(opts: DeleteCapturesOptions): Promise<number>;
+
 // ── Spore seed ────────────────────────────────────────────────────────────
 
 /**

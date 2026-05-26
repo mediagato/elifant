@@ -1,9 +1,10 @@
 /**
  * @mediagato/elifant — local-first PGlite-backed memory engine.
  *
- * Five tables:
+ * Six tables:
  *   state          — key/value with updated_by, updated_at, layer
  *   memories       — filename-keyed long-form notes
+ *   captures       — event stream; any substrate-conformant source writes here
  *   steering       — routing/template entries with mode + match_pattern
  *   review_lessons — auto-generated rules from prior tasks
  *   brain_meta     — internal kv (e.g. brain_name, spore_seeded_at)
@@ -11,6 +12,11 @@
  * 'layer' distinguishes user-created rows ('instance') from
  * template-seeded rows ('pattern'). The kernel itself initiates no
  * outbound network calls; any export/import happens via caller code.
+ *
+ * The captures table is the projection sink: every substrate surface
+ * (browser extension on AI sites, companion daemon, dispatch relay,
+ * future sources) POSTs structured events here and consumers read
+ * them back to render dashboards.
  */
 const path = require('path');
 const fs = require('fs');
@@ -94,6 +100,19 @@ async function init(dataDir) {
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS captures (
+      id BIGSERIAL PRIMARY KEY,
+      source TEXT NOT NULL,
+      type TEXT,
+      ts TEXT NOT NULL,
+      data JSONB,
+      layer TEXT DEFAULT 'instance',
+      anonymizable BOOLEAN DEFAULT true
+    );
+
+    CREATE INDEX IF NOT EXISTS captures_ts_idx ON captures (ts DESC);
+    CREATE INDEX IF NOT EXISTS captures_source_ts_idx ON captures (source, ts DESC);
   `);
 
   // Migration: add embedding column if upgrading from a 0.3.x database that
@@ -290,6 +309,99 @@ async function searchMemories({ queryEmbedding, k = 5, layer = null, prefix = nu
 async function deleteMemory(filename) {
   _ensure();
   await _db.query('DELETE FROM memories WHERE filename = $1', [filename]);
+}
+
+// ── Captures (event stream) ───────────────────────────────────────────────
+//
+// The captures table is the projection sink. Substrate-conformant surfaces
+// (browser extension, companion daemon, dispatch relay, future producers)
+// write structured events here. Consumers read them back to render
+// dashboards / timelines / activity feeds.
+//
+// Source-specific fields go on `data` (JSONB); top-level columns are the
+// protocol contract. The payload shape is designed so any process that can
+// POST JSON (browser extension, daemon, CLI, foreign program) can append
+// events without depending on this library directly.
+
+/**
+ * Write a capture event.
+ * @param {Object} cap
+ * @param {string} cap.source - producer identifier ('extension', 'companion', 'modelreins', ...)
+ * @param {string} [cap.type] - source-specific event type ('conversation_visit', 'job_started', ...)
+ * @param {Object} [cap.data] - structured payload, JSON-serializable
+ * @param {string} [cap.ts] - ISO 8601 timestamp; defaults to now
+ * @returns {Promise<{id: string, ts: string}>}
+ */
+async function addCapture({ source, type = null, data = null, ts = null } = {}) {
+  _ensure();
+  if (!source || typeof source !== 'string') {
+    throw new Error('addCapture: source (string) required');
+  }
+  const timestamp = ts || _ts();
+  const payload = data == null ? null : JSON.stringify(data);
+  const result = await _db.query(
+    `INSERT INTO captures (source, type, ts, data) VALUES ($1, $2, $3, $4) RETURNING id, ts`,
+    [source, type, timestamp, payload]
+  );
+  return { id: String(result.rows[0].id), ts: result.rows[0].ts };
+}
+
+/**
+ * Read captures, newest first.
+ * @param {Object} [opts]
+ * @param {string} [opts.since] - inclusive lower bound on ts (ISO 8601)
+ * @param {string} [opts.until] - inclusive upper bound on ts
+ * @param {string} [opts.source] - filter by producer
+ * @param {string} [opts.type] - filter by event type
+ * @param {number} [opts.limit=1000] - max rows
+ * @returns {Promise<Array<{id: string, source: string, type: string|null, ts: string, data: Object|null}>>}
+ */
+async function getCaptures(opts = {}) {
+  _ensure();
+  const { since, until, source, type } = opts;
+  const limit = Math.max(1, Math.min(parseInt(opts.limit, 10) || 1000, 10000));
+  const where = [];
+  const params = [];
+  let i = 1;
+  if (since)  { where.push(`ts >= $${i++}`); params.push(since); }
+  if (until)  { where.push(`ts <= $${i++}`); params.push(until); }
+  if (source) { where.push(`source = $${i++}`); params.push(source); }
+  if (type)   { where.push(`type = $${i++}`); params.push(type); }
+  const whereClause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  const result = await _db.query(
+    `SELECT id, source, type, ts, data FROM captures ${whereClause} ORDER BY ts DESC LIMIT ${limit}`,
+    params
+  );
+  return result.rows.map(r => ({
+    id: String(r.id),
+    source: r.source,
+    type: r.type,
+    ts: r.ts,
+    data: r.data, // PGlite returns JSONB as a parsed object
+  }));
+}
+
+/**
+ * Delete captures matching the filter. Use with care — events are append-only
+ * by convention; this exists for retention/pruning of older event noise.
+ * @returns {Promise<number>} rows deleted
+ */
+async function deleteCaptures({ until, source, type } = {}) {
+  _ensure();
+  const where = [];
+  const params = [];
+  let i = 1;
+  if (until)  { where.push(`ts <= $${i++}`); params.push(until); }
+  if (source) { where.push(`source = $${i++}`); params.push(source); }
+  if (type)   { where.push(`type = $${i++}`); params.push(type); }
+  if (!where.length) {
+    throw new Error('deleteCaptures: at least one filter (until/source/type) required to avoid wiping all captures');
+  }
+  const result = await _db.query(
+    `DELETE FROM captures WHERE ${where.join(' AND ')}`,
+    params
+  );
+  return result.affectedRows || 0;
 }
 
 // ── Spore seed ────────────────────────────────────────────────────────────
@@ -1006,6 +1118,10 @@ module.exports = {
   searchMemories,
   deleteMemory,
   getAllMemories,
+  // v0.5.0-dev — captures (event stream / projection sink)
+  addCapture,
+  getCaptures,
+  deleteCaptures,
   seedFromSpore,
   isSeeded,
   // v0.2.0 — Elifantic protocol v0 (skeletons; throw NotImplementedError until Tue/Thu)
