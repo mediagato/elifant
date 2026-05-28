@@ -71,7 +71,9 @@ async function init(dataDir) {
       updated_at TEXT NOT NULL,
       layer TEXT DEFAULT 'instance',
       anonymizable BOOLEAN DEFAULT true,
-      embedding vector(384)
+      embedding vector(384),
+      pinned BOOLEAN DEFAULT false,
+      archived BOOLEAN DEFAULT false
     );
 
     CREATE TABLE IF NOT EXISTS steering (
@@ -118,6 +120,11 @@ async function init(dataDir) {
   // Migration: add embedding column if upgrading from a 0.3.x database that
   // pre-dates pgvector. Idempotent.
   await _db.exec(`ALTER TABLE memories ADD COLUMN IF NOT EXISTS embedding vector(384);`);
+
+  // Migration: add curation flags (pinned, archived) for databases that
+  // pre-date v0.6.0. Idempotent.
+  await _db.exec(`ALTER TABLE memories ADD COLUMN IF NOT EXISTS pinned BOOLEAN DEFAULT false;`);
+  await _db.exec(`ALTER TABLE memories ADD COLUMN IF NOT EXISTS archived BOOLEAN DEFAULT false;`);
 
   _ready = true;
   // _debug writes to stderr (never stdout) so MCP servers using stdio transport
@@ -262,21 +269,63 @@ async function getMemoriesNeedingEmbedding(limit = 50) {
   return result.rows;
 }
 
-async function getAllMemories() {
+// List memories with optional filters and richer columns. Pinned memories
+// float to the top; archived memories are excluded by default. Pass
+// {includeArchived:true} to see everything, or {onlyArchived:true} for the
+// archive view. updated_by is surfaced so consumers can render provenance
+// ("why is this here?") without a follow-up fetch.
+async function getAllMemories({ includeArchived = false, onlyArchived = false } = {}) {
   _ensure();
-  const result = await _db.query('SELECT filename, layer, updated_at FROM memories ORDER BY filename');
+  const where = [];
+  if (onlyArchived) {
+    where.push('archived = true');
+  } else if (!includeArchived) {
+    where.push('archived = false');
+  }
+  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  const result = await _db.query(`
+    SELECT filename, layer, updated_at, updated_by, pinned, archived
+    FROM memories
+    ${whereSql}
+    ORDER BY pinned DESC, filename
+  `);
   return result.rows;
+}
+
+// Toggle the pinned flag on a memory. Pinned memories float to the top of
+// listings and (caller's choice) can be boosted in semantic recall. No-op if
+// the memory doesn't exist.
+async function setMemoryPin(filename, pinned) {
+  _ensure();
+  await _db.query(
+    'UPDATE memories SET pinned = $1 WHERE filename = $2',
+    [Boolean(pinned), filename]
+  );
+}
+
+// Toggle the archived flag on a memory. Archived memories are hidden from
+// the default listing and excluded from semantic search at the caller's
+// discretion. The memory itself is preserved. No-op if the memory doesn't
+// exist.
+async function setMemoryArchive(filename, archived) {
+  _ensure();
+  await _db.query(
+    'UPDATE memories SET archived = $1 WHERE filename = $2',
+    [Boolean(archived), filename]
+  );
 }
 
 // Semantic search over memories. Returns top-K rows ordered by cosine
 // distance to the query embedding (smaller = more similar). Memories
-// without an embedding are excluded from results. Optional filters narrow
-// by layer ('instance' | 'pattern') and/or filename prefix.
+// without an embedding are excluded from results. Archived memories are
+// excluded by default; pass {includeArchived:true} to opt back in.
+// Optional filters narrow by layer ('instance' | 'pattern') and/or
+// filename prefix.
 //
 // Returns: [{ filename, content, layer, updated_at, distance }]
 //   - distance is the raw pgvector cosine distance (0 = identical,
 //     2 = opposite). Score-as-similarity = 1 - distance/2.
-async function searchMemories({ queryEmbedding, k = 5, layer = null, prefix = null } = {}) {
+async function searchMemories({ queryEmbedding, k = 5, layer = null, prefix = null, includeArchived = false } = {}) {
   _ensure();
   if (!queryEmbedding) throw new Error('searchMemories: queryEmbedding is required');
   const vec = _vectorLiteral(queryEmbedding);
@@ -284,6 +333,7 @@ async function searchMemories({ queryEmbedding, k = 5, layer = null, prefix = nu
   const where = ['embedding IS NOT NULL'];
   const params = [vec];
   let nextParam = 2;
+  if (!includeArchived) { where.push('archived = false'); }
   if (layer) { where.push(`layer = $${nextParam++}`); params.push(layer); }
   if (prefix) { where.push(`filename LIKE $${nextParam++}`); params.push(`${prefix}%`); }
   params.push(k);
@@ -326,7 +376,7 @@ async function deleteMemory(filename) {
 /**
  * Write a capture event.
  * @param {Object} cap
- * @param {string} cap.source - producer identifier ('extension', 'companion', 'modelreins', ...)
+ * @param {string} cap.source - producer identifier ('extension', 'daemon', 'cli', ...)
  * @param {string} [cap.type] - source-specific event type ('conversation_visit', 'job_started', ...)
  * @param {Object} [cap.data] - structured payload, JSON-serializable
  * @param {string} [cap.ts] - ISO 8601 timestamp; defaults to now
@@ -1118,6 +1168,9 @@ module.exports = {
   searchMemories,
   deleteMemory,
   getAllMemories,
+  // v0.6.0 — memory curation (pin + archive)
+  setMemoryPin,
+  setMemoryArchive,
   // v0.5.0-dev — captures (event stream / projection sink)
   addCapture,
   getCaptures,

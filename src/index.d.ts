@@ -41,11 +41,26 @@ export interface MemoryRow {
   updated_at: string;
 }
 
-/** A metadata row returned from getAllMemories (NO content; for the index). */
+/**
+ * A metadata row returned from getAllMemories (NO content; for the index).
+ * Includes curation flags (pinned/archived) and provenance (updated_by)
+ * for "why is this here?" rendering.
+ */
 export interface MemoryListRow {
   filename: string;
   layer: Layer;
   updated_at: string;
+  updated_by: string | null;
+  pinned: boolean;
+  archived: boolean;
+}
+
+/** Options for getAllMemories. By default archived memories are excluded. */
+export interface ListMemoriesOptions {
+  /** Include archived rows in the result. Default: false. */
+  includeArchived?: boolean;
+  /** Return ONLY archived rows (overrides includeArchived). Default: false. */
+  onlyArchived?: boolean;
 }
 
 // ── Spore seed payload shape ──────────────────────────────────────────────
@@ -424,17 +439,29 @@ export interface MemorySearchHit {
 /**
  * Semantic search over memories. Returns top-k hits ordered by cosine
  * distance to queryEmbedding. Memories without an embedding are excluded.
- * Optional filters narrow by layer and/or filename prefix.
+ * Archived memories are excluded by default; pass includeArchived:true to
+ * opt back in. Optional filters narrow by layer and/or filename prefix.
  */
 export function searchMemories(options: {
   queryEmbedding: number[];
   k?: number;
   layer?: Layer | null;
   prefix?: string | null;
+  includeArchived?: boolean;
 }): Promise<MemorySearchHit[]>;
 
-/** Return all memory metadata (NO content) ordered by filename. */
-export function getAllMemories(): Promise<MemoryListRow[]>;
+/**
+ * Return memory metadata (NO content). Pinned rows float to the top, then
+ * filename order. Archived rows are excluded by default; opt in via
+ * includeArchived or fetch only archived via onlyArchived.
+ */
+export function getAllMemories(options?: ListMemoriesOptions): Promise<MemoryListRow[]>;
+
+/** Toggle the pinned flag on a memory. No-op if the memory doesn't exist. */
+export function setMemoryPin(filename: string, pinned: boolean): Promise<void>;
+
+/** Toggle the archived flag on a memory. No-op if the memory doesn't exist. */
+export function setMemoryArchive(filename: string, archived: boolean): Promise<void>;
 
 /** Delete a memory by filename. No-op if it doesn't exist. */
 export function deleteMemory(filename: string): Promise<void>;
