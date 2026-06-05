@@ -494,7 +494,18 @@ async function searchMemories({ queryEmbedding, queryText = null, k = 5, layer =
     ORDER BY embedding <=> $1::vector
     LIMIT $${nextParam}
   `;
-  const result = await _db.query(sql, params);
+  let result;
+  try {
+    result = await _db.query(sql, params);
+  } catch (e) {
+    // Dimension-mismatch guard (v0.8.0): a query embedded by a different-
+    // dimensioned Nose than the stored Scents (e.g. an old 384-dim app querying
+    // a brain mid model-swap migration to 768) makes pgvector throw. Degrade to
+    // "no recall" instead of crashing the caller with a 500 — a half-migrated
+    // brain stays usable until the re-embed finishes.
+    if (/dimension/i.test(String((e && e.message) || ''))) return [];
+    throw e;
+  }
   const rows = result.rows.map((r) => ({
     filename: r.filename,
     content: r.content,

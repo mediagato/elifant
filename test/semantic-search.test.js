@@ -244,6 +244,19 @@ test('rerank:false forces base mode even when queryText is supplied', async () =
   await brain.close();
 });
 
+test('dim-mismatch guard: a wrong-dimension query embedding returns [] (not a 500)', async () => {
+  const dir = tmpDir();
+  await brain.init(dir);
+  await brain.setMemory('m.md', 'content', 'test', 'instance', normalize(axisVec(0))); // 384-dim stored
+  const wrongDim = new Array(768).fill(0); wrongDim[0] = 1; // 768-dim query (mid model-swap)
+  const hits = await brain.searchMemories({ queryEmbedding: wrongDim, k: 5 });
+  assert.deepEqual(hits, [], 'wrong-dim query must degrade to empty, not throw');
+  // and the hybrid path (queryText) must also be guarded
+  const hits2 = await brain.searchMemories({ queryEmbedding: wrongDim, queryText: 'content', k: 5 });
+  assert.deepEqual(hits2, [], 'hybrid wrong-dim query must also degrade to empty');
+  await brain.close();
+});
+
 test('the Nose identity (embed_model/dim/version) is recorded + readable; setEmbedMeta updates it', async () => {
   const dir = tmpDir();
   await brain.init(dir);
