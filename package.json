@@ -1,6 +1,6 @@
 {
   "name": "@mediagato/elifant",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Local-first PGlite database kernel for persistent state, memories, and seed templates in Node.js applications. Signed export/import portability plus snapshot/rollback/health primitives. Reference implementation of the Elifantic protocol v0.1 storage layer.",
   "main": "src/index.js",
   "types": "src/index.d.ts",

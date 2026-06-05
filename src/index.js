@@ -126,6 +126,18 @@ async function init(dataDir) {
   await _db.exec(`ALTER TABLE memories ADD COLUMN IF NOT EXISTS pinned BOOLEAN DEFAULT false;`);
   await _db.exec(`ALTER TABLE memories ADD COLUMN IF NOT EXISTS archived BOOLEAN DEFAULT false;`);
 
+  // v0.7.0 — record the Nose (embedder) identity so a brain knows which model
+  // produced its Scents. Seeds the historical MiniLM/384 Nose ONLY if absent,
+  // so existing brains stay byte-identical. A future Nose swap bumps these via
+  // setEmbedMeta() and re-embeds every memory against the new model.
+  await _db.exec(`
+    INSERT INTO brain_meta (key, value) VALUES
+      ('embed_model', 'Xenova/all-MiniLM-L6-v2'),
+      ('embed_dim', '384'),
+      ('embed_version', '1')
+    ON CONFLICT (key) DO NOTHING;
+  `);
+
   _ready = true;
   // _debug writes to stderr (never stdout) so MCP servers using stdio transport
   // don't get "[brain] ..." lines in their JSON-RPC channel. With
@@ -159,6 +171,42 @@ async function setName(name) {
     INSERT INTO brain_meta (key, value) VALUES ('brain_name', $1)
     ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value
   `, [name]);
+}
+
+// ── The Nose (embedder identity) ──────────────────────────────────────────
+// A brain's Scents (embeddings) are only comparable to a query embedded by the
+// SAME Nose. Recording the model/dim/version lets a model-swap migration know a
+// re-embed is required, and lets federated elifants check Nose-compatibility
+// before comparing Scents. Defaults match the historical MiniLM/384 Nose.
+
+/** Get the Nose (embedder) identity recorded in this brain. */
+async function getEmbedMeta() {
+  _ensure();
+  const r = await _db.query(
+    "SELECT key, value FROM brain_meta WHERE key IN ('embed_model','embed_dim','embed_version')"
+  );
+  const m = {};
+  for (const row of r.rows) m[row.key] = row.value;
+  return {
+    model: m.embed_model || 'Xenova/all-MiniLM-L6-v2',
+    dim: m.embed_dim ? Number(m.embed_dim) : 384,
+    version: m.embed_version || '1',
+  };
+}
+
+/** Record the Nose (embedder) identity. Used by a model-swap migration. */
+async function setEmbedMeta({ model = null, dim = null, version = null } = {}) {
+  _ensure();
+  const pairs = [];
+  if (model != null) pairs.push(['embed_model', String(model)]);
+  if (dim != null) pairs.push(['embed_dim', String(dim)]);
+  if (version != null) pairs.push(['embed_version', String(version)]);
+  for (const [key, value] of pairs) {
+    await _db.query(
+      'INSERT INTO brain_meta (key, value) VALUES ($1, $2) ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value',
+      [key, value]
+    );
+  }
 }
 
 // ── State operations ──────────────────────────────────────────────────────
@@ -315,20 +363,114 @@ async function setMemoryArchive(filename, archived) {
   );
 }
 
-// Semantic search over memories. Returns top-K rows ordered by cosine
-// distance to the query embedding (smaller = more similar). Memories
-// without an embedding are excluded from results. Archived memories are
-// excluded by default; pass {includeArchived:true} to opt back in.
-// Optional filters narrow by layer ('instance' | 'pattern') and/or
-// filename prefix.
+// ── Hybrid reranking helpers (additive; only engaged when queryText is given) ──
+// The Nose produces a Scent (embedding); cosine over Scents is the base signal.
+// When a consumer also passes the raw query TEXT, searchMemories fuses three
+// rank lists — semantic (cosine), lexical (BM25 over content), and pin-aware
+// recency — via Reciprocal Rank Fusion. This RE-ORDERS rows but NEVER mutates
+// the raw cosine `distance` field (downstream relevance floors depend on its
+// absolute value, so it must never be repurposed); the fused value rides a
+// separate `rerank_score`.
+const _RERANK_STOP = new Set((
+  'a an the i my me do does what is are was were be been of to in on at for it its that this these those ' +
+  'you your yours we our us they them he she his her remember please tell show find search about know want ' +
+  'like likes love loves enjoy enjoys favorite favourite say said how where who when which whats'
+).split(/\s+/));
+function _rerankToks(s) {
+  return (String(s || '').toLowerCase().match(/[a-z0-9]+/g) || [])
+    .filter((w) => w.length > 1 && !_RERANK_STOP.has(w));
+}
+function _bm25(queryText, docs) {
+  const k1 = 1.5, b = 0.75, N = docs.length || 1;
+  const df = Object.create(null), dl = Object.create(null), dt = Object.create(null);
+  let avg = 0;
+  for (const d of docs) {
+    const t = _rerankToks(d.text); dt[d.id] = t; dl[d.id] = t.length; avg += t.length;
+    for (const w of new Set(t)) df[w] = (df[w] || 0) + 1;
+  }
+  avg = (avg / N) || 1;
+  const qt = _rerankToks(queryText);
+  const out = Object.create(null);
+  for (const d of docs) {
+    const tf = Object.create(null);
+    for (const w of dt[d.id]) tf[w] = (tf[w] || 0) + 1;
+    let s = 0;
+    for (const w of qt) {
+      if (!tf[w]) continue;
+      const idf = Math.log(1 + (N - df[w] + 0.5) / (df[w] + 0.5));
+      s += idf * (tf[w] * (k1 + 1)) / (tf[w] + k1 * (1 - b + b * (dl[d.id] / avg)));
+    }
+    out[d.id] = s;
+  }
+  return out;
+}
+function _ageDays(updatedAt) {
+  const t = Date.parse(updatedAt);
+  if (!Number.isFinite(t)) return 3650;
+  return Math.max(0, (Date.now() - t) / 86400000);
+}
+// Competition ranking BY VALUE: equal values share a rank (the index of the
+// group's first member). This matters because two memories with identical
+// cosine distance must contribute identically to the fusion — otherwise the
+// arbitrary DB tie-order leaks in and the pin-aware recency leg can't decide
+// ties. dir 'asc' = smaller-is-better (cosine), 'desc' = larger-is-better.
+function _denseRankMap(ids, valueOf, dir) {
+  const sorted = [...ids].sort((a, b) => (dir === 'asc' ? valueOf(a) - valueOf(b) : valueOf(b) - valueOf(a)));
+  const rank = Object.create(null);
+  let cur = 0;
+  for (let i = 0; i < sorted.length; i++) {
+    if (i > 0 && valueOf(sorted[i]) !== valueOf(sorted[i - 1])) cur = i;
+    rank[sorted[i]] = cur;
+  }
+  return rank;
+}
+
+// Reciprocal Rank Fusion of cosine + lexical + (pin-aware) recency. Higher =
+// better. recencyWeight keeps recency a light tie-breaker. Pinned rows are
+// treated as freshest, so the recency leg can only HELP a pinned memory — it
+// never demotes one below an unpinned row of equal relevance.
+function _fuseRerank(rows, queryText, recencyWeight) {
+  const K0 = 60;
+  const ids = rows.map((r) => r.filename);
+  const distOf = Object.create(null), recOf = Object.create(null);
+  for (const r of rows) {
+    distOf[r.filename] = r.distance;
+    recOf[r.filename] = r.pinned ? Number.POSITIVE_INFINITY : -_ageDays(r.updated_at);
+  }
+  const bm = _bm25(queryText, rows.map((r) => ({ id: r.filename, text: r.content })));
+  const cosRank = _denseRankMap(ids, (id) => distOf[id], 'asc');
+  const lexRank = _denseRankMap(ids, (id) => (bm[id] || 0), 'desc');
+  const recRank = _denseRankMap(ids, (id) => recOf[id], 'desc');
+  const score = Object.create(null);
+  for (const id of ids) {
+    score[id] = 1 / (K0 + cosRank[id]) + 1 / (K0 + lexRank[id]) + recencyWeight * (1 / (K0 + recRank[id]));
+  }
+  return score;
+}
+
+// Semantic search over memories.
 //
-// Returns: [{ filename, content, layer, updated_at, distance }]
-//   - distance is the raw pgvector cosine distance (0 = identical,
-//     2 = opposite). Score-as-similarity = 1 - distance/2.
-async function searchMemories({ queryEmbedding, k = 5, layer = null, prefix = null, includeArchived = false } = {}) {
+// Base mode (queryEmbedding only): top-K rows ordered by cosine distance to the
+// query embedding (smaller = more similar) — byte-identical to pre-0.7.0.
+// Memories without an embedding are excluded; archived excluded unless
+// {includeArchived:true}. Filters: layer + filename prefix.
+//
+// Hybrid mode (also pass queryText): fetches a wider candidate pool, then
+// re-ranks by Reciprocal Rank Fusion of semantic + lexical (BM25) + pin-aware
+// recency before the top-K cut. The raw cosine `distance` is PRESERVED on every
+// row (downstream relevance floors read its absolute value); the fused order is
+// exposed as `rerank_score`. Pass {rerank:false} to force base mode.
+//
+// Returns base mode:  [{ filename, content, layer, updated_at, distance }]
+//         hybrid mode: [{ ..., distance (raw cosine, unchanged), rerank_score, pinned }]
+//   - distance is the raw pgvector cosine distance (0 = identical, 2 = opposite).
+//     Score-as-similarity = 1 - distance/2.
+async function searchMemories({ queryEmbedding, queryText = null, k = 5, layer = null, prefix = null, includeArchived = false, rerank = true, recencyWeight = 0.5 } = {}) {
   _ensure();
   if (!queryEmbedding) throw new Error('searchMemories: queryEmbedding is required');
   const vec = _vectorLiteral(queryEmbedding);
+
+  const doRerank = rerank && typeof queryText === 'string' && queryText.trim().length > 0;
 
   const where = ['embedding IS NOT NULL'];
   const params = [vec];
@@ -336,24 +478,58 @@ async function searchMemories({ queryEmbedding, k = 5, layer = null, prefix = nu
   if (!includeArchived) { where.push('archived = false'); }
   if (layer) { where.push(`layer = $${nextParam++}`); params.push(layer); }
   if (prefix) { where.push(`filename LIKE $${nextParam++}`); params.push(`${prefix}%`); }
-  params.push(k);
 
+  // Hybrid pulls a wider candidate pool so the reranker has rows to move; base
+  // mode pulls exactly k (unchanged behavior + query plan).
+  const limit = doRerank ? Math.max(k * 5, 30) : k;
+  params.push(limit);
+
+  const cols = doRerank
+    ? 'filename, content, layer, updated_at, pinned, (embedding <=> $1::vector) AS distance'
+    : 'filename, content, layer, updated_at, (embedding <=> $1::vector) AS distance';
   const sql = `
-    SELECT filename, content, layer, updated_at,
-           (embedding <=> $1::vector) AS distance
+    SELECT ${cols}
     FROM memories
     WHERE ${where.join(' AND ')}
     ORDER BY embedding <=> $1::vector
     LIMIT $${nextParam}
   `;
   const result = await _db.query(sql, params);
-  return result.rows.map(r => ({
+  const rows = result.rows.map((r) => ({
     filename: r.filename,
     content: r.content,
     layer: r.layer,
     updated_at: r.updated_at,
+    pinned: r.pinned,
     distance: Number(r.distance),
   }));
+
+  if (!doRerank) {
+    // Base mode: identical shape + order to pre-0.7.0 (no pinned, no rerank_score).
+    return rows.map((r) => ({
+      filename: r.filename,
+      content: r.content,
+      layer: r.layer,
+      updated_at: r.updated_at,
+      distance: r.distance,
+    }));
+  }
+
+  // Hybrid mode: fuse + re-order, PRESERVING the raw cosine distance per row.
+  const score = _fuseRerank(rows, queryText, recencyWeight);
+  return rows
+    .map((r) => ({ ...r, rerank_score: score[r.filename] }))
+    .sort((a, b) => (b.rerank_score - a.rerank_score) || ((b.pinned ? 1 : 0) - (a.pinned ? 1 : 0)))
+    .slice(0, k)
+    .map((r) => ({
+      filename: r.filename,
+      content: r.content,
+      layer: r.layer,
+      updated_at: r.updated_at,
+      distance: r.distance,        // raw cosine — UNCHANGED (relevance floors depend on it)
+      rerank_score: r.rerank_score,
+      pinned: r.pinned,
+    }));
 }
 
 async function deleteMemory(filename) {
@@ -1157,6 +1333,8 @@ module.exports = {
   dbPath,
   getName,
   setName,
+  getEmbedMeta,
+  setEmbedMeta,
   getState,
   setState,
   getAllState,

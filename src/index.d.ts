@@ -427,28 +427,59 @@ export function setMemoryEmbedding(filename: string, embedding: number[]): Promi
  */
 export function getMemoriesNeedingEmbedding(limit?: number): Promise<{ filename: string; content: string }[]>;
 
-/** A row returned from searchMemories. distance is pgvector cosine distance (0=identical, 2=opposite). */
+/** A row returned from searchMemories. distance is the raw pgvector cosine distance (0=identical, 2=opposite) — ALWAYS preserved, even in hybrid mode. */
 export interface MemorySearchHit {
   filename: string;
   content: string;
   layer: Layer;
   updated_at: string;
   distance: number;
+  /** Present only in hybrid mode (queryText supplied): the Reciprocal-Rank-Fusion score the rows were re-ordered by. Higher = better. */
+  rerank_score?: number;
+  /** Present only in hybrid mode. */
+  pinned?: boolean;
 }
 
 /**
- * Semantic search over memories. Returns top-k hits ordered by cosine
- * distance to queryEmbedding. Memories without an embedding are excluded.
- * Archived memories are excluded by default; pass includeArchived:true to
- * opt back in. Optional filters narrow by layer and/or filename prefix.
+ * Semantic search over memories.
+ *
+ * Base mode (queryEmbedding only): top-k hits ordered by cosine distance to
+ * queryEmbedding — byte-identical to pre-0.7.0. Memories without an embedding
+ * are excluded; archived excluded unless includeArchived:true. Filters narrow
+ * by layer and/or filename prefix.
+ *
+ * Hybrid mode (also pass queryText): re-ranks a wider candidate pool by
+ * Reciprocal Rank Fusion of semantic + lexical (BM25) + pin-aware recency before
+ * the top-k cut. The raw cosine `distance` is PRESERVED on every row (downstream
+ * relevance floors depend on its absolute value); the fused order is exposed as
+ * `rerank_score`. Pass rerank:false to force base mode.
  */
 export function searchMemories(options: {
   queryEmbedding: number[];
+  /** Raw query text. When provided, enables hybrid (lexical+recency) reranking. */
+  queryText?: string | null;
   k?: number;
   layer?: Layer | null;
   prefix?: string | null;
   includeArchived?: boolean;
+  /** Default true; only has effect when queryText is a non-empty string. */
+  rerank?: boolean;
+  /** Weight of the pin-aware recency leg in the fusion. Default 0.5 (light tie-breaker). */
+  recencyWeight?: number;
 }): Promise<MemorySearchHit[]>;
+
+/** The Nose (embedder) identity recorded in a brain. */
+export interface EmbedMeta {
+  model: string;
+  dim: number;
+  version: string;
+}
+
+/** Get the Nose (embedder) identity recorded in this brain. Defaults to the historical MiniLM/384 Nose. */
+export function getEmbedMeta(): Promise<EmbedMeta>;
+
+/** Record the Nose (embedder) identity. Used by a model-swap migration. */
+export function setEmbedMeta(meta: { model?: string | null; dim?: number | null; version?: string | null }): Promise<void>;
 
 /**
  * Return memory metadata (NO content). Pinned rows float to the top, then

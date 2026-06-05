@@ -170,3 +170,92 @@ test('searchMemories rejects non-finite or missing queryEmbedding', async () => 
   );
   await brain.close();
 });
+
+// ── v0.7.0 hybrid reranking (additive; engaged only when queryText is given) ──
+
+test('hybrid mode PRESERVES raw cosine distance + adds rerank_score (does not clobber distance)', async () => {
+  const dir = tmpDir();
+  await brain.init(dir);
+  const v0 = normalize(axisVec(0));
+  const v1 = normalize(axisVec(1));
+  await brain.setMemory('a.md', 'grateful dead concert tickets', 'test', 'instance', v0);
+  await brain.setMemory('b.md', 'orange bikini fashion note', 'test', 'instance', v1);
+
+  const hits = await brain.searchMemories({ queryEmbedding: v0, queryText: 'grateful dead', k: 2 });
+  assert.equal(hits.length, 2);
+  for (const h of hits) {
+    // CRITICAL: distance must remain the RAW cosine distance in [0,2], NOT the
+    // fused score (~0–0.05). Three downstream surfaces threshold on its absolute
+    // value (extension/bowl 0.9 floors). This is the audit's non-negotiable.
+    assert.ok(typeof h.distance === 'number' && h.distance >= 0 && h.distance <= 2,
+      `distance must stay raw cosine [0,2], got ${h.distance}`);
+    assert.ok('rerank_score' in h, 'hybrid hit must carry a separate rerank_score');
+    assert.ok(h.rerank_score < 0.9, 'sanity: fused score stays well under the 0.9 floor');
+  }
+  // a.md is both cosine-closest AND the lexical match → ranks first.
+  assert.equal(hits[0].filename, 'a.md');
+  await brain.close();
+});
+
+test('hybrid lexical leg does not rank a literal-term match WORSE than cosine alone', async () => {
+  const dir = tmpDir();
+  await brain.init(dir);
+  const qv = normalize(axisVec(0));
+  // decoy is cosine-closest but lexically irrelevant to the query
+  await brain.setMemory('decoy.md', 'a pleasant generic note', 'test', 'instance', normalize(axisVec(0)));
+  // target is cosine-FAR but contains the literal query term
+  await brain.setMemory('target.md', 'eskimo pies are the best', 'test', 'instance', normalize(axisVec(50)));
+
+  const base = await brain.searchMemories({ queryEmbedding: qv, k: 2 });
+  assert.equal(base[0].filename, 'decoy.md', 'cosine alone ranks the decoy first');
+  const baseRank = base.findIndex((h) => h.filename === 'target.md');
+
+  const hybrid = await brain.searchMemories({ queryEmbedding: qv, queryText: 'eskimo pies', k: 2 });
+  const hybridRank = hybrid.findIndex((h) => h.filename === 'target.md');
+  assert.ok(hybridRank <= baseRank, 'lexical match must not rank worse under hybrid reranking');
+  await brain.close();
+});
+
+test('hybrid recency is pin-aware: a pinned memory is not demoted below an unpinned one', async () => {
+  const dir = tmpDir();
+  await brain.init(dir);
+  const v = normalize(axisVec(0));
+  await brain.setMemory('pinned.md', 'cobalt blue preference', 'test', 'instance', v);
+  await brain.setMemory('plain.md', 'cobalt blue preference', 'test', 'instance', v);
+  await brain.setMemoryPin('pinned.md', true);
+
+  // identical cosine + lexical; the recency leg treats pinned as freshest, so it
+  // must rank at or above the unpinned twin.
+  const hits = await brain.searchMemories({ queryEmbedding: v, queryText: 'cobalt blue', k: 2 });
+  const pinnedRank = hits.findIndex((h) => h.filename === 'pinned.md');
+  const plainRank = hits.findIndex((h) => h.filename === 'plain.md');
+  assert.ok(pinnedRank <= plainRank, 'pinned memory must not be demoted below the unpinned one');
+  await brain.close();
+});
+
+test('rerank:false forces base mode even when queryText is supplied', async () => {
+  const dir = tmpDir();
+  await brain.init(dir);
+  const v = normalize(axisVec(0));
+  await brain.setMemory('only.md', 'eskimo pies', 'test', 'instance', v);
+  const hits = await brain.searchMemories({ queryEmbedding: v, queryText: 'eskimo pies', k: 1, rerank: false });
+  assert.equal(hits.length, 1);
+  assert.ok(!('rerank_score' in hits[0]), 'base mode must not add rerank_score');
+  await brain.close();
+});
+
+test('the Nose identity (embed_model/dim/version) is recorded + readable; setEmbedMeta updates it', async () => {
+  const dir = tmpDir();
+  await brain.init(dir);
+  const meta = await brain.getEmbedMeta();
+  assert.equal(meta.model, 'Xenova/all-MiniLM-L6-v2');
+  assert.equal(meta.dim, 384);
+  assert.equal(meta.version, '1');
+
+  await brain.setEmbedMeta({ model: 'nomic-embed-text', dim: 768, version: '2' });
+  const after = await brain.getEmbedMeta();
+  assert.equal(after.model, 'nomic-embed-text');
+  assert.equal(after.dim, 768);
+  assert.equal(after.version, '2');
+  await brain.close();
+});
