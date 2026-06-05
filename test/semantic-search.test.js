@@ -244,6 +244,34 @@ test('rerank:false forces base mode even when queryText is supplied', async () =
   await brain.close();
 });
 
+test('migrateEmbedDim re-dimensions the Scent column (nulls all, keeps content) + records the new Nose', async () => {
+  const dir = tmpDir();
+  await brain.init(dir);
+  await brain.setMemory('a.md', 'hello world', 'test', 'instance', normalize(axisVec(0))); // 384-dim
+  assert.equal((await brain.searchMemories({ queryEmbedding: normalize(axisVec(0)), k: 1 })).length, 1);
+
+  const n = await brain.migrateEmbedDim(768, { model: 'nomic-embed-text', version: '2' });
+  assert.equal(n, 1, 'one memory now needs re-embed');
+
+  const meta = await brain.getEmbedMeta();
+  assert.equal(meta.dim, 768);
+  assert.equal(meta.model, 'nomic-embed-text');
+  assert.equal(meta.version, '2');
+
+  // content preserved, embedding nulled -> in the backfill queue, excluded from search
+  const todo = await brain.getMemoriesNeedingEmbedding(10);
+  assert.equal(todo.length, 1);
+  assert.equal(todo[0].content, 'hello world');
+
+  // re-embed at the new dim -> searchable again with a 768-dim query
+  const q768 = new Array(768).fill(0); q768[0] = 1;
+  await brain.setMemoryEmbedding('a.md', normalize(q768));
+  const re = await brain.searchMemories({ queryEmbedding: normalize(q768), k: 1 });
+  assert.equal(re.length, 1);
+  assert.equal(re[0].filename, 'a.md');
+  await brain.close();
+});
+
 test('dim-mismatch guard: a wrong-dimension query embedding returns [] (not a 500)', async () => {
   const dir = tmpDir();
   await brain.init(dir);

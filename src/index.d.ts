@@ -482,6 +482,15 @@ export function getEmbedMeta(): Promise<EmbedMeta>;
 export function setEmbedMeta(meta: { model?: string | null; dim?: number | null; version?: string | null }): Promise<void>;
 
 /**
+ * Re-dimension the Scent column for a Nose swap. DROPs + re-ADDs the embedding
+ * column at newDim (nulling every Scent; CONTENT is preserved), then records the
+ * new Nose identity. DESTRUCTIVE — back up the brain dir first and re-embed after
+ * (the backfill queue re-embeds the now-null rows). Returns the count of memories
+ * awaiting a fresh Scent.
+ */
+export function migrateEmbedDim(newDim: number, nose?: { model?: string; version?: string }): Promise<number>;
+
+/**
  * Return memory metadata (NO content). Pinned rows float to the top, then
  * filename order. Archived rows are excluded by default; opt in via
  * includeArchived or fetch only archived via onlyArchived.

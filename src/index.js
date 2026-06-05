@@ -209,6 +209,34 @@ async function setEmbedMeta({ model = null, dim = null, version = null } = {}) {
   }
 }
 
+/**
+ * Re-dimension the Scent column for a Nose swap (v0.9.0). pgvector cannot ALTER
+ * a populated vector(N) column in place, so this DROPs + re-ADDs `embedding` at
+ * the new dimension — nulling every Scent — then records the new Nose identity.
+ * Memory CONTENT is untouched; only the vectors are cleared, so the backfill
+ * queue (getMemoriesNeedingEmbedding) re-embeds every row against the new Nose.
+ *
+ * DESTRUCTIVE: the caller MUST back up the brain dir BEFORE calling this and
+ * re-embed AFTER. No-op-safe to call when already at newDim (drops + re-adds an
+ * empty/!current column either way). Returns the number of memories now needing
+ * a fresh Scent.
+ *
+ * @param {number} newDim
+ * @param {{model?: string, version?: string}} [nose] - new Nose identity to record
+ * @returns {Promise<number>} count of memories awaiting re-embed
+ */
+async function migrateEmbedDim(newDim, { model = null, version = null } = {}) {
+  _ensure();
+  if (!Number.isInteger(newDim) || newDim < 1) {
+    throw new Error('migrateEmbedDim: newDim must be a positive integer');
+  }
+  await _db.exec('ALTER TABLE memories DROP COLUMN IF EXISTS embedding;');
+  await _db.exec(`ALTER TABLE memories ADD COLUMN embedding vector(${newDim});`);
+  await setEmbedMeta({ model, dim: newDim, version });
+  const r = await _db.query('SELECT COUNT(*)::int AS n FROM memories');
+  return r.rows[0] ? r.rows[0].n : 0;
+}
+
 // ── State operations ──────────────────────────────────────────────────────
 
 async function getState(key) {
@@ -1346,6 +1374,7 @@ module.exports = {
   setName,
   getEmbedMeta,
   setEmbedMeta,
+  migrateEmbedDim,
   getState,
   setState,
   getAllState,
