@@ -149,6 +149,31 @@ console.log(back.signature_status);  // 'verified' | 'invalid' | 'unsigned' | 's
 
 `syncUp()` and `syncDown()` are declared and typed but throw `NotImplementedError`. The kernel itself never initiates network calls in its current implementation; sync ships in a future release alongside a sync server.
 
+### Polyglot-skills layer (v0.10+) — `skills`
+
+*Native everywhere, proprietary nowhere.* The substrate ships no walled skill format; it is fluent in every vendor's, because it knows where each host keeps them. The `skills` namespace folds two read-side verbs over a per-host **location + format map**. Pure filesystem, zero network.
+
+```js
+const { skills } = require('@mediagato/elifant');
+
+// READ — inventory every skill on this machine across every host.
+// projectRoots is LOCAL config (which dirs are project roots); supply it here.
+const inv = skills.scanSkills({ projectRoots: ['C:/CascadeProjects'] });
+// -> { hosts: [{ id, label, format, items: [{ name, desc, path }] }],
+//      mcp:   [{ id, label, servers }],
+//      stats: { skills, hostsHit, projectsScanned } }
+
+// CARRY — translate a Claude skill into another host's dialect (cursor|agents|claude).
+// Best-effort + honest: it NAMES what can't survive the trip and does NOT write to disk.
+const out = skills.carrySkill({ name: 'seal', target: 'cursor' });
+// -> { name, target, suggestedPath, text, lossy: [...], clean }
+if (!out.clean) console.warn('lossy:', out.lossy); // bundled helpers a flat target can't hold
+```
+
+The **use** verb has no code here: once a carried skill sits in a host's slot, that host runs it natively — the substrate borrows the runtime, then owns it.
+
+The canonical host-map lives in the [elifantic spec](https://github.com/mediagato/elifantic) (`spec/skills-registry.json`, MIT — the open joint everyone plugs into). This kernel **vendors a snapshot** (`src/skills-registry.json`) so a core substrate capability never depends on fetching cloud infra at runtime; `loadSkillRegistry({ registry })` lets a caller-supplied map win. Add a host (a new assistant grew an on-disk skill format?) by PR'ing the spec.
+
 ## Schema
 
 ```sql

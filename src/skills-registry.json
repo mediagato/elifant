@@ -1,0 +1,30 @@
+{
+  "version": "0",
+  "kind": "elifantic.skills-registry",
+  "_source": "Vendored snapshot of the canonical map at elifantic spec/skills-registry.json (MIT). Spec: spec/skills-registry-v0.md. A caller-supplied registry always wins over this snapshot; this exists so the read/carry verbs never depend on fetching cloud infra at runtime.",
+  "note": "The open per-host skill location + format map. Consumers supply projectRoots locally; it is not part of this shared map.",
+  "hosts": [
+    { "id": "claude-skills-user",    "label": "Claude — user skills",         "scope": "user",    "path": "~/.claude/skills",   "match": "dir/SKILL.md",            "format": "skill-md", "extract": "frontmatter" },
+    { "id": "claude-skills-project", "label": "Claude — project skills",      "scope": "project", "path": ".claude/skills",     "match": "dir/SKILL.md",            "format": "skill-md", "extract": "frontmatter" },
+    { "id": "claude-md",             "label": "Claude — project memory",      "scope": "project", "path": ".",                  "match": "CLAUDE.md",               "format": "markdown", "extract": "h1" },
+    { "id": "agents-md",             "label": "AGENTS.md — cross-tool",       "scope": "project", "path": ".",                  "match": "AGENTS.md",               "format": "markdown", "extract": "h1" },
+    { "id": "cursor-rules",          "label": "Cursor — rules",               "scope": "project", "path": ".cursor/rules",      "match": "*.mdc",                   "format": "mdc",      "extract": "frontmatter" },
+    { "id": "cursor-legacy",         "label": "Cursor — legacy .cursorrules", "scope": "project", "path": ".",                  "match": ".cursorrules",            "format": "plain",    "extract": "filename" },
+    { "id": "copilot",               "label": "GitHub Copilot — instructions","scope": "project", "path": ".github",            "match": "copilot-instructions.md", "format": "markdown", "extract": "h1" },
+    { "id": "windsurf",              "label": "Windsurf — rules",             "scope": "project", "path": ".",                  "match": ".windsurfrules",          "format": "plain",    "extract": "filename" },
+    { "id": "cline",                 "label": "Cline — rules",                "scope": "project", "path": ".",                  "match": ".clinerules",             "format": "plain",    "extract": "filename" }
+  ],
+  "mcp": [
+    { "id": "claude-cli-mcp",     "label": "Claude CLI — MCP servers",     "path": "~/.claude.json", "key": "mcpServers" },
+    {
+      "id": "claude-desktop-mcp",
+      "label": "Claude Desktop — MCP servers",
+      "paths": {
+        "win32":  "~/AppData/Roaming/Claude/claude_desktop_config.json",
+        "darwin": "~/Library/Application Support/Claude/claude_desktop_config.json",
+        "linux":  "~/.config/Claude/claude_desktop_config.json"
+      },
+      "key": "mcpServers"
+    }
+  ]
+}

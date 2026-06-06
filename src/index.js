@@ -21,6 +21,11 @@
 const path = require('path');
 const fs = require('fs');
 
+// v0.10.0 — the polyglot-skills layer (read + carry verbs over a host-map
+// registry). Self-contained filesystem module; exported as the `skills`
+// namespace below so it never collides with the storage core's flat surface.
+const skills = require('./skills');
+
 // Gate debug stderr behind an opt-in env var so consumers don't see "[brain] ..."
 // lines unless they ask for them. Was unconditional through v0.2.x; gated in
 // v0.3.0-dev.1, made strict + runtime-evaluated in v0.3.0-dev.2 after a
@@ -1407,4 +1412,6 @@ module.exports = {
   syncUp,
   syncDown,
   close,
+  // v0.10.0 — polyglot-skills layer (read + carry over the host-map registry)
+  skills,
 };

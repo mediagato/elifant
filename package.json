@@ -1,7 +1,7 @@
 {
   "name": "@mediagato/elifant",
-  "version": "0.9.0",
-  "description": "Local-first PGlite database kernel for persistent state, memories, and seed templates in Node.js applications. Signed export/import portability plus snapshot/rollback/health primitives. Reference implementation of the Elifantic protocol v0.1 storage layer.",
+  "version": "0.10.0",
+  "description": "Local-first PGlite database kernel for persistent state, memories, and seed templates in Node.js applications. Signed export/import portability plus snapshot/rollback/health primitives, and the polyglot-skills layer (read + carry skills across host dialects). Reference implementation of the Elifantic protocol v0.1 storage layer.",
   "main": "src/index.js",
   "types": "src/index.d.ts",
   "files": [

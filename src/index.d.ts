@@ -615,3 +615,115 @@ export function syncUp(options: SyncOptions): Promise<SyncUpResult>;
 
 /** Pull from a sync server + decrypt + merge. Skeleton (throws NotImplementedError until the sync server ships). */
 export function syncDown(options: SyncDownOptions): Promise<SyncDownResult>;
+
+// ── Polyglot-skills layer (v0.10.0) ──
+//
+// Read + carry verbs over a per-host skill location + format map. "Native
+// everywhere, proprietary nowhere." The canonical map lives in the elifantic
+// spec (spec/skills-registry.json, MIT); this kernel vendors a snapshot for
+// sovereign offline operation. A caller-supplied map always wins.
+
+/** One on-disk skill/rules surface in the host-map registry. */
+export interface SkillsHost {
+  id: string;
+  label: string;
+  scope: 'user' | 'project';
+  path: string;
+  match: string;
+  format: 'skill-md' | 'mdc' | 'markdown' | 'plain';
+  extract: 'frontmatter' | 'h1' | 'filename';
+}
+
+/** One MCP capability surface (config file + the key holding its server map). */
+export interface SkillsMcp {
+  id: string;
+  label: string;
+  path?: string;
+  paths?: Partial<Record<NodeJS.Platform, string>>;
+  key: string;
+}
+
+/** The host-map registry: where every host keeps its skills. */
+export interface SkillRegistry {
+  version: string;
+  kind?: string;
+  hosts: SkillsHost[];
+  mcp?: SkillsMcp[];
+  [k: string]: unknown;
+}
+
+export interface LoadRegistryOptions {
+  /** A registry object supplied by the caller — wins over everything. */
+  registry?: SkillRegistry;
+  /** Path to a registry JSON file. Used when `registry` is absent. */
+  registryPath?: string;
+}
+
+export interface ScanOptions extends LoadRegistryOptions {
+  /** LOCAL config: dirs whose immediate children are project roots. */
+  projectRoots?: string[];
+  /** Override $HOME (testing). */
+  home?: string;
+}
+
+export interface ScannedSkill {
+  name: string;
+  desc: string | null;
+  path: string;
+}
+
+export interface ScannedHost {
+  id: string;
+  label: string;
+  format: string;
+  items: ScannedSkill[];
+}
+
+export interface ScannedMcp {
+  id: string;
+  label: string;
+  servers: string[];
+}
+
+export interface ScanResult {
+  hosts: ScannedHost[];
+  mcp: ScannedMcp[];
+  stats: { skills: number; hostsHit: number; projectsScanned: number };
+}
+
+export type CarryTarget = 'cursor' | 'agents' | 'claude';
+
+export interface CarryOptions {
+  /** Path to a Claude SKILL.md (alternative to skillsDir + name). */
+  source?: string;
+  /** Dir holding <name>/SKILL.md (default ~/.claude/skills). */
+  skillsDir?: string;
+  /** Skill dir name (with skillsDir). */
+  name?: string;
+  target: CarryTarget;
+  /** Override $HOME (testing). */
+  home?: string;
+}
+
+export interface CarryResult {
+  name: string;
+  target: CarryTarget;
+  /** Relative path a caller MAY write the translated skill to. */
+  suggestedPath: string;
+  text: string;
+  /** Sibling files that don't survive the trip to a flat target. */
+  lossy: string[];
+  /** True = pure prose, nothing lost. */
+  clean: boolean;
+}
+
+export namespace skills {
+  /** Resolve the host-map registry (caller registry > registryPath > vendored snapshot). */
+  function loadSkillRegistry(opts?: LoadRegistryOptions): SkillRegistry;
+  /** READ: inventory every skill on this machine across every host. Pure filesystem, zero network. */
+  function scanSkills(opts?: ScanOptions): ScanResult;
+  /** CARRY: translate a Claude skill into another host's dialect; names what can't survive the trip. Does not write to disk. */
+  function carrySkill(opts: CarryOptions): CarryResult;
+  /** Absolute path to the vendored registry snapshot. */
+  const VENDORED_REGISTRY: string;
+}
