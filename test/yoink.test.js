@@ -374,12 +374,15 @@ test('bug_013: tampered payload bytes cause signature_status=invalid', async () 
   );
   await recv1.close();
 
-  // signature_mode=verify (default) should report invalid but not throw
+  // crypto-02 (audit-2026-06-10): the default mode now HARD-FAILS on a tampered
+  // payload too (it was advisory before — reported invalid and imported anyway).
   const recv2 = freshBrain();
   await recv2.init(tmpDir());
-  const result = await recv2.importBrain({ payload: tamperedPayload });
-  assert.equal(result.signature_status, 'invalid',
-    'tampered payload must downgrade signature_status to invalid');
+  await assert.rejects(
+    () => recv2.importBrain({ payload: tamperedPayload }),
+    /invalid|tampered/i,
+    'tampered payload must hard-fail under the default mode'
+  );
   await recv2.close();
 });
 

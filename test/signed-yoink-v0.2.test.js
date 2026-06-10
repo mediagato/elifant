@@ -77,15 +77,19 @@ test('importBrain rejects tampered signature when signature_mode=require', async
       'tampered manifest should reject under signature_mode=require'
     );
 
-    // With default signature_mode=verify, the tampering is logged but import proceeds.
-    const result = await brain.importBrain({ payload: tampered });
-    assert.equal(result.signature_status, 'invalid', 'signature should be reported invalid');
+    // crypto-02 (audit-2026-06-10): the default mode now HARD-FAILS on tampering
+    // too (it was advisory before — reported invalid and imported anyway).
+    await assert.rejects(
+      brain.importBrain({ payload: tampered }),
+      /invalid|tampered/i,
+      'tampered manifest must hard-fail under the default mode'
+    );
   } finally {
     await brain.close();
   }
 });
 
-test('importBrain accepts legacy v0 (unsigned) manifests by default', async () => {
+test('importBrain rejects unsigned by default, imports with allow_unsigned', async () => {
   await makeBrain();
   try {
     // Build a legacy v0 manifest manually
@@ -110,14 +114,48 @@ test('importBrain accepts legacy v0 (unsigned) manifests by default', async () =
       { name: 'brain_meta.json', content: Buffer.from('{}') },
     ];
     const payload = tar.pack(files);
-    const result = await brain.importBrain({ payload });
-    assert.equal(result.signature_status, 'unsigned', 'legacy v0 should report unsigned');
+    // crypto-02 (audit-2026-06-10): unsigned souls are now REJECTED by default...
+    await assert.rejects(
+      brain.importBrain({ payload }),
+      /unsigned/i,
+      'unsigned soul must be rejected by default'
+    );
 
-    // require-mode should reject legacy
+    // ...but the keyholder can import one deliberately with allow_unsigned.
+    const result = await brain.importBrain({ payload, allow_unsigned: true });
+    assert.equal(result.signature_status, 'unsigned', 'allow_unsigned imports a legacy v0 soul (reported unsigned)');
+
+    // require-mode should also reject legacy (no opt-in under require)
     await assert.rejects(
       brain.importBrain({ payload, signature_mode: 'require' }),
       /unsigned/i,
       'require mode should reject legacy v0'
+    );
+  } finally {
+    await brain.close();
+  }
+});
+
+test('allow_unsigned does NOT rescue a tampered (invalid) signature', async () => {
+  await makeBrain();
+  try {
+    await brain.setMemory('a.md', 'a', 'test', 'instance');
+    const exp = await brain.exportBrain();
+
+    // Tamper the manifest after signing → signature becomes invalid.
+    const tar = require('../src/tar');
+    const files = tar.unpack(exp.payload);
+    const mf = files.find((f) => f.name === 'soul-manifest.json');
+    const manifest = JSON.parse(mf.content.toString('utf8'));
+    manifest.exported_at = '2020-01-01T00:00:00.000Z';
+    mf.content = Buffer.from(JSON.stringify(manifest, null, 2));
+    const tampered = tar.pack(files);
+
+    // allow_unsigned is about UNSIGNED souls; it must never bypass tamper detection.
+    await assert.rejects(
+      brain.importBrain({ payload: tampered, allow_unsigned: true }),
+      /invalid|tampered/i,
+      'allow_unsigned must not rescue an invalid signature'
     );
   } finally {
     await brain.close();

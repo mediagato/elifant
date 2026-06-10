@@ -120,6 +120,19 @@ async function init(dataDir) {
 
     CREATE INDEX IF NOT EXISTS captures_ts_idx ON captures (ts DESC);
     CREATE INDEX IF NOT EXISTS captures_source_ts_idx ON captures (source, ts DESC);
+
+    -- crypto-01: pinned keyholder signing keys (TOFU trust anchor). Records the
+    -- Ed25519 public key first seen for each foreign substrate_identity, so a
+    -- later soul claiming the same identity with a DIFFERENT key is caught as
+    -- impersonation. Receiver-private: never exported (not in ALL_TABLES).
+    CREATE TABLE IF NOT EXISTS keyholders (
+      substrate_identity TEXT PRIMARY KEY,
+      public_key TEXT NOT NULL,
+      display_name TEXT,
+      trusted BOOLEAN NOT NULL DEFAULT false,
+      first_seen TEXT NOT NULL,
+      last_seen TEXT
+    );
   `);
 
   // Migration: add embedding column if upgrading from a 0.3.x database that
@@ -825,6 +838,64 @@ async function _getSigningKey() {
   return { privateKey, publicKeyB64: parsed.public_b64 };
 }
 
+// ── Keyholder key pinning (crypto-01 — TOFU trust anchor) ──────────────────
+//
+// A 'verified' signature only proves "signed by SOMEBODY" — the verify key is
+// taken from the manifest itself, so an attacker can self-sign a poisoned soul
+// and get 'verified'. To anchor trust, importBrain pins the Ed25519 public key
+// first seen for each foreign substrate_identity (Trust-On-First-Use). A later
+// soul claiming the same identity with a DIFFERENT key is impersonation (or an
+// unconfirmed key rotation) and is rejected. See audit-2026-06-10 (crypto-01).
+
+async function _lookupKeyholder(identity) {
+  const r = await _db.query(
+    'SELECT substrate_identity, public_key, display_name, trusted, first_seen, last_seen FROM keyholders WHERE substrate_identity = $1',
+    [identity]
+  );
+  return r.rows[0] || null;
+}
+
+/** List known keyholders (pinned signing keys). Powers CONSENT/HEALTH surfaces. */
+async function listKeyholders() {
+  _ensure();
+  const r = await _db.query(
+    'SELECT substrate_identity, public_key, display_name, trusted, first_seen, last_seen FROM keyholders ORDER BY first_seen'
+  );
+  return r.rows;
+}
+
+/** Bless/unbless a known keyholder — the "I trust this keyholder" gesture. */
+async function setKeyholderTrust(identity, trusted) {
+  _ensure();
+  await _db.query('UPDATE keyholders SET trusted = $1 WHERE substrate_identity = $2', [Boolean(trusted), identity]);
+}
+
+/** Un-pin a keyholder. A later import from them becomes first-contact again. */
+async function forgetKeyholder(identity) {
+  _ensure();
+  await _db.query('DELETE FROM keyholders WHERE substrate_identity = $1', [identity]);
+}
+
+/**
+ * Pin a keyholder's public key OUT-OF-BAND — the strongest trust establishment:
+ * the keyholder vouches for a key received over a channel they trust (in person,
+ * verified fingerprint, etc.) rather than trusting-on-first-use. After this, an
+ * import claiming this identity with any other key is rejected as impersonation.
+ */
+async function pinKeyholder(identity, publicKey, { trusted = true, displayName = null } = {}) {
+  _ensure();
+  await _db.query(
+    `INSERT INTO keyholders (substrate_identity, public_key, display_name, trusted, first_seen, last_seen)
+     VALUES ($1, $2, $3, $4, $5, $5)
+     ON CONFLICT(substrate_identity) DO UPDATE SET
+       public_key = EXCLUDED.public_key,
+       display_name = EXCLUDED.display_name,
+       trusted = EXCLUDED.trusted,
+       last_seen = EXCLUDED.last_seen`,
+    [identity, publicKey, displayName, Boolean(trusted), _ts()]
+  );
+}
+
 /**
  * Canonical-form serialization of a manifest for signing. Drops the
  * `signature` field (since the signature signs the rest), sorts keys
@@ -1054,10 +1125,13 @@ async function importBrain(input) {
     throw new Error(`importBrain: unknown manifest schema '${manifest.schema}'`);
   }
 
-  // v0.2 signature verification. Modes:
-  //   verify       — default: if manifest has signature, verify it; if missing, allow (legacy v0)
+  // v0.2 signature verification. Modes (enforcement gate is below, after the
+  // payload-integrity check — see crypto-02):
+  //   verify       — default: a VALID signature proceeds; an INVALID one hard-fails;
+  //                  an UNSIGNED soul is rejected unless input.allow_unsigned is set
   //   require      — manifest MUST be signed and verifiable; reject otherwise
-  //   skip         — don't verify even if signature present (only for migration / debug)
+  //   skip         — don't verify even if signature present (migration / debug bypass;
+  //                  implies allow_unsigned)
   const sigMode = input.signature_mode || 'verify';
   if (!['verify', 'require', 'skip'].includes(sigMode)) {
     throw new Error(`importBrain: unknown signature_mode '${sigMode}'`);
@@ -1105,25 +1179,114 @@ async function importBrain(input) {
   // match the manifest. Catches an attacker who swapped .jsonl bytes after
   // signing — without this, the manifest signature only proved the
   // metadata, not the payload.
-  if (signatureStatus === 'verified' && manifest.file_hashes) {
-    for (const [filename, expected] of Object.entries(manifest.file_hashes)) {
+  // crypto-02 (red-team hardened 2026-06-10) — the payload-integrity binding must
+  // be EXHAUSTIVE, not allowlist-only. manifest.file_hashes is the ONLY thing the
+  // signature binds to the row payloads, so two PoC bypasses of a partial/optional
+  // binding had to be closed: (a) a verified manifest with NO file_hashes (the old
+  // `&& manifest.file_hashes` made the whole check optional → arbitrary rows
+  // imported as 'verified'); (b) a verified manifest listing a SUBSET, with an
+  // extra unlisted *.jsonl the row loops still apply. Now: when verified, require
+  // non-empty file_hashes, require every consumed data file present in the archive
+  // to be covered by a signed hash, and require every listed hash to match. Any
+  // failure is a hard reject.
+  if (signatureStatus === 'verified') {
+    const CONSUMED = ['state.jsonl', 'memories.jsonl', 'steering.jsonl', 'review_lessons.jsonl', 'brain_meta.json'];
+    const hashes = manifest.file_hashes || {};
+    if (Object.keys(hashes).length === 0) {
+      throw new Error('importBrain: refusing to import — verified manifest carries no file_hashes (the signature binds nothing to the payload)');
+    }
+    // Every consumed data file PRESENT in the archive must be covered by a signed
+    // hash — else an attacker appended unsigned rows past a partial manifest.
+    for (const name of CONSUMED) {
+      if (byName[name] !== undefined && !(name in hashes)) {
+        throw new Error(`importBrain: refusing to import — archive contains '${name}' but it is not in the signed file_hashes (unsigned payload smuggled in)`);
+      }
+    }
+    // Every listed hash must reference a present file whose bytes match.
+    for (const [filename, expected] of Object.entries(hashes)) {
       const content = byName[filename];
       if (content === undefined) {
-        signatureStatus = 'invalid';
-        if (sigMode === 'require') {
-          throw new Error(`importBrain: manifest references '${filename}' but archive does not contain it (signature_mode=require)`);
-        }
-        _debug(`[brain] importBrain: file '${filename}' missing from archive`);
-        break;
+        throw new Error(`importBrain: refusing to import — manifest references '${filename}' but the archive does not contain it`);
       }
-      const actual = _sha256(content);
-      if (actual !== expected) {
-        signatureStatus = 'invalid';
-        if (sigMode === 'require') {
-          throw new Error(`importBrain: file '${filename}' content hash mismatch — payload tampered (signature_mode=require)`);
+      if (_sha256(content) !== expected) {
+        throw new Error(`importBrain: refusing to import — '${filename}' content hash mismatch (payload tampered)`);
+      }
+    }
+  }
+
+  // crypto-02 — enforce the verification outcome BEFORE applying any row.
+  // Previously the row loops ran unconditionally and, under the default 'verify'
+  // mode, the signature was advisory (an invalid or unsigned soul still imported).
+  // Now: a present-but-INVALID signature or a payload-hash mismatch is NEVER
+  // imported, in any mode — tampering always hard-fails. An UNSIGNED soul is
+  // rejected by default; the keyholder opts in with allow_unsigned:true to import
+  // a legacy v0 soul (or their own old export) on purpose. allow_unsigned does
+  // NOT rescue an invalid signature. 'skip' stays the explicit migration/debug
+  // bypass (it implies allow_unsigned). See audit-2026-06-10 (crypto-02/03, tar-02).
+  const allowUnsigned = input.allow_unsigned === true || sigMode === 'skip';
+  if (signatureStatus === 'invalid') {
+    throw new Error('importBrain: refusing to import — signature or payload INVALID (tampered)');
+  }
+  if (signatureStatus === 'unsigned' && !allowUnsigned) {
+    throw new Error('importBrain: refusing to import an UNSIGNED soul; pass allow_unsigned:true to import it deliberately');
+  }
+
+  // crypto-01 — trust anchor. A 'verified' signature is only internally
+  // consistent; now check WHOSE key signed it. Pin the key per substrate_identity
+  // (TOFU); a later soul claiming the same identity with a different key is
+  // impersonation and is rejected unless the keyholder confirms a rotation.
+  let senderTrust = null;
+  if (signatureStatus === 'verified') {
+    const senderId = manifest.substrate_identity || null;
+    const senderKey = (manifest.signature && manifest.signature.keyholder_public_key) || null;
+    const myId = await _getSubstrateIdentity();
+    if (senderId && senderId === myId) {
+      // crypto-01 (red-team hardened 2026-06-10): substrate_identity is PUBLIC —
+      // it ships in plaintext in every exported soul — so an identity match alone
+      // is NOT a trust anchor. Only the signing key is secret. Require the soul to
+      // be signed by THIS bowl's own key; an attacker who stamps our identity onto
+      // a foreign-signed soul matches the id but not the key, and must be rejected
+      // as an impersonation rather than granted the most-trusted 'self' tier.
+      const { publicKeyB64: myKey } = await _getSigningKey();
+      if (senderKey && senderKey === myKey) {
+        senderTrust = 'self'; // genuinely my own export, re-imported (round-trip / snapshot)
+      } else {
+        throw new Error("importBrain: refusing to import — manifest claims THIS bowl's substrate_identity but is signed by a different key (identity spoof)");
+      }
+    } else if (!senderId || !senderKey) {
+      senderTrust = 'unknown-identity'; // verified but unpinnable (malformed manifest)
+    } else {
+      const known = await _lookupKeyholder(senderId);
+      if (!known) {
+        // First contact: record the key (TOFU), accept-and-flag. The keyholder
+        // may bless this sender now (trust_sender) so future imports are trusted
+        // and a key change is caught. NOTE (red-team 2026-06-10): sender_trust is
+        // currently ADVISORY — the row loops below apply regardless of trust. The
+        // demotion/quarantine of a non-trusted sender's claims (so SURFACE wraps
+        // them as tier-3 instead of treating them as keyholder-authoritative) is
+        // the trust_tier work in Phase A.1 (decision-b); until it lands, a caller
+        // MUST gate on sender_trust itself — a first SUMMON of a hostile soul still
+        // writes its rows.
+        await _db.query(
+          `INSERT INTO keyholders (substrate_identity, public_key, display_name, trusted, first_seen, last_seen)
+           VALUES ($1, $2, $3, $4, $5, $5) ON CONFLICT(substrate_identity) DO NOTHING`,
+          [senderId, senderKey, manifest.display_name || null, input.trust_sender === true, _ts()]
+        );
+        senderTrust = input.trust_sender === true ? 'trusted-now' : 'first-contact';
+      } else if (known.public_key === senderKey) {
+        await _db.query('UPDATE keyholders SET last_seen = $1 WHERE substrate_identity = $2', [_ts(), senderId]);
+        if (input.trust_sender === true && !known.trusted) {
+          await _db.query('UPDATE keyholders SET trusted = true WHERE substrate_identity = $1', [senderId]);
         }
-        _debug(`[brain] importBrain: file '${filename}' content tampered (expected ${expected}, got ${actual})`);
-        break;
+        senderTrust = (known.trusted || input.trust_sender === true) ? 'trusted' : 'known-untrusted';
+      } else {
+        // Same identity, DIFFERENT key — impersonation or an unconfirmed rotation.
+        if (input.accept_key_change === true) {
+          await _db.query('UPDATE keyholders SET public_key = $1, last_seen = $2 WHERE substrate_identity = $3', [senderKey, _ts(), senderId]);
+          senderTrust = 'key-rotated';
+        } else {
+          throw new Error(`importBrain: refusing to import — substrate_identity ${senderId} presents a DIFFERENT signing key than the one pinned (possible impersonation). Pass accept_key_change:true to accept a deliberate key rotation.`);
+        }
       }
     }
   }
@@ -1242,7 +1405,7 @@ async function importBrain(input) {
   }
 
   _debug(`[brain] importBrain: imported ${JSON.stringify(imported)}, skipped ${skipped}, conflicts ${conflicts}`);
-  return { imported, skipped, conflicts, manifest, signature_status: signatureStatus };
+  return { imported, skipped, conflicts, manifest, signature_status: signatureStatus, sender_trust: senderTrust };
 }
 
 // ── SNAPSHOT / ROLLBACK / LIST_SNAPSHOTS / HEALTH (v0.3 — Elifantic protocol v0.1) ──
@@ -1403,6 +1566,11 @@ module.exports = {
   // v0.2.0 — Elifantic protocol v0 (skeletons; throw NotImplementedError until Tue/Thu)
   exportBrain,
   importBrain,
+  // crypto-01 — keyholder key pinning (TOFU trust anchor)
+  listKeyholders,
+  setKeyholderTrust,
+  forgetKeyholder,
+  pinKeyholder,
   // v0.3.0-dev — Elifantic protocol v0.1 (skeletons; throw NotImplementedError until a future release)
   snapshot,
   rollback,
