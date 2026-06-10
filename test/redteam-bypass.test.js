@@ -134,39 +134,114 @@ test('red-team crypto-02: a legitimate PARTIAL export still imports (no false po
   } finally { await brain.close(); }
 });
 
-// A.1 anti-replay. exported_at is a SIGNED field, so a captured OLDER export from a
-// known keyholder can't be re-stamped newer — importBrain rejects it as a replay
-// (it would resurrect rows you deleted after that export). Equal is fine (idempotent
-// re-import); a deliberate older import opts in with allow_replay.
-test('A.1 anti-replay: a strictly-older export from a known keyholder is rejected', async () => {
+// A.1 + 0.14.0(A) anti-replay. exported_at is a SIGNED field, so a captured export
+// from a known keyholder can't be re-stamped — importBrain rejects BOTH a strictly
+// OLDER soul AND an EXACT re-import of the last-accepted soul (the equal-stamp
+// resurrection hole: re-importing the newest soul after you deleted a row from it
+// would re-insert that row). A genuinely-different same-second sibling has a
+// different signature and still imports; a deliberate re-import opts in with allow_replay.
+const stateRowLine = (k) =>
+  JSON.stringify({ key: k, value: 'v', updated_at: '2026-06-10T12:00:00Z', updated_by: 'test', layer: 'instance', anonymizable: true }) + '\n';
+
+test('0.14.0 A: older AND exact-reconsume are replays; allow_replay overrides; different sibling imports', async () => {
   await brain.init(tmpDir());
   try {
     const key = genKey();
     const id = '44444444-4444-4444-4444-444444444444';
-    const mk = (exportedAt) => forgeSoul({
+    const mk = (exportedAt, body) => forgeSoul({
       identity: id,
-      files: { 'state.jsonl': Buffer.from('') },
+      files: { 'state.jsonl': Buffer.from(body !== undefined ? body : '') },
       signKey: key,
       fileHashes: true,
       exportedAt,
     });
     const older = mk('2026-06-10T10:00:00Z');
-    const newer = mk('2026-06-10T12:00:00Z');
+    const newer = mk('2026-06-10T12:00:00Z', stateRowLine('a'));
 
-    // Import the NEWER soul first → first-contact pins the key + high-water=12:00.
+    // Import newer first → first-contact pins key + high-water + signature.
     const r1 = await brain.importBrain({ payload: newer });
     assert.equal(r1.sender_trust, 'first-contact');
 
-    // Replaying the OLDER soul is rejected.
-    await assert.rejects(brain.importBrain({ payload: older }), /older|replay/i);
+    // A strictly-older capture is rejected as a replay.
+    await assert.rejects(brain.importBrain({ payload: older }), /replay|older/i);
 
-    // The keyholder can still import the older soul deliberately with the opt-in.
+    // 0.14.0: re-importing the EXACT newest soul is now rejected (same signature as
+    // the last accepted) — closes the equal-stamp resurrection of deleted rows.
+    await assert.rejects(brain.importBrain({ payload: newer }), /replay|exact/i);
+
+    // allow_replay overrides both.
     const r2 = await brain.importBrain({ payload: older, allow_replay: true });
     assert.equal(r2.signature_status, 'verified');
+    const r3 = await brain.importBrain({ payload: newer, allow_replay: true });
+    assert.equal(r3.signature_status, 'verified');
 
-    // Re-importing the newest soul (equal high-water) is fine — not a replay.
-    const r3 = await brain.importBrain({ payload: newer });
-    assert.ok(['trusted', 'known-untrusted'].includes(r3.sender_trust));
+    // A genuinely DIFFERENT soul at the same second (different content → different
+    // signature) is NOT a replay and still imports — no false positive.
+    const sibling = mk('2026-06-10T12:00:00Z', stateRowLine('b'));
+    const r4 = await brain.importBrain({ payload: sibling });
+    assert.equal(r4.signature_status, 'verified');
+    assert.ok(['trusted', 'known-untrusted'].includes(r4.sender_trust));
+  } finally { await brain.close(); }
+});
+
+test('0.14.0 B: a verified soul with NO substrate_identity is rejected (cannot be pinned/replay-tracked)', async () => {
+  await brain.init(tmpDir());
+  try {
+    const payload = forgeSoul({
+      identity: undefined, // omit it — the signature still verifies over the canonical form
+      files: { 'state.jsonl': Buffer.from('') },
+      signKey: genKey(),
+      fileHashes: true,
+      exportedAt: '2026-06-10T12:00:00Z',
+    });
+    await assert.rejects(brain.importBrain({ payload }), /substrate_identity/i);
+  } finally { await brain.close(); }
+});
+
+test('0.14.0 D: a verified soul with a malformed exported_at is rejected (no fail-open)', async () => {
+  await brain.init(tmpDir());
+  try {
+    const payload = forgeSoul({
+      identity: '55555555-5555-5555-5555-555555555555',
+      files: { 'state.jsonl': Buffer.from('') },
+      signKey: genKey(),
+      fileHashes: true,
+      exportedAt: 'not-a-timestamp',
+    });
+    await assert.rejects(brain.importBrain({ payload }), /well-formed exported_at/i);
+  } finally { await brain.close(); }
+});
+
+test('0.14.0 E: a verified soul stamped implausibly far in the future is rejected (high-water poisoning)', async () => {
+  await brain.init(tmpDir());
+  try {
+    const payload = forgeSoul({
+      identity: '66666666-6666-6666-6666-666666666666',
+      files: { 'state.jsonl': Buffer.from('') },
+      signKey: genKey(),
+      fileHashes: true,
+      exportedAt: '2099-01-01T00:00:00Z',
+    });
+    await assert.rejects(brain.importBrain({ payload }), /future/i);
+  } finally { await brain.close(); }
+});
+
+test('0.14.0 F: a soul that fails mid-apply (bad brain_meta) leaves NOTHING applied (atomic)', async () => {
+  await brain.init(tmpDir());
+  try {
+    const stateContent = Buffer.from(stateRowLine('atomic-probe'));
+    const badMeta = Buffer.from('{ this is not valid json');
+    const payload = forgeSoul({
+      identity: '77777777-7777-7777-7777-777777777777',
+      files: { 'state.jsonl': stateContent, 'brain_meta.json': badMeta },
+      signKey: genKey(),
+      fileHashes: true,
+      exportedAt: '2026-06-10T12:00:00Z',
+    });
+    // state.jsonl applies first, brain_meta.json (parsed last) throws → ROLLBACK.
+    await assert.rejects(brain.importBrain({ payload }), /JSON|Unexpected|token/i);
+    const got = await brain.getState('atomic-probe');
+    assert.equal(got, null, 'a failed import must apply nothing (the row must not survive)');
   } finally { await brain.close(); }
 });
 

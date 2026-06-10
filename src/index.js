@@ -132,7 +132,8 @@ async function init(dataDir) {
       trusted BOOLEAN NOT NULL DEFAULT false,
       first_seen TEXT NOT NULL,
       last_seen TEXT,
-      last_exported_at TEXT
+      last_exported_at TEXT,
+      last_signature TEXT
     );
   `);
 
@@ -141,6 +142,11 @@ async function init(dataDir) {
   // stamp is a SIGNED manifest field so it can't be forged newer. Migration for
   // brains created at 0.11.0 (keyholders pre-dates this column). Idempotent.
   await _db.exec(`ALTER TABLE keyholders ADD COLUMN IF NOT EXISTS last_exported_at TEXT;`);
+  // 0.14.0 anti-replay edge-hardening: signature of the last-accepted soul, so an
+  // EXACT re-import of the newest soul (same exported_at, same bytes) is caught as a
+  // replay rather than silently resurrecting rows the keyholder deleted since. A
+  // genuinely different same-second sibling has a different signature and still imports.
+  await _db.exec(`ALTER TABLE keyholders ADD COLUMN IF NOT EXISTS last_signature TEXT;`);
 
   // Migration: add embedding column if upgrading from a 0.3.x database that
   // pre-dates pgvector. Idempotent.
@@ -173,6 +179,21 @@ async function init(dataDir) {
 
 function _ts() {
   return new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+}
+
+// Tolerate a producer's clock skew, but reject an export stamped beyond this far
+// in the future — a hostile first-contact soul could otherwise seed a keyholder's
+// anti-replay high-water at year 9999 and lock out their genuine later exports.
+const REPLAY_FUTURE_SKEW_MS = 48 * 60 * 60 * 1000;
+
+// Parse an export stamp (manifest.exported_at) to epoch ms for ordering + validity.
+// Returns a finite number for a well-formed timestamp, NaN otherwise. Comparing
+// NUMERICALLY (not lexically) is format-robust: a ms-precision or offset stamp from
+// another open-protocol peer still orders correctly, and garbage / non-strings are
+// caught as NaN instead of silently mis-sorting or failing a check OPEN.
+function _parseStamp(s) {
+  if (typeof s !== 'string' || !s) return NaN;
+  return Date.parse(s);
 }
 
 function _ensure() {
@@ -861,7 +882,7 @@ async function _getSigningKey() {
 
 async function _lookupKeyholder(identity) {
   const r = await _db.query(
-    'SELECT substrate_identity, public_key, display_name, trusted, first_seen, last_seen, last_exported_at FROM keyholders WHERE substrate_identity = $1',
+    'SELECT substrate_identity, public_key, display_name, trusted, first_seen, last_seen, last_exported_at, last_signature FROM keyholders WHERE substrate_identity = $1',
     [identity]
   );
   return r.rows[0] || null;
@@ -871,7 +892,7 @@ async function _lookupKeyholder(identity) {
 async function listKeyholders() {
   _ensure();
   const r = await _db.query(
-    'SELECT substrate_identity, public_key, display_name, trusted, first_seen, last_seen, last_exported_at FROM keyholders ORDER BY first_seen'
+    'SELECT substrate_identity, public_key, display_name, trusted, first_seen, last_seen, last_exported_at, last_signature FROM keyholders ORDER BY first_seen'
   );
   return r.rows;
 }
@@ -1252,10 +1273,38 @@ async function importBrain(input) {
   // (TOFU); a later soul claiming the same identity with a different key is
   // impersonation and is rejected unless the keyholder confirms a rotation.
   let senderTrust = null;
+  const imported = { state: 0, memories: 0, steering: 0, review_lessons: 0 };
+  let skipped = 0;
+  let conflicts = 0;
+
+  // F (0.14.0) — apply the trust-anchor writes + ALL row mutations atomically.
+  // PGlite is a single connection, so BEGIN/COMMIT here makes the whole import
+  // all-or-nothing: a malformed row, a constraint violation, a bad brain_meta blob
+  // (parsed last), or a crash mid-apply can no longer leave a half-imported bowl
+  // with the keyholder high-water already advanced. Any throw rolls back.
+  await _db.query('BEGIN');
+  let _committed = false;
+  try {
   if (signatureStatus === 'verified') {
     const senderId = manifest.substrate_identity || null;
     const senderKey = (manifest.signature && manifest.signature.keyholder_public_key) || null;
+    const senderSig = (manifest.signature && manifest.signature.signature) || null;
     const myId = await _getSubstrateIdentity();
+
+    // D (0.14.0) — a verified soul MUST carry a well-formed exported_at. It anchors
+    // the anti-replay high-water; a missing/garbage stamp used to make the replay
+    // check fail OPEN. Parse to epoch ms (format-robust vs a lexical compare) and
+    // reject NaN. E (0.14.0) — and reject a stamp implausibly far in the future, so
+    // a hostile first soul can't seed a keyholder's high-water at year 9999 and lock
+    // out their genuine later exports.
+    const incomingMs = _parseStamp(manifest.exported_at);
+    if (!Number.isFinite(incomingMs)) {
+      throw new Error('importBrain: refusing to import — a verified soul must carry a well-formed exported_at timestamp');
+    }
+    if (incomingMs > Date.now() + REPLAY_FUTURE_SKEW_MS) {
+      throw new Error('importBrain: refusing to import — soul exported_at is implausibly far in the future (clock-skew or corrupt stamp)');
+    }
+
     if (senderId && senderId === myId) {
       // crypto-01 (red-team hardened 2026-06-10): substrate_identity is PUBLIC —
       // it ships in plaintext in every exported soul — so an identity match alone
@@ -1269,43 +1318,51 @@ async function importBrain(input) {
       } else {
         throw new Error("importBrain: refusing to import — manifest claims THIS bowl's substrate_identity but is signed by a different key (identity spoof)");
       }
-    } else if (!senderId || !senderKey) {
-      senderTrust = 'unknown-identity'; // verified but unpinnable (malformed manifest)
+    } else if (!senderId) {
+      // B (0.14.0) — a verified soul with NO substrate_identity can't be pinned or
+      // replay-tracked. It used to take a free 'unknown-identity' pass that applied
+      // its rows AND permanently escaped the high-water (infinite re-summon, and a
+      // clean bypass of the future trust gate). No legitimate export omits it
+      // (exportBrain always emits one), so reject it outright.
+      throw new Error('importBrain: refusing to import — a verified soul must carry a substrate_identity (it cannot be pinned or replay-tracked without one)');
     } else {
       const known = await _lookupKeyholder(senderId);
       if (!known) {
-        // First contact: record the key (TOFU), accept-and-flag. The keyholder
-        // may bless this sender now (trust_sender) so future imports are trusted
-        // and a key change is caught. NOTE (red-team 2026-06-10): sender_trust is
+        // First contact: pin the key (TOFU), accept-and-flag, seed the high-water +
+        // the last-accepted signature. NOTE (red-team 2026-06-10): sender_trust is
         // currently ADVISORY — the row loops below apply regardless of trust. The
-        // demotion/quarantine of a non-trusted sender's claims (so SURFACE wraps
-        // them as tier-3 instead of treating them as keyholder-authoritative) is
-        // the trust_tier work in Phase A.1 (decision-b); until it lands, a caller
-        // MUST gate on sender_trust itself — a first SUMMON of a hostile soul still
-        // writes its rows.
+        // demotion/quarantine of a non-trusted sender's claims is the trust_tier work
+        // in Phase A.1 (decision-b); until it lands, a caller MUST gate on
+        // sender_trust itself — a first SUMMON of a hostile soul still writes its rows.
         await _db.query(
-          `INSERT INTO keyholders (substrate_identity, public_key, display_name, trusted, first_seen, last_seen, last_exported_at)
-           VALUES ($1, $2, $3, $4, $5, $5, $6) ON CONFLICT(substrate_identity) DO NOTHING`,
-          [senderId, senderKey, manifest.display_name || null, input.trust_sender === true, _ts(), manifest.exported_at || null]
+          `INSERT INTO keyholders (substrate_identity, public_key, display_name, trusted, first_seen, last_seen, last_exported_at, last_signature)
+           VALUES ($1, $2, $3, $4, $5, $5, $6, $7) ON CONFLICT(substrate_identity) DO NOTHING`,
+          [senderId, senderKey, manifest.display_name || null, input.trust_sender === true, _ts(), manifest.exported_at, senderSig]
         );
         senderTrust = input.trust_sender === true ? 'trusted-now' : 'first-contact';
       } else if (known.public_key === senderKey) {
-        // Same pinned key — a genuine return visit from this keyholder. Anti-replay
-        // (A.1): exported_at is a SIGNED field, so an attacker can't forge a newer
-        // stamp on an older soul. Reject a soul STRICTLY OLDER than the newest we've
-        // already accepted from this keyholder — a captured old export replayed to
-        // resurrect rows you've since deleted. Equal is allowed (re-importing the
-        // same file is an idempotent no-op under newer-wins); a deliberate older
-        // import is still possible with allow_replay. Second-precision stamps mean
-        // two genuine exports in the same second compare equal — never a false reject.
-        const incoming = manifest.exported_at || null;
-        if (incoming && known.last_exported_at && incoming < known.last_exported_at && input.allow_replay !== true) {
-          throw new Error(`importBrain: refusing to import — this soul (exported ${incoming}) is OLDER than the newest already accepted from ${senderId} (${known.last_exported_at}); looks like a replayed old export. Pass allow_replay:true to import it deliberately.`);
+        // Same pinned key — a genuine return visit. Anti-replay: exported_at is a
+        // SIGNED field, so an attacker can't forge a newer stamp on an older soul.
+        // Reject if EITHER (older) the stamp is strictly older than our high-water —
+        // a captured old export — OR (A, 0.14.0) this is the EXACT soul we last
+        // accepted (same signature). The latter closes the equal-stamp resurrection
+        // hole: re-importing the newest soul after you've DELETED a row from it
+        // re-inserts that row (no existing row → no newer-wins protection). A
+        // genuinely different same-second sibling has a different signature and still
+        // imports; a deliberate re-import opts in with allow_replay.
+        const knownMs = _parseStamp(known.last_exported_at);
+        const isOlder = Number.isFinite(knownMs) && incomingMs < knownMs;
+        const isExactReconsume = senderSig && known.last_signature && senderSig === known.last_signature;
+        if ((isOlder || isExactReconsume) && input.allow_replay !== true) {
+          const detail = isExactReconsume
+            ? 'the exact export already accepted'
+            : `exported_at ${manifest.exported_at} is older than the high-water ${known.last_exported_at}`;
+          throw new Error(`importBrain: refusing to import — this soul looks like a replay (${detail}) from keyholder ${senderId}. Pass allow_replay:true to import it deliberately.`);
         }
         await _db.query('UPDATE keyholders SET last_seen = $1 WHERE substrate_identity = $2', [_ts(), senderId]);
-        // Advance the high-water mark to the newest stamp we've accepted.
-        if (incoming && (!known.last_exported_at || incoming > known.last_exported_at)) {
-          await _db.query('UPDATE keyholders SET last_exported_at = $1 WHERE substrate_identity = $2', [incoming, senderId]);
+        // Advance the high-water + last-accepted signature to the newest soul we accept.
+        if (!Number.isFinite(knownMs) || incomingMs > knownMs) {
+          await _db.query('UPDATE keyholders SET last_exported_at = $1, last_signature = $2 WHERE substrate_identity = $3', [manifest.exported_at, senderSig, senderId]);
         }
         if (input.trust_sender === true && !known.trusted) {
           await _db.query('UPDATE keyholders SET trusted = true WHERE substrate_identity = $1', [senderId]);
@@ -1314,11 +1371,16 @@ async function importBrain(input) {
       } else {
         // Same identity, DIFFERENT key — impersonation or an unconfirmed rotation.
         if (input.accept_key_change === true) {
-          // A deliberate rotation re-baselines the keyholder: new key, and the
-          // high-water resets to this soul's stamp (the replay check resumes from here).
+          // A deliberate rotation re-pins the key + re-baselines the last-accepted
+          // signature. C (0.14.0) — the high-water is MONOTONIC: keep max(old, incoming)
+          // so a rotation can NEVER move the anti-replay watermark backward (the one
+          // path that previously could). `trusted` is preserved by design — a rotation
+          // is the keyholder vouching "same me, new key" (Steve, 2026-06-10).
+          const knownMs = _parseStamp(known.last_exported_at);
+          const keepStamp = (Number.isFinite(knownMs) && knownMs >= incomingMs) ? known.last_exported_at : manifest.exported_at;
           await _db.query(
-            'UPDATE keyholders SET public_key = $1, last_seen = $2, last_exported_at = $3 WHERE substrate_identity = $4',
-            [senderKey, _ts(), manifest.exported_at || known.last_exported_at || null, senderId]
+            'UPDATE keyholders SET public_key = $1, last_seen = $2, last_exported_at = $3, last_signature = $4 WHERE substrate_identity = $5',
+            [senderKey, _ts(), keepStamp, senderSig, senderId]
           );
           senderTrust = 'key-rotated';
         } else {
@@ -1327,10 +1389,6 @@ async function importBrain(input) {
       }
     }
   }
-
-  const imported = { state: 0, memories: 0, steering: 0, review_lessons: 0 };
-  let skipped = 0;
-  let conflicts = 0;
 
   // ── state ────────────────────────────────────────────────────────────
   if (byName['state.jsonl']) {
@@ -1439,6 +1497,15 @@ async function importBrain(input) {
         ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value
       `, [k, v]);
     }
+  }
+
+    await _db.query('COMMIT');
+    _committed = true;
+  } finally {
+    // Any throw above (validation, replay reject, bad row, malformed brain_meta,
+    // constraint violation) leaves the import wholly un-applied — the high-water
+    // never moves on a failed import. See F (0.14.0).
+    if (!_committed) { try { await _db.query('ROLLBACK'); } catch { /* nothing to undo */ } }
   }
 
   _debug(`[brain] importBrain: imported ${JSON.stringify(imported)}, skipped ${skipped}, conflicts ${conflicts}`);

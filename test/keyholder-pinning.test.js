@@ -75,7 +75,9 @@ test('crypto-01: trust_sender blesses the sender (trusted-now), and a re-import 
   try {
     const r1 = await brain.importBrain({ payload: sender.payload, trust_sender: true });
     assert.equal(r1.sender_trust, 'trusted-now');
-    const r2 = await brain.importBrain({ payload: sender.payload });
+    // 0.14.0: re-importing the EXACT same soul is now an exact-reconsume replay, so the
+    // deliberate re-import opts in with allow_replay; the trust resolution still says 'trusted'.
+    const r2 = await brain.importBrain({ payload: sender.payload, allow_replay: true });
     assert.equal(r2.sender_trust, 'trusted');
   } finally { await brain.close(); }
 });
