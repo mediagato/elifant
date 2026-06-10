@@ -133,3 +133,36 @@ test('red-team crypto-02: a legitimate PARTIAL export still imports (no false po
     assert.equal(res.imported.state, 1);
   } finally { await brain.close(); }
 });
+
+// CONSUMED-sync guard (cleanup batch, audit-2026-06-10). The crypto-02 binding's
+// CONSUMED list is a hand-kept mirror of importBrain's row loops; if a NEW consumed
+// file is ever added to the loops without being added to CONSUMED, the smuggle gap
+// reopens for it. The original red-team test only proved the steering case. This
+// pins ALL FIVE: each consumed data file, present in the archive but omitted from a
+// (non-empty) signed file_hashes set, must be rejected as a smuggled payload. If a
+// sixth importable file appears, add it here AND to CONSUMED — this test is the
+// reminder that the two must move together.
+test('red-team crypto-02: every consumed file is individually smuggle-rejected (CONSUMED-sync guard)', async () => {
+  const CONSUMED = ['state.jsonl', 'memories.jsonl', 'steering.jsonl', 'review_lessons.jsonl', 'brain_meta.json'];
+  for (const target of CONSUMED) {
+    await brain.init(tmpDir());
+    try {
+      // A companion file that IS hashed, so file_hashes is non-empty and we exercise
+      // the "present-but-unlisted" branch (not the "no file_hashes at all" branch).
+      const companion = target === 'brain_meta.json' ? 'state.jsonl' : 'brain_meta.json';
+      const companionContent = Buffer.from(companion === 'brain_meta.json' ? '{}' : '');
+      const targetContent = Buffer.from(`smuggled-${target}`);
+      const payload = forgeSoul({
+        identity: '33333333-3333-3333-3333-333333333333',
+        files: { [companion]: companionContent, [target]: targetContent },
+        signKey: genKey(),
+        fileHashes: { [companion]: sha256(companionContent) }, // target deliberately NOT hashed
+      });
+      await assert.rejects(
+        brain.importBrain({ payload }),
+        /not in the signed file_hashes|smuggled/i,
+        `expected a smuggled '${target}' to be rejected`
+      );
+    } finally { await brain.close(); }
+  }
+});

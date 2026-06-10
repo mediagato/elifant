@@ -15,6 +15,15 @@
 
 const BLOCK = 512;
 
+// The USTAR size field is 12 bytes = 11 octal digits + a NUL terminator, so the
+// largest size it can encode is 0o77777777777 (8 GiB - 1). A member past that
+// would make the octal string overflow 11 digits; _writeOctal would then truncate
+// the field and DROP the NUL terminator, silently writing a corrupt size a reader
+// could misinterpret. Reject it loudly instead — an 8 GiB single member in a
+// memory export is absurd, and GNU base-256 large-size encoding is out of scope
+// for this minimal writer. See audit-2026-06-10 (tar pack NUL-drop).
+const MAX_USTAR_SIZE = 0o77777777777;
+
 function _pad(b) {
   const r = b.length % BLOCK;
   if (r === 0) return b;
@@ -29,6 +38,9 @@ function _writeOctal(buf, offset, length, value) {
 function _header(name, size) {
   if (Buffer.byteLength(name) > 100) {
     throw new Error(`tar: filename too long (max 100): ${name}`);
+  }
+  if (size > MAX_USTAR_SIZE) {
+    throw new Error(`tar: member too large for USTAR size field (${size} bytes > ${MAX_USTAR_SIZE}): ${name}`);
   }
   const h = Buffer.alloc(BLOCK);
   h.write(name, 0, 100, 'ascii');

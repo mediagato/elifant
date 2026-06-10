@@ -651,8 +651,13 @@ async function getCaptures(opts = {}) {
   if (source) { where.push(`source = $${i++}`); params.push(source); }
   if (type)   { where.push(`type = $${i++}`); params.push(type); }
   const whereClause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  // sqli-01: bind the LIMIT as a parameter rather than interpolate it. `limit` is
+  // already coerced to an integer in [1, 10000] above, so this is defense-in-depth
+  // (no live injection), but it keeps the query string free of any caller-derived
+  // value — the standing pattern, and one less thing to re-verify on every edit.
+  params.push(limit);
   const result = await _db.query(
-    `SELECT id, source, type, ts, data FROM captures ${whereClause} ORDER BY ts DESC LIMIT ${limit}`,
+    `SELECT id, source, type, ts, data FROM captures ${whereClause} ORDER BY ts DESC LIMIT $${params.length}`,
     params
   );
   return result.rows.map(r => ({
