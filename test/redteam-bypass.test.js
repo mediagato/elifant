@@ -48,7 +48,7 @@ function genKey() {
 // files; object = explicit subset; omitted = none. signKey signs + its pubkey is
 // embedded, so the signature VERIFIES (that is the whole point — 'verified' must
 // not be enough on its own).
-function forgeSoul({ identity, files, signKey, fileHashes }) {
+function forgeSoul({ identity, files, signKey, fileHashes, exportedAt }) {
   const data = {};
   for (const [n, c] of Object.entries(files)) data[n] = Buffer.isBuffer(c) ? c : Buffer.from(c, 'utf8');
   let fh;
@@ -59,7 +59,7 @@ function forgeSoul({ identity, files, signKey, fileHashes }) {
     substrate_identity: identity,
     display_name: 'forged',
     brain_version: '0.0.0',
-    exported_at: '2026-01-01T00:00:00Z',
+    exported_at: exportedAt || '2026-01-01T00:00:00Z',
     table_counts: {},
     encryption: null,
   };
@@ -131,6 +131,42 @@ test('red-team crypto-02: a legitimate PARTIAL export still imports (no false po
     const res = await brain.importBrain({ payload: exp.payload });
     assert.equal(res.signature_status, 'verified');
     assert.equal(res.imported.state, 1);
+  } finally { await brain.close(); }
+});
+
+// A.1 anti-replay. exported_at is a SIGNED field, so a captured OLDER export from a
+// known keyholder can't be re-stamped newer — importBrain rejects it as a replay
+// (it would resurrect rows you deleted after that export). Equal is fine (idempotent
+// re-import); a deliberate older import opts in with allow_replay.
+test('A.1 anti-replay: a strictly-older export from a known keyholder is rejected', async () => {
+  await brain.init(tmpDir());
+  try {
+    const key = genKey();
+    const id = '44444444-4444-4444-4444-444444444444';
+    const mk = (exportedAt) => forgeSoul({
+      identity: id,
+      files: { 'state.jsonl': Buffer.from('') },
+      signKey: key,
+      fileHashes: true,
+      exportedAt,
+    });
+    const older = mk('2026-06-10T10:00:00Z');
+    const newer = mk('2026-06-10T12:00:00Z');
+
+    // Import the NEWER soul first → first-contact pins the key + high-water=12:00.
+    const r1 = await brain.importBrain({ payload: newer });
+    assert.equal(r1.sender_trust, 'first-contact');
+
+    // Replaying the OLDER soul is rejected.
+    await assert.rejects(brain.importBrain({ payload: older }), /older|replay/i);
+
+    // The keyholder can still import the older soul deliberately with the opt-in.
+    const r2 = await brain.importBrain({ payload: older, allow_replay: true });
+    assert.equal(r2.signature_status, 'verified');
+
+    // Re-importing the newest soul (equal high-water) is fine — not a replay.
+    const r3 = await brain.importBrain({ payload: newer });
+    assert.ok(['trusted', 'known-untrusted'].includes(r3.sender_trust));
   } finally { await brain.close(); }
 });
 

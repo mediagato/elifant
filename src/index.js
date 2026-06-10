@@ -131,9 +131,16 @@ async function init(dataDir) {
       display_name TEXT,
       trusted BOOLEAN NOT NULL DEFAULT false,
       first_seen TEXT NOT NULL,
-      last_seen TEXT
+      last_seen TEXT,
+      last_exported_at TEXT
     );
   `);
+
+  // crypto-01 anti-replay (A.1): newest exported_at accepted from each keyholder.
+  // A captured OLDER export replayed to resurrect rows you deleted is rejected; the
+  // stamp is a SIGNED manifest field so it can't be forged newer. Migration for
+  // brains created at 0.11.0 (keyholders pre-dates this column). Idempotent.
+  await _db.exec(`ALTER TABLE keyholders ADD COLUMN IF NOT EXISTS last_exported_at TEXT;`);
 
   // Migration: add embedding column if upgrading from a 0.3.x database that
   // pre-dates pgvector. Idempotent.
@@ -854,7 +861,7 @@ async function _getSigningKey() {
 
 async function _lookupKeyholder(identity) {
   const r = await _db.query(
-    'SELECT substrate_identity, public_key, display_name, trusted, first_seen, last_seen FROM keyholders WHERE substrate_identity = $1',
+    'SELECT substrate_identity, public_key, display_name, trusted, first_seen, last_seen, last_exported_at FROM keyholders WHERE substrate_identity = $1',
     [identity]
   );
   return r.rows[0] || null;
@@ -864,7 +871,7 @@ async function _lookupKeyholder(identity) {
 async function listKeyholders() {
   _ensure();
   const r = await _db.query(
-    'SELECT substrate_identity, public_key, display_name, trusted, first_seen, last_seen FROM keyholders ORDER BY first_seen'
+    'SELECT substrate_identity, public_key, display_name, trusted, first_seen, last_seen, last_exported_at FROM keyholders ORDER BY first_seen'
   );
   return r.rows;
 }
@@ -1103,6 +1110,10 @@ async function exportBrain(options = {}) {
  * @param {string} [input.passphrase]                         — v0.3 (Thu)
  * @param {'skip'|'overwrite'|'newer-wins'} [input.conflict='newer-wins']
  * @param {Array<'instance'|'pattern'|'any'>} [input.layer_filter] — default ['any']
+ * @param {boolean} [input.allow_unsigned]   — opt in to importing an UNSIGNED soul
+ * @param {boolean} [input.allow_replay]     — opt in to a strictly-older export from a known keyholder (anti-replay override)
+ * @param {boolean} [input.trust_sender]     — bless a first-contact/known keyholder as trusted
+ * @param {boolean} [input.accept_key_change]— accept a deliberate signing-key rotation for a pinned identity
  * @returns {Promise<{imported: object, skipped: number, conflicts: number, manifest: object}>}
  */
 async function importBrain(input) {
@@ -1273,13 +1284,29 @@ async function importBrain(input) {
         // MUST gate on sender_trust itself — a first SUMMON of a hostile soul still
         // writes its rows.
         await _db.query(
-          `INSERT INTO keyholders (substrate_identity, public_key, display_name, trusted, first_seen, last_seen)
-           VALUES ($1, $2, $3, $4, $5, $5) ON CONFLICT(substrate_identity) DO NOTHING`,
-          [senderId, senderKey, manifest.display_name || null, input.trust_sender === true, _ts()]
+          `INSERT INTO keyholders (substrate_identity, public_key, display_name, trusted, first_seen, last_seen, last_exported_at)
+           VALUES ($1, $2, $3, $4, $5, $5, $6) ON CONFLICT(substrate_identity) DO NOTHING`,
+          [senderId, senderKey, manifest.display_name || null, input.trust_sender === true, _ts(), manifest.exported_at || null]
         );
         senderTrust = input.trust_sender === true ? 'trusted-now' : 'first-contact';
       } else if (known.public_key === senderKey) {
+        // Same pinned key — a genuine return visit from this keyholder. Anti-replay
+        // (A.1): exported_at is a SIGNED field, so an attacker can't forge a newer
+        // stamp on an older soul. Reject a soul STRICTLY OLDER than the newest we've
+        // already accepted from this keyholder — a captured old export replayed to
+        // resurrect rows you've since deleted. Equal is allowed (re-importing the
+        // same file is an idempotent no-op under newer-wins); a deliberate older
+        // import is still possible with allow_replay. Second-precision stamps mean
+        // two genuine exports in the same second compare equal — never a false reject.
+        const incoming = manifest.exported_at || null;
+        if (incoming && known.last_exported_at && incoming < known.last_exported_at && input.allow_replay !== true) {
+          throw new Error(`importBrain: refusing to import — this soul (exported ${incoming}) is OLDER than the newest already accepted from ${senderId} (${known.last_exported_at}); looks like a replayed old export. Pass allow_replay:true to import it deliberately.`);
+        }
         await _db.query('UPDATE keyholders SET last_seen = $1 WHERE substrate_identity = $2', [_ts(), senderId]);
+        // Advance the high-water mark to the newest stamp we've accepted.
+        if (incoming && (!known.last_exported_at || incoming > known.last_exported_at)) {
+          await _db.query('UPDATE keyholders SET last_exported_at = $1 WHERE substrate_identity = $2', [incoming, senderId]);
+        }
         if (input.trust_sender === true && !known.trusted) {
           await _db.query('UPDATE keyholders SET trusted = true WHERE substrate_identity = $1', [senderId]);
         }
@@ -1287,7 +1314,12 @@ async function importBrain(input) {
       } else {
         // Same identity, DIFFERENT key — impersonation or an unconfirmed rotation.
         if (input.accept_key_change === true) {
-          await _db.query('UPDATE keyholders SET public_key = $1, last_seen = $2 WHERE substrate_identity = $3', [senderKey, _ts(), senderId]);
+          // A deliberate rotation re-baselines the keyholder: new key, and the
+          // high-water resets to this soul's stamp (the replay check resumes from here).
+          await _db.query(
+            'UPDATE keyholders SET public_key = $1, last_seen = $2, last_exported_at = $3 WHERE substrate_identity = $4',
+            [senderKey, _ts(), manifest.exported_at || known.last_exported_at || null, senderId]
+          );
           senderTrust = 'key-rotated';
         } else {
           throw new Error(`importBrain: refusing to import — substrate_identity ${senderId} presents a DIFFERENT signing key than the one pinned (possible impersonation). Pass accept_key_change:true to accept a deliberate key rotation.`);
