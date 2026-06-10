@@ -66,7 +66,8 @@ async function init(dataDir) {
       updated_by TEXT,
       updated_at TEXT NOT NULL,
       layer TEXT DEFAULT 'instance',
-      anonymizable BOOLEAN DEFAULT true
+      anonymizable BOOLEAN DEFAULT true,
+      trust_tier TEXT DEFAULT 'tier-1-keyholder-direct'
     );
 
     CREATE TABLE IF NOT EXISTS memories (
@@ -78,7 +79,8 @@ async function init(dataDir) {
       anonymizable BOOLEAN DEFAULT true,
       embedding vector(384),
       pinned BOOLEAN DEFAULT false,
-      archived BOOLEAN DEFAULT false
+      archived BOOLEAN DEFAULT false,
+      trust_tier TEXT DEFAULT 'tier-1-keyholder-direct'
     );
 
     CREATE TABLE IF NOT EXISTS steering (
@@ -91,7 +93,8 @@ async function init(dataDir) {
       enabled BOOLEAN DEFAULT true,
       layer TEXT DEFAULT 'instance',
       created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
+      updated_at TEXT NOT NULL,
+      trust_tier TEXT DEFAULT 'tier-1-keyholder-direct'
     );
 
     CREATE TABLE IF NOT EXISTS review_lessons (
@@ -157,6 +160,15 @@ async function init(dataDir) {
   await _db.exec(`ALTER TABLE memories ADD COLUMN IF NOT EXISTS pinned BOOLEAN DEFAULT false;`);
   await _db.exec(`ALTER TABLE memories ADD COLUMN IF NOT EXISTS archived BOOLEAN DEFAULT false;`);
 
+  // Migration (0.15.0 — H1 trust_tier slice 1): add trust_tier to the three
+  // recall-surfaced/importable tables. The constant DEFAULT backfills every
+  // existing row to tier-1 (keyholder-direct) — they're your own local content.
+  // Idempotent. SUMMON demotes a foreign soul's rows on import (decision-b); pin
+  // promotes to tier-1 (decision-a). The inject path honoring tiers is slice 2.
+  await _db.exec(`ALTER TABLE memories ADD COLUMN IF NOT EXISTS trust_tier TEXT DEFAULT 'tier-1-keyholder-direct';`);
+  await _db.exec(`ALTER TABLE state ADD COLUMN IF NOT EXISTS trust_tier TEXT DEFAULT 'tier-1-keyholder-direct';`);
+  await _db.exec(`ALTER TABLE steering ADD COLUMN IF NOT EXISTS trust_tier TEXT DEFAULT 'tier-1-keyholder-direct';`);
+
   // v0.7.0 — record the Nose (embedder) identity so a brain knows which model
   // produced its Scents. Seeds the historical MiniLM/384 Nose ONLY if absent,
   // so existing brains stay byte-identical. A future Nose swap bumps these via
@@ -194,6 +206,35 @@ const REPLAY_FUTURE_SKEW_MS = 48 * 60 * 60 * 1000;
 function _parseStamp(s) {
   if (typeof s !== 'string' || !s) return NaN;
   return Date.parse(s);
+}
+
+// ── trust_tier (H1 / decision-a + decision-b) ──────────────────────────────
+// Every memory/state/steering row carries a trust tier. tier-1 = keyholder-direct
+// (your own writes, or a pin — the one sanctioned promotion, decision-a). tier-2 =
+// synthesized. tier-3 = observed-external (a foreign keyholder's claim, from YOUR
+// bowl's view). tier-4 = raw exhaust. Native writes default to tier-1 via the
+// column DEFAULT; SUMMON DEMOTES a foreign soul's rows (decision-b) so their
+// keyholder-direct is, to you, observed-external. The READ/inject path honoring
+// these tiers (tier-3 wrapped, tier-4 held) is slice 2 — this slice only tags +
+// carries them, so nothing about what surfaces to an LLM changes yet.
+const TRUST_TIER = {
+  KEYHOLDER_DIRECT: 'tier-1-keyholder-direct',
+  SYNTHESIZED: 'tier-2-synthesized',
+  OBSERVED_EXTERNAL: 'tier-3-observed-external',
+  RAW_EXHAUST: 'tier-4-raw-exhaust',
+};
+const TIER_RANK = { 'tier-1-keyholder-direct': 1, 'tier-2-synthesized': 2, 'tier-3-observed-external': 3, 'tier-4-raw-exhaust': 4 };
+
+// Resolve the tier to WRITE for an imported row given the import's tier policy.
+// 'preserve' keeps the incoming tier (the "I trust this keyholder" override, and
+// the default for a self round-trip). 'demote' (default for any foreign/unsigned
+// soul) floors the row at tier-3 — a foreign claim is never more trusted than
+// observed-external — while leaving already-lower raw exhaust at tier-4. A missing
+// incoming tier is treated as most-trusted (rank 1) so demote still floors it.
+function _resolveImportTier(rowTier, policy) {
+  if (policy === 'preserve') return rowTier || TRUST_TIER.KEYHOLDER_DIRECT;
+  const rank = TIER_RANK[rowTier] || 1;
+  return rank < 3 ? TRUST_TIER.OBSERVED_EXTERNAL : (rowTier || TRUST_TIER.OBSERVED_EXTERNAL);
 }
 
 function _ensure() {
@@ -321,7 +362,7 @@ async function deleteState(key) {
 async function getMemory(filename) {
   _ensure();
   const result = await _db.query(
-    'SELECT content, layer, updated_at FROM memories WHERE filename = $1', [filename]
+    'SELECT content, layer, updated_at, trust_tier FROM memories WHERE filename = $1', [filename]
   );
   return result.rows[0] || null;
 }
@@ -406,7 +447,7 @@ async function getAllMemories({ includeArchived = false, onlyArchived = false } 
   }
   const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const result = await _db.query(`
-    SELECT filename, layer, updated_at, updated_by, pinned, archived
+    SELECT filename, layer, updated_at, updated_by, pinned, archived, trust_tier
     FROM memories
     ${whereSql}
     ORDER BY pinned DESC, filename
@@ -419,10 +460,18 @@ async function getAllMemories({ includeArchived = false, onlyArchived = false } 
 // the memory doesn't exist.
 async function setMemoryPin(filename, pinned) {
   _ensure();
-  await _db.query(
-    'UPDATE memories SET pinned = $1 WHERE filename = $2',
-    [Boolean(pinned), filename]
-  );
+  if (pinned) {
+    // decision-a: a pin is the keyholder vouching directly, so it promotes the
+    // memory to tier-1 (keyholder-direct). This is the ONE sanctioned re-tag path —
+    // keyholder-initiated, not channel-inferred — the explicit exception to
+    // never-re-tag. Unpinning does NOT demote (the vouch stands).
+    await _db.query(
+      'UPDATE memories SET pinned = true, trust_tier = $1 WHERE filename = $2',
+      [TRUST_TIER.KEYHOLDER_DIRECT, filename]
+    );
+  } else {
+    await _db.query('UPDATE memories SET pinned = false WHERE filename = $1', [filename]);
+  }
 }
 
 // Toggle the archived flag on a memory. Archived memories are hidden from
@@ -559,8 +608,8 @@ async function searchMemories({ queryEmbedding, queryText = null, k = 5, layer =
   params.push(limit);
 
   const cols = doRerank
-    ? 'filename, content, layer, updated_at, pinned, (embedding <=> $1::vector) AS distance'
-    : 'filename, content, layer, updated_at, (embedding <=> $1::vector) AS distance';
+    ? 'filename, content, layer, updated_at, pinned, trust_tier, (embedding <=> $1::vector) AS distance'
+    : 'filename, content, layer, updated_at, trust_tier, (embedding <=> $1::vector) AS distance';
   const sql = `
     SELECT ${cols}
     FROM memories
@@ -586,16 +635,19 @@ async function searchMemories({ queryEmbedding, queryText = null, k = 5, layer =
     layer: r.layer,
     updated_at: r.updated_at,
     pinned: r.pinned,
+    trust_tier: r.trust_tier,
     distance: Number(r.distance),
   }));
 
   if (!doRerank) {
-    // Base mode: identical shape + order to pre-0.7.0 (no pinned, no rerank_score).
+    // Base mode: pre-0.7.0 shape + the additive trust_tier (slice 2's inject path
+    // reads it; existing callers ignore it). Order/distance unchanged.
     return rows.map((r) => ({
       filename: r.filename,
       content: r.content,
       layer: r.layer,
       updated_at: r.updated_at,
+      trust_tier: r.trust_tier,
       distance: r.distance,
     }));
   }
@@ -614,6 +666,7 @@ async function searchMemories({ queryEmbedding, queryText = null, k = 5, layer =
       distance: r.distance,        // raw cosine — UNCHANGED (relevance floors depend on it)
       rerank_score: r.rerank_score,
       pinned: r.pinned,
+      trust_tier: r.trust_tier,
     }));
 }
 
@@ -1004,13 +1057,13 @@ async function exportBrain(options = {}) {
     let sql;
     switch (t) {
       case 'state':
-        sql = 'SELECT key, value, updated_by, updated_at, layer, anonymizable FROM state ORDER BY key';
+        sql = 'SELECT key, value, updated_by, updated_at, layer, anonymizable, trust_tier FROM state ORDER BY key';
         break;
       case 'memories':
-        sql = 'SELECT filename, content, updated_by, updated_at, layer, anonymizable FROM memories ORDER BY filename';
+        sql = 'SELECT filename, content, updated_by, updated_at, layer, anonymizable, trust_tier FROM memories ORDER BY filename';
         break;
       case 'steering':
-        sql = 'SELECT id, name, content, mode, match_pattern, priority, enabled, layer, created_at, updated_at FROM steering ORDER BY id';
+        sql = 'SELECT id, name, content, mode, match_pattern, priority, enabled, layer, created_at, updated_at, trust_tier FROM steering ORDER BY id';
         break;
       case 'review_lessons':
         sql = 'SELECT id, task_type, rule, source_item_id, layer, created_at FROM review_lessons ORDER BY id';
@@ -1135,6 +1188,7 @@ async function exportBrain(options = {}) {
  * @param {boolean} [input.allow_replay]     — opt in to a strictly-older export from a known keyholder (anti-replay override)
  * @param {boolean} [input.trust_sender]     — bless a first-contact/known keyholder as trusted
  * @param {boolean} [input.accept_key_change]— accept a deliberate signing-key rotation for a pinned identity
+ * @param {'demote'|'preserve'} [input.tier_policy='demote'] — decision-b: 'demote' floors a foreign soul's rows at tier-3 (observed-external); 'preserve' keeps their tiers (the attended "I trust this keyholder" import). A self round-trip always preserves.
  * @returns {Promise<{imported: object, skipped: number, conflicts: number, manifest: object}>}
  */
 async function importBrain(input) {
@@ -1390,6 +1444,14 @@ async function importBrain(input) {
     }
   }
 
+  // trust_tier (decision-b): the tier policy for the rows about to be applied. A
+  // self round-trip PRESERVES tiers (it's your own export coming home). Any foreign
+  // or unsigned soul DEMOTES by default — its keyholder-direct is, from YOUR bowl,
+  // observed-external (tier-3) — unless the keyholder passes tier_policy:'preserve'
+  // ("I trust this keyholder, keep their tiers"). _resolveImportTier floors each row.
+  // The READ/inject path honoring these tiers is slice 2; this only tags + carries.
+  const tierPolicy = (senderTrust === 'self' || input.tier_policy === 'preserve') ? 'preserve' : 'demote';
+
   // ── state ────────────────────────────────────────────────────────────
   if (byName['state.jsonl']) {
     const rows = _parseJsonl(byName['state.jsonl']);
@@ -1402,15 +1464,16 @@ async function importBrain(input) {
         if (conflict === 'newer-wins' && existing.rows[0].updated_at >= row.updated_at) { skipped++; continue; }
       }
       await _db.query(`
-        INSERT INTO state (key, value, updated_by, updated_at, layer, anonymizable)
-        VALUES ($1, $2, $3, $4, $5, $6)
+        INSERT INTO state (key, value, updated_by, updated_at, layer, anonymizable, trust_tier)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
         ON CONFLICT(key) DO UPDATE SET
           value = EXCLUDED.value,
           updated_by = EXCLUDED.updated_by,
           updated_at = EXCLUDED.updated_at,
           layer = EXCLUDED.layer,
-          anonymizable = EXCLUDED.anonymizable
-      `, [row.key, row.value, row.updated_by || 'import', row.updated_at || _ts(), row.layer || 'instance', row.anonymizable !== false]);
+          anonymizable = EXCLUDED.anonymizable,
+          trust_tier = EXCLUDED.trust_tier
+      `, [row.key, row.value, row.updated_by || 'import', row.updated_at || _ts(), row.layer || 'instance', row.anonymizable !== false, _resolveImportTier(row.trust_tier, tierPolicy)]);
       imported.state++;
     }
   }
@@ -1427,15 +1490,16 @@ async function importBrain(input) {
         if (conflict === 'newer-wins' && existing.rows[0].updated_at >= row.updated_at) { skipped++; continue; }
       }
       await _db.query(`
-        INSERT INTO memories (filename, content, updated_by, updated_at, layer, anonymizable)
-        VALUES ($1, $2, $3, $4, $5, $6)
+        INSERT INTO memories (filename, content, updated_by, updated_at, layer, anonymizable, trust_tier)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
         ON CONFLICT(filename) DO UPDATE SET
           content = EXCLUDED.content,
           updated_by = EXCLUDED.updated_by,
           updated_at = EXCLUDED.updated_at,
           layer = EXCLUDED.layer,
-          anonymizable = EXCLUDED.anonymizable
-      `, [row.filename, row.content, row.updated_by || 'import', row.updated_at || _ts(), row.layer || 'instance', row.anonymizable !== false]);
+          anonymizable = EXCLUDED.anonymizable,
+          trust_tier = EXCLUDED.trust_tier
+      `, [row.filename, row.content, row.updated_by || 'import', row.updated_at || _ts(), row.layer || 'instance', row.anonymizable !== false, _resolveImportTier(row.trust_tier, tierPolicy)]);
       imported.memories++;
     }
   }
@@ -1452,8 +1516,8 @@ async function importBrain(input) {
         if (conflict === 'newer-wins' && existing.rows[0].updated_at >= row.updated_at) { skipped++; continue; }
       }
       await _db.query(`
-        INSERT INTO steering (id, name, content, mode, match_pattern, priority, enabled, layer, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        INSERT INTO steering (id, name, content, mode, match_pattern, priority, enabled, layer, created_at, updated_at, trust_tier)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
         ON CONFLICT(id) DO UPDATE SET
           name = EXCLUDED.name,
           content = EXCLUDED.content,
@@ -1462,8 +1526,9 @@ async function importBrain(input) {
           priority = EXCLUDED.priority,
           enabled = EXCLUDED.enabled,
           layer = EXCLUDED.layer,
-          updated_at = EXCLUDED.updated_at
-      `, [row.id, row.name, row.content, row.mode || 'always', row.match_pattern || null, row.priority || 0, row.enabled !== false, row.layer || 'instance', row.created_at || _ts(), row.updated_at || _ts()]);
+          updated_at = EXCLUDED.updated_at,
+          trust_tier = EXCLUDED.trust_tier
+      `, [row.id, row.name, row.content, row.mode || 'always', row.match_pattern || null, row.priority || 0, row.enabled !== false, row.layer || 'instance', row.created_at || _ts(), row.updated_at || _ts(), _resolveImportTier(row.trust_tier, tierPolicy)]);
       imported.steering++;
     }
   }
