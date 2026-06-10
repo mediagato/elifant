@@ -74,7 +74,16 @@ function pack(files) {
 function unpack(buf) {
   const files = [];
   let offset = 0;
+  // Backstop against a runaway loop on a pathological archive. The bounds +
+  // non-negative-size guards below already cap iterations at buf.length/BLOCK,
+  // but this fails loud and early on an absurd member count rather than
+  // grinding through a hostile input. See audit-2026-06-10 (tar-01).
+  const MAX_ENTRIES = 1_000_000;
+  let entries = 0;
   while (offset + BLOCK <= buf.length) {
+    if (++entries > MAX_ENTRIES) {
+      throw new Error('tar: too many entries (malformed archive)');
+    }
     const header = buf.slice(offset, offset + BLOCK);
     // End-of-archive: a block of all zeros.
     if (header[0] === 0) break;
@@ -83,17 +92,30 @@ function unpack(buf) {
     const name = nameRaw.replace(/\0.*$/, '');
     const sizeRaw = header.slice(124, 136).toString('ascii').replace(/[\0\s]/g, '');
     const size = parseInt(sizeRaw, 8);
-    if (Number.isNaN(size)) {
+    // Reject hostile/garbage sizes BEFORE using them. A negative octal size
+    // (e.g. '-1000' = -512) passes the old Number.isNaN check but makes the
+    // per-iteration offset advance net to <= 0 — an infinite loop that pegs the
+    // event loop and DoSes the whole daemon from a ~16-byte input (tar-01).
+    // Number.isInteger also rejects NaN / floats / Infinity, so this strictly
+    // supersedes the previous isNaN guard.
+    if (!Number.isInteger(size) || size < 0) {
       throw new Error(`tar: invalid size in header for ${name}`);
     }
     const typeflag = String.fromCharCode(header[156] || 0x30);
     offset += BLOCK;
 
+    // Declared content must fit inside the archive. A size that runs past the
+    // end is a truncated or hostile header, not a valid USTAR member.
+    if (offset + size > buf.length) {
+      throw new Error(`tar: declared size for ${name} exceeds archive bounds`);
+    }
+
     if (typeflag === '0' || typeflag === '\0') {
       const content = buf.slice(offset, offset + size);
       files.push({ name, content });
     }
-    // Skip content + alignment padding.
+    // Skip content + alignment padding. size >= 0 is now guaranteed, so offset
+    // advances by at least BLOCK every iteration — the loop cannot stall.
     offset += size;
     const r = size % BLOCK;
     if (r !== 0) offset += BLOCK - r;
