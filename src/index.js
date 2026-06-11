@@ -792,13 +792,14 @@ async function deleteCaptures({ until, source, type } = {}) {
     `DELETE FROM captures WHERE ${where.join(' AND ')}`,
     params
   );
-  // Prune watermark (H2 forward-merge): when captures are pruned by TIME, advance a
-  // high-water so a later forward-merge does NOT resurrect the event-noise the
-  // keyholder deliberately pruned (for captures, "absent in live" usually means
-  // "pruned on purpose", not "lost"). A source/type-only prune (no `until`) can't be
-  // time-watermarked, so those captures may resurrect on merge — a documented edge,
-  // not a silent-loss path. ISO-8601 stamps compare correctly as TEXT via GREATEST.
-  if (until && (result.affectedRows || 0) > 0) {
+  // Prune watermark (H2 forward-merge): ONLY a pure-time prune (until, with no source/type)
+  // advances the high-water, so a later forward-merge won't resurrect event-noise the
+  // keyholder time-pruned ("absent in live" usually means "pruned on purpose"). A SCOPED
+  // prune (until+source/type, or source/type-only) must NOT advance it — doing so would
+  // wrongly block UNRELATED sources' captures from being recovered on merge (silent
+  // non-restore in the default mode). Scoped-prune captures may resurrect on merge — a
+  // documented edge, not a loss path. ISO-8601 stamps compare correctly as TEXT via GREATEST.
+  if (until && !source && !type && (result.affectedRows || 0) > 0) {
     await _db.query(`
       INSERT INTO brain_meta (key, value) VALUES ('captures_prune_watermark', $1)
       ON CONFLICT(key) DO UPDATE SET value = GREATEST(brain_meta.value, EXCLUDED.value)
@@ -1662,7 +1663,11 @@ function _newPglite(dataDirOrOpts, opts) {
   if (typeof dataDirOrOpts === 'string') return new PGlite(dataDirOrOpts, { extensions: { vector }, ...(opts || {}) });
   return new PGlite({ extensions: { vector }, ...(dataDirOrOpts || {}) });
 }
-function _blobFromBuffer(buf, name) { return new File([buf], name, { type: 'application/x-gzip' }); }
+// Wrap a Buffer for PGlite's loadDataDir. Use Blob (a Node 18 global) NOT File (Node 20+)
+// so the package's declared engines '>=18' stays honest — all three rollback modes would
+// otherwise throw ReferenceError on Node 18. PGlite detects gzip via the blob's `type`
+// ('application/x-gzip'), so no filename is needed.
+function _blobFromBuffer(buf) { return new Blob([buf], { type: 'application/x-gzip' }); }
 
 async function _tableCounts(db) {
   const counts = {};
@@ -1788,7 +1793,12 @@ function _rmDir(dir) {
     catch (e) { if (i === 4) throw e; _sleepSync(150); }
   }
 }
-function _writeJournal(obj) { fs.writeFileSync(_rollbackJournalPath(), JSON.stringify(obj)); }
+function _writeJournal(obj) {
+  // Durable: fsync so a power loss can't persist rename#1 while the journal blocks are
+  // lost/torn (which would strand recovery). Mirrors snapshot()'s tarball write.
+  const fd = fs.openSync(_rollbackJournalPath(), 'w');
+  try { fs.writeSync(fd, JSON.stringify(obj)); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+}
 function _clearJournal() { try { fs.unlinkSync(_rollbackJournalPath()); } catch { /* already gone */ } }
 
 // Synchronous crash-recovery for an interrupted replace-rollback directory swap.
@@ -1806,8 +1816,15 @@ function _recoverInterruptedSwap(dataDir) {
   const valid = (d) => { try { return fs.existsSync(path.join(d, 'PG_VERSION')); } catch { return false; } };
   const rm = (d) => { try { if (fs.existsSync(d)) fs.rmSync(d, { recursive: true, force: true }); } catch { /* ignore */ } };
   if (!journal) {
-    if (valid(brainDir)) { rm(newDir); rm(oldDir); } // tidy strays from a completed swap
-    return;
+    if (valid(brainDir)) { rm(newDir); rm(oldDir); return; } // tidy strays from a completed swap
+    // No journal but brain/ is missing/invalid while a valid sibling store exists — a
+    // crash whose journal was lost or torn (power loss, AV quarantine, a dotfile-skipping
+    // copy tool). NEVER bootstrap a fresh empty brain over recoverable data. Without a
+    // journal we can't know rename#2's intent, so prefer brain.old (the pre-rollback
+    // store) when present; otherwise complete forward to brain.new.
+    if (valid(oldDir)) { rm(brainDir); fs.renameSync(oldDir, brainDir); rm(newDir); return; }
+    if (valid(newDir)) { rm(brainDir); fs.renameSync(newDir, brainDir); rm(oldDir); return; }
+    return; // genuinely fresh first run: no journal, no brain, no siblings
   }
   if (valid(brainDir)) { // rename#2 done; crash before cleanup
     rm(oldDir); rm(newDir); try { fs.unlinkSync(journalPath); } catch {}
@@ -1874,7 +1891,12 @@ async function snapshot(reason, options = {}) {
 }
 
 function _loadSnapshotBuffer(receipt) {
-  const p = receipt.storage_uri || path.join(_snapDir(), `${receipt.snapshot_id}.tar.gz`);
+  // Resolve the LOCAL path first; fall back to the receipt's (absolute) storage_uri only
+  // if the local tarball is absent. A baked-in absolute storage_uri would otherwise break
+  // EVERY restore after the dataDir moves (new laptop / restored-from-backup / renamed
+  // folder) — the exact disaster-recovery moment this feature exists for.
+  const local = path.join(_snapDir(), `${receipt.snapshot_id}.tar.gz`);
+  const p = fs.existsSync(local) ? local : (receipt.storage_uri || local);
   const buf = fs.readFileSync(p); // throws clearly if the tarball is gone
   if (receipt.sha256) {
     const got = _sha256(buf);
@@ -1920,7 +1942,7 @@ async function _rollbackReplace(receipt, buf) {
 
   // Load into brain.new + VERIFY (counts + vector probe) BEFORE touching live. A bad
   // blob fails here with live untouched.
-  const verify = _newPglite(newDir, { loadDataDir: _blobFromBuffer(buf, `${receipt.snapshot_id}.tar.gz`) });
+  const verify = _newPglite(newDir, { loadDataDir: _blobFromBuffer(buf) });
   await verify.query('SELECT 1');
   await _applySchema(verify);
   const restored_counts = await _tableCounts(verify);
@@ -1947,7 +1969,7 @@ async function _rollbackFork(receipt, buf) {
   const forkId = `fork_${_compactTs()}_${crypto.randomBytes(4).toString('hex')}`;
   const forkBrain = path.join(path.dirname(_dbPath), 'forks', forkId, 'brain');
   fs.mkdirSync(path.dirname(forkBrain), { recursive: true });
-  const forkDb = _newPglite(forkBrain, { loadDataDir: _blobFromBuffer(buf, `${receipt.snapshot_id}.tar.gz`) });
+  const forkDb = _newPglite(forkBrain, { loadDataDir: _blobFromBuffer(buf) });
   await forkDb.query('SELECT 1');
   await _applySchema(forkDb);
   // A fork is a NEW being: fresh substrate_identity + fresh signing keypair (must
@@ -1966,7 +1988,7 @@ async function _rollbackForwardMerge(receipt, buf) {
   const safety = await snapshot(`pre-forward-merge safety net (before ${receipt.snapshot_id})`, { trigger: 'pre-action' });
 
   // IN-MEMORY temp instance — options-first form is REQUIRED (see _newPglite).
-  const tmp = _newPglite({ loadDataDir: _blobFromBuffer(buf, `${receipt.snapshot_id}.tar.gz`) });
+  const tmp = _newPglite({ loadDataDir: _blobFromBuffer(buf) });
   await tmp.query('SELECT 1');
   await _applySchema(tmp); // backfill columns a pre-migration snapshot predates
 

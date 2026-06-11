@@ -269,3 +269,55 @@ test('health: overview is self-describing, never throws, guards a zero baseline'
     assert.ok(bogus.observations.length > 0);
   } finally { await brain.close(); }
 });
+
+// ── security+code-pass must-fix regression tests ──────────────────────────────
+
+test('crash-safety: journal LOST (missing/torn) + brain/ gone but brain.old valid → recovers, never empty-bootstraps', async () => {
+  const dir = tmpDir();
+  await brain.init(dir);
+  await brain.setMemory('survivor.md', 'must-not-vanish', 'test', 'instance');
+  await brain.close();
+  const brainDir = path.join(dir, 'brain');
+  // rename#1 done (brain→brain.old) then a crash whose journal NEVER persisted (power
+  // loss / AV quarantine / dotfile-skipping copy): brain/ missing, brain.old valid, NO journal.
+  fs.renameSync(brainDir, brainDir + '.old');
+  assert.ok(!fs.existsSync(path.join(dir, '.rollback-journal.json')), 'precondition: no journal');
+  await brain.init(dir); // must recover from brain.old, NOT bootstrap a fresh empty brain
+  try {
+    const m = await brain.getMemory('survivor.md');
+    assert.ok(m && m.content === 'must-not-vanish', 'recovered from brain.old, not silently wiped');
+    assert.ok(!fs.existsSync(brainDir + '.old'), 'brain.old consumed (not left to be deleted next boot)');
+  } finally { await brain.close(); }
+});
+
+test('rollback: succeeds after the dataDir MOVES (stale absolute storage_uri ignored)', async () => {
+  const dir1 = tmpDir();
+  await brain.init(dir1);
+  await brain.setMemory('m.md', 'v1', 'test', 'instance');
+  const snap = await brain.snapshot('pre-move');
+  assert.ok(path.isAbsolute(snap.storage_uri), 'receipt records an absolute storage_uri');
+  await brain.close();
+  const dir2 = dir1 + '-moved'; // new laptop / renamed folder → the absolute uri now dangles
+  fs.renameSync(dir1, dir2);
+  await brain.init(dir2);
+  try {
+    await brain.deleteMemory('m.md');
+    const res = await brain.rollback(snap.snapshot_id, 'forward-merge'); // resolves the LOCAL tarball
+    assert.equal(res.resurrected_counts.memories, 1, 'restore worked post-move');
+    assert.ok(await brain.getMemory('m.md'));
+  } finally { await brain.close(); }
+});
+
+test('forward-merge: a SCOPED prune (until+source) does NOT block an unrelated source from resurrecting', async () => {
+  const dir = tmpDir();
+  await brain.init(dir);
+  try {
+    await brain.addCapture({ source: 'noise', type: 'e', data: { x: 1 }, ts: '2020-01-01T00:00:00Z' });
+    await brain.addCapture({ source: 'important', type: 'e', data: { y: 2 }, ts: '2020-01-01T00:00:00Z' });
+    const snap = await brain.snapshot('pre-prune');
+    await brain.deleteCaptures({ until: '2020-06-01T00:00:00Z', source: 'noise' }); // scoped — must NOT advance the watermark
+    await brain.deleteCaptures({ source: 'important' });                            // separately lose the important stream
+    await brain.rollback(snap.snapshot_id, 'forward-merge');
+    assert.equal((await brain.getCaptures({ source: 'important' })).length, 1, 'unrelated lost capture resurrected (watermark not wrongly advanced)');
+  } finally { await brain.close(); }
+});
