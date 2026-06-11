@@ -52,14 +52,34 @@ async function init(dataDir) {
   const { vector } = require('@electric-sql/pglite/vector');
 
   _dbPath = path.join(dataDir, 'brain');
+  // crash-safety: finish or revert an interrupted replace-rollback directory swap
+  // BEFORE we open the brain dir — otherwise a missing brain/ (mid-swap crash) gets
+  // bootstrapped fresh+empty, stranding the keyholder's data in brain.old. See #2.
+  _recoverInterruptedSwap(dataDir);
   fs.mkdirSync(_dbPath, { recursive: true });
 
   _db = new PGlite(_dbPath, { extensions: { vector } });
 
-  // pgvector must be enabled before any vector(N) columns are declared.
-  await _db.exec(`CREATE EXTENSION IF NOT EXISTS vector;`);
+  await _applySchema(_db);
 
-  await _db.exec(`
+  _ready = true;
+  // _debug writes to stderr (never stdout) so MCP servers using stdio transport
+  // don't get "[brain] ..." lines in their JSON-RPC channel. With
+  // MEDIAGATO_ELIFANT_DEBUG unset (default), _debug is a no-op for all consumers.
+  _debug(`[brain] PGlite initialized at ${_dbPath}`);
+  return _db;
+}
+
+// Apply the full schema + every idempotent migration to a PGlite instance. init()
+// runs it on the live brain; rollback (replace/fork/forward-merge) runs it on the
+// reopened or snapshot-loaded instance so a snapshot predating a column is
+// backfilled before any read ("column does not exist" can't happen). Every
+// statement is CREATE/ALTER ... IF NOT EXISTS, so it is safe on any instance.
+async function _applySchema(db) {
+  // pgvector must be enabled before any vector(N) columns are declared.
+  await db.exec(`CREATE EXTENSION IF NOT EXISTS vector;`);
+
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS state (
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL,
@@ -144,49 +164,51 @@ async function init(dataDir) {
   // A captured OLDER export replayed to resurrect rows you deleted is rejected; the
   // stamp is a SIGNED manifest field so it can't be forged newer. Migration for
   // brains created at 0.11.0 (keyholders pre-dates this column). Idempotent.
-  await _db.exec(`ALTER TABLE keyholders ADD COLUMN IF NOT EXISTS last_exported_at TEXT;`);
+  await db.exec(`ALTER TABLE keyholders ADD COLUMN IF NOT EXISTS last_exported_at TEXT;`);
   // 0.14.0 anti-replay edge-hardening: signature of the last-accepted soul, so an
   // EXACT re-import of the newest soul (same exported_at, same bytes) is caught as a
   // replay rather than silently resurrecting rows the keyholder deleted since. A
   // genuinely different same-second sibling has a different signature and still imports.
-  await _db.exec(`ALTER TABLE keyholders ADD COLUMN IF NOT EXISTS last_signature TEXT;`);
+  await db.exec(`ALTER TABLE keyholders ADD COLUMN IF NOT EXISTS last_signature TEXT;`);
 
   // Migration: add embedding column if upgrading from a 0.3.x database that
   // pre-dates pgvector. Idempotent.
-  await _db.exec(`ALTER TABLE memories ADD COLUMN IF NOT EXISTS embedding vector(384);`);
+  await db.exec(`ALTER TABLE memories ADD COLUMN IF NOT EXISTS embedding vector(384);`);
 
   // Migration: add curation flags (pinned, archived) for databases that
   // pre-date v0.6.0. Idempotent.
-  await _db.exec(`ALTER TABLE memories ADD COLUMN IF NOT EXISTS pinned BOOLEAN DEFAULT false;`);
-  await _db.exec(`ALTER TABLE memories ADD COLUMN IF NOT EXISTS archived BOOLEAN DEFAULT false;`);
+  await db.exec(`ALTER TABLE memories ADD COLUMN IF NOT EXISTS pinned BOOLEAN DEFAULT false;`);
+  await db.exec(`ALTER TABLE memories ADD COLUMN IF NOT EXISTS archived BOOLEAN DEFAULT false;`);
 
   // Migration (0.15.0 — H1 trust_tier slice 1): add trust_tier to the three
   // recall-surfaced/importable tables. The constant DEFAULT backfills every
   // existing row to tier-1 (keyholder-direct) — they're your own local content.
   // Idempotent. SUMMON demotes a foreign soul's rows on import (decision-b); pin
   // promotes to tier-1 (decision-a). The inject path honoring tiers is slice 2.
-  await _db.exec(`ALTER TABLE memories ADD COLUMN IF NOT EXISTS trust_tier TEXT DEFAULT 'tier-1-keyholder-direct';`);
-  await _db.exec(`ALTER TABLE state ADD COLUMN IF NOT EXISTS trust_tier TEXT DEFAULT 'tier-1-keyholder-direct';`);
-  await _db.exec(`ALTER TABLE steering ADD COLUMN IF NOT EXISTS trust_tier TEXT DEFAULT 'tier-1-keyholder-direct';`);
+  await db.exec(`ALTER TABLE memories ADD COLUMN IF NOT EXISTS trust_tier TEXT DEFAULT 'tier-1-keyholder-direct';`);
+  await db.exec(`ALTER TABLE state ADD COLUMN IF NOT EXISTS trust_tier TEXT DEFAULT 'tier-1-keyholder-direct';`);
+  await db.exec(`ALTER TABLE steering ADD COLUMN IF NOT EXISTS trust_tier TEXT DEFAULT 'tier-1-keyholder-direct';`);
+
+  // Migration (0.16.0 — H2 snapshot/rollback): restored_from provenance. A
+  // forward-merge that resurrects a row absent in live stamps it with the
+  // snapshot_id, so the keyholder can see — and re-z86 — exactly what a rollback
+  // brought back (resurrect-and-FLAG, not silently). Idempotent.
+  await db.exec(`ALTER TABLE memories ADD COLUMN IF NOT EXISTS restored_from TEXT;`);
+  await db.exec(`ALTER TABLE state ADD COLUMN IF NOT EXISTS restored_from TEXT;`);
+  await db.exec(`ALTER TABLE steering ADD COLUMN IF NOT EXISTS restored_from TEXT;`);
+  await db.exec(`ALTER TABLE review_lessons ADD COLUMN IF NOT EXISTS restored_from TEXT;`);
 
   // v0.7.0 — record the Nose (embedder) identity so a brain knows which model
   // produced its Scents. Seeds the historical MiniLM/384 Nose ONLY if absent,
   // so existing brains stay byte-identical. A future Nose swap bumps these via
   // setEmbedMeta() and re-embeds every memory against the new model.
-  await _db.exec(`
+  await db.exec(`
     INSERT INTO brain_meta (key, value) VALUES
       ('embed_model', 'Xenova/all-MiniLM-L6-v2'),
       ('embed_dim', '384'),
       ('embed_version', '1')
     ON CONFLICT (key) DO NOTHING;
   `);
-
-  _ready = true;
-  // _debug writes to stderr (never stdout) so MCP servers using stdio transport
-  // don't get "[brain] ..." lines in their JSON-RPC channel. With
-  // MEDIAGATO_ELIFANT_DEBUG unset (default), _debug is a no-op for all consumers.
-  _debug(`[brain] PGlite initialized at ${_dbPath}`);
-  return _db;
 }
 
 function _ts() {
@@ -362,7 +384,7 @@ async function deleteState(key) {
 async function getMemory(filename) {
   _ensure();
   const result = await _db.query(
-    'SELECT content, layer, updated_at, trust_tier FROM memories WHERE filename = $1', [filename]
+    'SELECT content, layer, updated_at, trust_tier, restored_from FROM memories WHERE filename = $1', [filename]
   );
   return result.rows[0] || null;
 }
@@ -447,7 +469,7 @@ async function getAllMemories({ includeArchived = false, onlyArchived = false } 
   }
   const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const result = await _db.query(`
-    SELECT filename, layer, updated_at, updated_by, pinned, archived, trust_tier
+    SELECT filename, layer, updated_at, updated_by, pinned, archived, trust_tier, restored_from
     FROM memories
     ${whereSql}
     ORDER BY pinned DESC, filename
@@ -770,6 +792,18 @@ async function deleteCaptures({ until, source, type } = {}) {
     `DELETE FROM captures WHERE ${where.join(' AND ')}`,
     params
   );
+  // Prune watermark (H2 forward-merge): when captures are pruned by TIME, advance a
+  // high-water so a later forward-merge does NOT resurrect the event-noise the
+  // keyholder deliberately pruned (for captures, "absent in live" usually means
+  // "pruned on purpose", not "lost"). A source/type-only prune (no `until`) can't be
+  // time-watermarked, so those captures may resurrect on merge — a documented edge,
+  // not a silent-loss path. ISO-8601 stamps compare correctly as TEXT via GREATEST.
+  if (until && (result.affectedRows || 0) > 0) {
+    await _db.query(`
+      INSERT INTO brain_meta (key, value) VALUES ('captures_prune_watermark', $1)
+      ON CONFLICT(key) DO UPDATE SET value = GREATEST(brain_meta.value, EXCLUDED.value)
+    `, [until]);
+  }
   return result.affectedRows || 0;
 }
 
@@ -1577,83 +1611,559 @@ async function importBrain(input) {
   return { imported, skipped, conflicts, manifest, signature_status: signatureStatus, sender_trust: senderTrust };
 }
 
-// ── SNAPSHOT / ROLLBACK / LIST_SNAPSHOTS / HEALTH (v0.3 — Elifantic protocol v0.1) ──
+// ── SNAPSHOT / ROLLBACK / LIST_SNAPSHOTS / HEALTH (Elifantic protocol v0.1) ──
 //
-// Mount points added in protocol v0.1 amendment. These are skeletons in v0.3.0-dev;
-// real implementation lands in a future release. See the Elifantic protocol
-// v0.1 spec for the full contracts.
+// Local-first restore points. A snapshot is a FILESYSTEM dumpDataDir copy of the
+// whole PGlite store — NOT an exportBrain dump. exportBrain omits captures,
+// embeddings, pinned/archived/trust_tier flags, keyholders, and the Nose meta
+// (correct for YOINK federation, catastrophic for a local snapshot), so a snapshot
+// built on it would silently lose data. dumpDataDir is full-fidelity by
+// construction: every table, column, embedding, flag, and the substrate_identity
+// round-trip byte-exact, at the snapshot's Nose version (no re-embed).
 //
-// Triggers for snapshot per the spec:
-//   - 'keyholder-explicit'   ("Bob, snapshot now")
-//   - 'schedule'             (daily auto at quiet hour, typically 4am local)
-//   - 'pre-action'           (before spore re-seed, federation join, large SUMMON, kernel upgrade)
-//   - 'anomaly-triggered'    (HEALTH surface detected drift exceeding baseline)
-//   - 'capture-burst'        (single capture source dumped unusually large payload)
+// Layout (SIBLINGS of brain/, so a dump of brain/ never swallows prior snapshots and
+// a `replace` that swaps brain/ leaves restore points intact):
+//   <dataDir>/snapshots/<id>.tar.gz   — the gzipped dumpDataDir blob
+//   <dataDir>/snapshots/index.jsonl   — append-only, one SnapshotReceipt per line
+//   <dataDir>/.rollback-journal.json  — present only mid-swap; drives crash recovery
 //
-// Storage: encrypted-at-rest blobs in `<dataDir>/brain/snapshots/<snapshot_id>.tar`
-// (or wherever the implementation chooses). Retention: Borg-style cap (N recent +
-// N daily + N weekly + N monthly).
+// Snapshots are PLAINTEXT at rest in v0.16: the tarball holds signing_keypair_v1 +
+// all data in clear. This is the SAME exposure as the live brain/ store, which
+// already persists the keypair in plaintext on disk — not a new leak. Encrypted-at-
+// rest (AES-256-GCM / PBKDF2 per the spec) is a tracked follow-on.
+
+const SNAP_RETENTION = { recentDays: 7, dailyDays: 30, weeklyDays: 180, hardCap: 200 };
+const SNAP_TABLES = ['state', 'memories', 'steering', 'review_lessons', 'captures', 'keyholders'];
+const _DAY_MS = 86400000;
+
+function _snapDir() { return path.join(path.dirname(_dbPath), 'snapshots'); }
+function _rollbackJournalPath() { return path.join(path.dirname(_dbPath), '.rollback-journal.json'); }
+function _compactTs() { return _ts().replace(/[:-]/g, '').replace('T', '-'); }
+function _snapId() { return `snap_${_compactTs()}_${crypto.randomBytes(4).toString('hex')}`; }
+function _tsAgo(ms) { return new Date(Date.now() - ms).toISOString().replace(/\.\d{3}Z$/, 'Z'); }
+
+// Numeric, tie-goes-to-live stamp comparison (format-robust vs lexical >=). Returns
+// true when the LIVE row should win (live newer-or-equal) — the snapshot only wins
+// when it is strictly newer.
+function _liveWins(liveStamp, snapStamp) {
+  const a = _parseStamp(liveStamp), b = _parseStamp(snapStamp);
+  if (Number.isFinite(a) && Number.isFinite(b)) return a >= b;
+  return String(liveStamp) >= String(snapStamp);
+}
+
+// Construct a PGlite. CRITICAL (PGlite 0.2.x): loadDataDir for an IN-MEMORY instance
+// must use the OPTIONS-FIRST form `new PGlite({loadDataDir})`. `new PGlite(undefined,
+// {loadDataDir})` silently drops the options (the constructor only reads options
+// when arg 1 is a string), so the temp instance opens EMPTY — the bug that made the
+// default forward-merge mode dead-on-arrival. A string path always takes options.
+function _newPglite(dataDirOrOpts, opts) {
+  const { PGlite } = require('@electric-sql/pglite');
+  const { vector } = require('@electric-sql/pglite/vector');
+  if (typeof dataDirOrOpts === 'string') return new PGlite(dataDirOrOpts, { extensions: { vector }, ...(opts || {}) });
+  return new PGlite({ extensions: { vector }, ...(dataDirOrOpts || {}) });
+}
+function _blobFromBuffer(buf, name) { return new File([buf], name, { type: 'application/x-gzip' }); }
+
+async function _tableCounts(db) {
+  const counts = {};
+  for (const t of SNAP_TABLES) {
+    try { const r = await db.query(`SELECT count(*)::int AS n FROM ${t}`); counts[t] = r.rows[0].n; }
+    catch { /* table absent on a very old loaded snapshot */ }
+  }
+  return counts;
+}
+async function _embedMetaOf(db) {
+  const r = await db.query("SELECT key, value FROM brain_meta WHERE key IN ('embed_model','embed_dim','embed_version')");
+  const m = {};
+  for (const row of r.rows) m[row.key] = row.value;
+  return { model: m.embed_model || null, dim: m.embed_dim || null, version: m.embed_version || null };
+}
+async function _tableExists(name) {
+  try { const r = await _db.query('SELECT to_regclass($1) AS t', ['public.' + name]); return !!(r.rows[0] && r.rows[0].t); }
+  catch { return false; }
+}
+
+// Mint a fresh Ed25519 signing keypair blob (same shape _getSigningKey persists).
+// Used by fork: a fork is a new being and must never be able to sign as the parent.
+function _generateSigningKeypairJson() {
+  const { privateKey, publicKey } = crypto.generateKeyPairSync('ed25519');
+  const privPem = privateKey.export({ format: 'pem', type: 'pkcs8' });
+  const pubRaw = publicKey.export({ format: 'der', type: 'spki' });
+  const pubRawKey = pubRaw.subarray(pubRaw.length - 32);
+  return JSON.stringify({ algorithm: 'ed25519', private_pem: privPem.toString(), public_b64: pubRawKey.toString('base64'), created_at: new Date().toISOString() });
+}
+
+// Canonical, collision-free hash of a capture for forward-merge set-union dedup.
+// Hash a JSON ARRAY (field boundaries can't collide), null-safe, sorted-key payload.
+// NOTE: _ts() is second-precision, so two genuinely distinct identical-payload events
+// in the same second collapse to one on a forward-merge — replace mode is the
+// exact-recovery path; documented in the audit capture.
+function _canonicalJson(v) {
+  if (v === null || typeof v !== 'object') return JSON.stringify(v);
+  if (Array.isArray(v)) return '[' + v.map(_canonicalJson).join(',') + ']';
+  return '{' + Object.keys(v).sort().map(k => JSON.stringify(k) + ':' + _canonicalJson(v[k])).join(',') + '}';
+}
+function _captureHash(row) {
+  const data = row.data == null ? null : (typeof row.data === 'string' ? row.data : _canonicalJson(row.data));
+  return _sha256(JSON.stringify(['cap', row.source, row.type, row.ts, data]));
+}
+
+// Read the snapshot index, tolerant of a torn/corrupt line ANYWHERE (not just the
+// trailing one), dedup by id (a retention-rewrite crash could dupe), and glob-fall-
+// back to *.tar.gz on disk when the index is missing/empty so restore capability
+// never silently vanishes.
+function _readIndex() {
+  const snapDir = _snapDir();
+  const byId = new Map();
+  let txt = '';
+  try { txt = fs.readFileSync(path.join(snapDir, 'index.jsonl'), 'utf8'); } catch { txt = ''; }
+  for (const line of txt.split('\n')) {
+    const s = line.trim();
+    if (!s) continue;
+    try { const r = JSON.parse(s); if (r && r.snapshot_id && !byId.has(r.snapshot_id)) byId.set(r.snapshot_id, r); } catch { /* skip corrupt line */ }
+  }
+  try {
+    for (const f of fs.readdirSync(snapDir)) {
+      if (!f.endsWith('.tar.gz')) continue;
+      const id = f.replace(/\.tar\.gz$/, '');
+      if (!byId.has(id)) byId.set(id, { snapshot_id: id, reason: '(recovered; index entry missing)', trigger: 'keyholder-explicit', exported_at: '', table_counts: {}, bytes: 0, storage_uri: path.join(snapDir, f) });
+    }
+  } catch { /* snapshots dir not created yet */ }
+  return [...byId.values()];
+}
+
+// Borg-style retention. NEVER reaps an exempt id (the rollback target + the just-
+// written snapshot). Rewrites the index FIRST (atomic temp+rename) THEN deletes
+// tarballs — a vanished index is a broken promise, an orphan tarball is harmless.
+function _applyRetention(exemptIds = []) {
+  const snapDir = _snapDir();
+  const receipts = _readIndex();
+  if (!receipts.length) return;
+  const exempt = new Set(exemptIds);
+  const now = Date.now();
+  receipts.sort((a, b) => (_parseStamp(b.exported_at) || 0) - (_parseStamp(a.exported_at) || 0)); // newest first
+  const keep = [];
+  const seen = new Set();
+  for (const r of receipts) {
+    if (exempt.has(r.snapshot_id)) { keep.push(r); continue; }
+    const ms = _parseStamp(r.exported_at);
+    const ageDays = Number.isFinite(ms) ? (now - ms) / _DAY_MS : 0;
+    if (ageDays <= SNAP_RETENTION.recentDays) { keep.push(r); continue; }
+    let bucket;
+    if (ageDays <= SNAP_RETENTION.dailyDays) bucket = 'D' + Math.floor(ms / _DAY_MS);
+    else if (ageDays <= SNAP_RETENTION.weeklyDays) bucket = 'W' + Math.floor(ms / (_DAY_MS * 7));
+    else { const d = new Date(ms); bucket = 'M' + (d.getUTCFullYear() * 12 + d.getUTCMonth()); }
+    if (!seen.has(bucket)) { seen.add(bucket); keep.push(r); }
+  }
+  if (keep.length > SNAP_RETENTION.hardCap) {
+    let over = keep.length - SNAP_RETENTION.hardCap;
+    const capped = [];
+    for (let i = keep.length - 1; i >= 0; i--) { // drop oldest non-exempt first
+      if (over > 0 && !exempt.has(keep[i].snapshot_id)) { over--; continue; }
+      capped.push(keep[i]);
+    }
+    capped.reverse();
+    keep.length = 0; keep.push(...capped);
+  }
+  const keepIds = new Set(keep.map(r => r.snapshot_id));
+  if (keepIds.size === receipts.length) return; // nothing reaped
+  const indexPath = path.join(snapDir, 'index.jsonl');
+  const tmpIdx = indexPath + '.tmp';
+  fs.writeFileSync(tmpIdx, keep.length ? keep.map(r => JSON.stringify(r)).join('\n') + '\n' : '');
+  fs.renameSync(tmpIdx, indexPath);
+  for (const r of receipts) {
+    if (!keepIds.has(r.snapshot_id)) { try { fs.unlinkSync(path.join(snapDir, `${r.snapshot_id}.tar.gz`)); } catch { /* already gone */ } }
+  }
+}
+
+// Real (non-busy) blocking sleep for the rare sync retry path (recovery runs before
+// the event loop is usable). Atomics.wait parks the thread without burning a core.
+function _sleepSync(ms) {
+  try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* SAB unavailable: skip */ }
+}
+function _rmDir(dir) {
+  // Windows can hold a directory handle briefly after PGlite.close(); retry w/ backoff.
+  for (let i = 0; i < 5; i++) {
+    try { fs.rmSync(dir, { recursive: true, force: true }); return; }
+    catch (e) { if (i === 4) throw e; _sleepSync(150); }
+  }
+}
+function _writeJournal(obj) { fs.writeFileSync(_rollbackJournalPath(), JSON.stringify(obj)); }
+function _clearJournal() { try { fs.unlinkSync(_rollbackJournalPath()); } catch { /* already gone */ } }
+
+// Synchronous crash-recovery for an interrupted replace-rollback directory swap.
+// Called from init() BEFORE the brain dir is opened. A replace does: write journal
+// -> rename brain->brain.old -> rename brain.new->brain -> clear journal -> rm
+// brain.old. A crash anywhere must NEVER let init() bootstrap a fresh empty brain
+// (that would strand the keyholder's data in brain.old — a silent total wipe).
+function _recoverInterruptedSwap(dataDir) {
+  const journalPath = path.join(dataDir, '.rollback-journal.json');
+  let journal = null;
+  try { journal = JSON.parse(fs.readFileSync(journalPath, 'utf8')); } catch { journal = null; }
+  const brainDir = path.join(dataDir, 'brain');
+  const oldDir = brainDir + '.old';
+  const newDir = brainDir + '.new';
+  const valid = (d) => { try { return fs.existsSync(path.join(d, 'PG_VERSION')); } catch { return false; } };
+  const rm = (d) => { try { if (fs.existsSync(d)) fs.rmSync(d, { recursive: true, force: true }); } catch { /* ignore */ } };
+  if (!journal) {
+    if (valid(brainDir)) { rm(newDir); rm(oldDir); } // tidy strays from a completed swap
+    return;
+  }
+  if (valid(brainDir)) { // rename#2 done; crash before cleanup
+    rm(oldDir); rm(newDir); try { fs.unlinkSync(journalPath); } catch {}
+    return;
+  }
+  if (valid(newDir)) { // rename#1 done, rename#2 not — complete forward to the snapshot
+    rm(brainDir); fs.renameSync(newDir, brainDir); rm(oldDir); try { fs.unlinkSync(journalPath); } catch {}
+    return;
+  }
+  if (valid(oldDir)) { // brain.new never made it — revert to the pre-rollback store
+    rm(brainDir); fs.renameSync(oldDir, brainDir); rm(newDir); try { fs.unlinkSync(journalPath); } catch {}
+    return;
+  }
+  throw new Error(`elifant: interrupted rollback detected and no valid brain/, brain.new, or brain.old to recover (journal=${JSON.stringify(journal)}). Refusing to bootstrap an empty brain; manual recovery needed.`);
+}
 
 /**
- * Capture a portable restore point. Sugar over exportBrain with retention discipline.
- *
- * @param {string} reason - human-readable; "daily auto" / "before X" / "keyholder: ..."
+ * Capture a portable restore point: a full-fidelity dumpDataDir copy of the store.
+ * @param {string} reason - "daily auto" / "before X" / "keyholder: ..."
  * @param {object} [options]
  * @param {'keyholder-explicit'|'schedule'|'pre-action'|'anomaly-triggered'|'capture-burst'} [options.trigger]
- * @param {object} [options.scope]
- * @returns {Promise<object>} SnapshotReceipt
+ * @returns {Promise<object>} SnapshotReceipt {snapshot_id, reason, trigger, exported_at, table_counts, bytes, sha256, storage_uri, brain_version, substrate_identity}
  */
 async function snapshot(reason, options = {}) {
   _ensure();
-  throw new Error('snapshot: not yet implemented in this version (skeleton in v0.3.0-dev; full impl ships with protocol v0.1 amendment)');
+  const trigger = options.trigger || 'keyholder-explicit';
+  const snapDir = _snapDir();
+  fs.mkdirSync(snapDir, { recursive: true });
+  const id = _snapId();
+  // ms-precision (still valid ISO-8601 UTC) so two snapshots in the same second order
+  // deterministically newest-first; the rest of the kernel keeps second-precision _ts().
+  const exported_at = new Date().toISOString();
+
+  // dumpDataDir is a SYNCHRONOUS tar walk (no awaits → can't interleave with a WASM
+  // query), so a concurrent single-statement write lands fully before or after, never
+  // torn (multi-statement writes use transaction() exclusivity). CHECKPOINT first is
+  // belt-and-braces: flush the WAL so the dump reflects a checkpointed store.
+  try { await _db.exec('CHECKPOINT'); } catch { /* non-fatal */ }
+
+  const table_counts = await _tableCounts(_db);
+  const substrate_identity = await _getSubstrateIdentity();
+  const file = await _db.dumpDataDir('gzip');
+  const buf = Buffer.from(await file.arrayBuffer());
+  const sha256 = _sha256(buf);
+
+  // Durable write: tmp -> fsync -> rename, so a crash/disk-full mid-write never leaves
+  // a truncated tarball at the real path (discovered only at restore).
+  const finalPath = path.join(snapDir, `${id}.tar.gz`);
+  const tmpPath = finalPath + '.tmp';
+  const fd = fs.openSync(tmpPath, 'w');
+  try { fs.writeSync(fd, buf); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+  fs.renameSync(tmpPath, finalPath);
+
+  const receipt = { snapshot_id: id, reason: reason || 'snapshot', trigger, exported_at, table_counts, bytes: buf.length, sha256, storage_uri: finalPath, brain_version: PACKAGE_VERSION, substrate_identity };
+  fs.appendFileSync(path.join(snapDir, 'index.jsonl'), JSON.stringify(receipt) + '\n');
+
+  // Retention — but a pre-action (safety) snapshot SKIPS it, so a rollback's safety
+  // net can never reap the very target being restored.
+  if (trigger !== 'pre-action') {
+    try { _applyRetention([id]); } catch (e) { _debug(`[brain] retention: ${e.message}`); }
+  }
+  _debug(`[brain] snapshot ${id}: ${buf.length} bytes, ${JSON.stringify(table_counts)}`);
+  return receipt;
+}
+
+function _loadSnapshotBuffer(receipt) {
+  const p = receipt.storage_uri || path.join(_snapDir(), `${receipt.snapshot_id}.tar.gz`);
+  const buf = fs.readFileSync(p); // throws clearly if the tarball is gone
+  if (receipt.sha256) {
+    const got = _sha256(buf);
+    if (got !== receipt.sha256) throw new Error(`rollback: snapshot ${receipt.snapshot_id} failed integrity check (expected ${receipt.sha256}, got ${got}) — aborting, live untouched`);
+  }
+  return buf;
 }
 
 /**
- * Restore from a snapshot. Three modes:
- *   - 'replace'        destroy current state, load snapshot fully (requires explicit keyholder confirmation)
- *   - 'forward-merge'  keep current, merge snapshot using newer-wins (default, safest)
- *   - 'fork'           load snapshot into a sibling bowl instance, keep both
- *
+ * Restore from a snapshot. Three modes (spec RollbackResult shape):
+ *   - 'replace'        destroy current state, load snapshot fully (requires options.confirm===true)
+ *   - 'forward-merge'  keep current, merge snapshot newer-wins + resurrect-and-flag (default, safest)
+ *   - 'fork'           materialize a sibling bowl with a fresh identity, keep both
  * @param {string} snapshotId
  * @param {'replace'|'forward-merge'|'fork'} [mode='forward-merge']
- * @returns {Promise<object>} RollbackResult
+ * @param {object} [options] - {confirm} required true for 'replace'
+ * @returns {Promise<object>} RollbackResult {snapshot_id, mode, imported, skipped, conflicts, fork_bowl_id?, ...}
  */
-async function rollback(snapshotId, mode = 'forward-merge') {
+async function rollback(snapshotId, mode = 'forward-merge', options = {}) {
   _ensure();
-  throw new Error('rollback: not yet implemented in this version (skeleton in v0.3.0-dev; full impl ships with protocol v0.1 amendment)');
+  if (!['replace', 'forward-merge', 'fork'].includes(mode)) throw new Error(`rollback: unknown mode '${mode}'`);
+  const receipt = _readIndex().find(r => r.snapshot_id === snapshotId);
+  if (!receipt) throw new Error(`rollback: no snapshot '${snapshotId}'`);
+  // Read + integrity-verify the target FULLY into memory FIRST — before any safety
+  // snapshot or destructive step — so retention/IO can never strand the target.
+  const buf = _loadSnapshotBuffer(receipt);
+  if (mode === 'replace') {
+    if (options.confirm !== true) throw new Error("rollback: mode 'replace' destroys current state and requires options.confirm===true (keyholder confirmation gesture)");
+    return _rollbackReplace(receipt, buf);
+  }
+  if (mode === 'fork') return _rollbackFork(receipt, buf);
+  return _rollbackForwardMerge(receipt, buf);
+}
+
+async function _rollbackReplace(receipt, buf) {
+  const brainDir = _dbPath;
+  const newDir = brainDir + '.new';
+  const oldDir = brainDir + '.old';
+  const safety = await snapshot(`pre-rollback-replace safety net (before ${receipt.snapshot_id})`, { trigger: 'pre-action' });
+
+  if (fs.existsSync(newDir)) _rmDir(newDir); // stale from a prior crashed replace (loadDataDir refuses a populated dir)
+  if (fs.existsSync(oldDir)) _rmDir(oldDir);
+
+  // Load into brain.new + VERIFY (counts + vector probe) BEFORE touching live. A bad
+  // blob fails here with live untouched.
+  const verify = _newPglite(newDir, { loadDataDir: _blobFromBuffer(buf, `${receipt.snapshot_id}.tar.gz`) });
+  await verify.query('SELECT 1');
+  await _applySchema(verify);
+  const restored_counts = await _tableCounts(verify);
+  try { await verify.query('SELECT embedding::text FROM memories WHERE embedding IS NOT NULL LIMIT 1'); }
+  catch (e) { await verify.close(); _rmDir(newDir); throw new Error(`rollback replace: vector probe failed on snapshot — aborting, live untouched (${e.message})`); }
+  await verify.close();
+
+  // Journaled directory swap. _recoverInterruptedSwap completes/reverts on next init.
+  _writeJournal({ phase: 'swapping', snapshot_id: receipt.snapshot_id, safety_snapshot_id: safety.snapshot_id, at: _ts() });
+  _ready = false;
+  await close(); // close live _db so the rename can't hit an open handle (Windows EPERM)
+  fs.renameSync(brainDir, oldDir);
+  fs.renameSync(newDir, brainDir);
+  _clearJournal(); // brain/ is the restored store; past the no-empty-bootstrap risk
+
+  _db = _newPglite(brainDir);
+  await _applySchema(_db);
+  _ready = true;
+  _rmDir(oldDir);
+  return { snapshot_id: receipt.snapshot_id, mode: 'replace', imported: restored_counts, skipped: 0, conflicts: 0, safety_snapshot_id: safety.snapshot_id };
+}
+
+async function _rollbackFork(receipt, buf) {
+  const forkId = `fork_${_compactTs()}_${crypto.randomBytes(4).toString('hex')}`;
+  const forkBrain = path.join(path.dirname(_dbPath), 'forks', forkId, 'brain');
+  fs.mkdirSync(path.dirname(forkBrain), { recursive: true });
+  const forkDb = _newPglite(forkBrain, { loadDataDir: _blobFromBuffer(buf, `${receipt.snapshot_id}.tar.gz`) });
+  await forkDb.query('SELECT 1');
+  await _applySchema(forkDb);
+  // A fork is a NEW being: fresh substrate_identity + fresh signing keypair (must
+  // never sign as the parent). The forking bowl's own identity is untouched.
+  const newIdentity = crypto.randomUUID();
+  await forkDb.query("INSERT INTO brain_meta (key, value) VALUES ('substrate_identity', $1) ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value", [newIdentity]);
+  await forkDb.query("INSERT INTO brain_meta (key, value) VALUES ('signing_keypair_v1', $1) ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value", [_generateSigningKeypairJson()]);
+  const counts = await _tableCounts(forkDb);
+  await forkDb.close();
+  return { snapshot_id: receipt.snapshot_id, mode: 'fork', imported: counts, skipped: 0, conflicts: 0, fork_bowl_id: newIdentity, fork_path: path.dirname(forkBrain) };
+}
+
+async function _rollbackForwardMerge(receipt, buf) {
+  // Mandatory pre-merge safety snapshot (kernel-ethics #11; also the undo for the
+  // merge itself, so even a surprising merge is rollback-able).
+  const safety = await snapshot(`pre-forward-merge safety net (before ${receipt.snapshot_id})`, { trigger: 'pre-action' });
+
+  // IN-MEMORY temp instance — options-first form is REQUIRED (see _newPglite).
+  const tmp = _newPglite({ loadDataDir: _blobFromBuffer(buf, `${receipt.snapshot_id}.tar.gz`) });
+  await tmp.query('SELECT 1');
+  await _applySchema(tmp); // backfill columns a pre-migration snapshot predates
+
+  // Nose compatibility: carry a snapshot Scent only if the live Nose matches; else
+  // insert NULL so the resurrected row lands in the re-embed backfill queue (never a
+  // stale/poisoned embedding).
+  const liveNose = await _embedMetaOf(_db);
+  const snapNose = await _embedMetaOf(tmp);
+  const noseMatch = liveNose.model === snapNose.model && liveNose.dim === snapNose.dim && liveNose.version === snapNose.version;
+
+  const wmRow = await _db.query("SELECT value FROM brain_meta WHERE key = 'captures_prune_watermark'");
+  const pruneWatermark = wmRow.rows[0] ? wmRow.rows[0].value : null;
+
+  const imported = { state: 0, memories: 0, steering: 0, review_lessons: 0, captures: 0 };
+  let skipped = 0, conflicts = 0;
+  const resurrected = { state: [], memories: [], steering: [], review_lessons: 0, captures: 0 };
+  const sid = receipt.snapshot_id;
+  let auditId = null;
+
+  // The WHOLE merge runs under transaction() exclusivity. A raw BEGIN only holds the
+  // PGlite mutex per-statement, so a concurrent daemon write could land inside the txn
+  // and be destroyed by a rollback-on-throw — silent loss in a durability feature.
+  // transaction() queues concurrent queries instead (_runExclusiveTransaction).
+  await _db.transaction(async (tx) => {
+    // state — full-column writes (a partial column list silently resets flags)
+    for (const row of (await tmp.query('SELECT key, value, updated_by, updated_at, layer, anonymizable, trust_tier FROM state')).rows) {
+      const ex = await tx.query('SELECT updated_at FROM state WHERE key = $1', [row.key]);
+      if (ex.rows[0]) {
+        conflicts++;
+        if (_liveWins(ex.rows[0].updated_at, row.updated_at)) { skipped++; continue; }
+        await tx.query(`INSERT INTO state (key,value,updated_by,updated_at,layer,anonymizable,trust_tier) VALUES ($1,$2,$3,$4,$5,$6,$7)
+          ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value, updated_by=EXCLUDED.updated_by, updated_at=EXCLUDED.updated_at, layer=EXCLUDED.layer, anonymizable=EXCLUDED.anonymizable, trust_tier=EXCLUDED.trust_tier`,
+          [row.key, row.value, row.updated_by, row.updated_at, row.layer, row.anonymizable, row.trust_tier]);
+        imported.state++;
+      } else {
+        await tx.query(`INSERT INTO state (key,value,updated_by,updated_at,layer,anonymizable,trust_tier,restored_from) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+          [row.key, row.value, row.updated_by, row.updated_at, row.layer, row.anonymizable, row.trust_tier, sid]);
+        imported.state++; resurrected.state.push(row.key);
+      }
+    }
+    // memories — embedding gated on noseMatch (NULL → re-embed queue)
+    for (const row of (await tmp.query('SELECT filename, content, updated_by, updated_at, layer, anonymizable, embedding::text AS embedding, pinned, archived, trust_tier FROM memories')).rows) {
+      const emb = noseMatch ? row.embedding : null;
+      const ex = await tx.query('SELECT updated_at FROM memories WHERE filename = $1', [row.filename]);
+      if (ex.rows[0]) {
+        conflicts++;
+        if (_liveWins(ex.rows[0].updated_at, row.updated_at)) { skipped++; continue; }
+        await tx.query(`INSERT INTO memories (filename,content,updated_by,updated_at,layer,anonymizable,embedding,pinned,archived,trust_tier) VALUES ($1,$2,$3,$4,$5,$6,$7::vector,$8,$9,$10)
+          ON CONFLICT(filename) DO UPDATE SET content=EXCLUDED.content, updated_by=EXCLUDED.updated_by, updated_at=EXCLUDED.updated_at, layer=EXCLUDED.layer, anonymizable=EXCLUDED.anonymizable, embedding=EXCLUDED.embedding, pinned=EXCLUDED.pinned, archived=EXCLUDED.archived, trust_tier=EXCLUDED.trust_tier`,
+          [row.filename, row.content, row.updated_by, row.updated_at, row.layer, row.anonymizable, emb, row.pinned, row.archived, row.trust_tier]);
+        imported.memories++;
+      } else {
+        await tx.query(`INSERT INTO memories (filename,content,updated_by,updated_at,layer,anonymizable,embedding,pinned,archived,trust_tier,restored_from) VALUES ($1,$2,$3,$4,$5,$6,$7::vector,$8,$9,$10,$11)`,
+          [row.filename, row.content, row.updated_by, row.updated_at, row.layer, row.anonymizable, emb, row.pinned, row.archived, row.trust_tier, sid]);
+        imported.memories++; resurrected.memories.push(row.filename);
+      }
+    }
+    // steering — RESURRECTED rows come back DISABLED (they steer behavior; the
+    // keyholder re-enables deliberately). A snapshot-wins UPDATE keeps the snapshot's
+    // enabled flag (it's a content update, not a resurrection).
+    for (const row of (await tmp.query('SELECT id, name, content, mode, match_pattern, priority, enabled, layer, created_at, updated_at, trust_tier FROM steering')).rows) {
+      const ex = await tx.query('SELECT updated_at FROM steering WHERE id = $1', [row.id]);
+      if (ex.rows[0]) {
+        conflicts++;
+        if (_liveWins(ex.rows[0].updated_at, row.updated_at)) { skipped++; continue; }
+        await tx.query(`INSERT INTO steering (id,name,content,mode,match_pattern,priority,enabled,layer,created_at,updated_at,trust_tier) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+          ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name, content=EXCLUDED.content, mode=EXCLUDED.mode, match_pattern=EXCLUDED.match_pattern, priority=EXCLUDED.priority, enabled=EXCLUDED.enabled, layer=EXCLUDED.layer, updated_at=EXCLUDED.updated_at, trust_tier=EXCLUDED.trust_tier`,
+          [row.id, row.name, row.content, row.mode, row.match_pattern, row.priority, row.enabled, row.layer, row.created_at, row.updated_at, row.trust_tier]);
+        imported.steering++;
+      } else {
+        await tx.query(`INSERT INTO steering (id,name,content,mode,match_pattern,priority,enabled,layer,created_at,updated_at,trust_tier,restored_from) VALUES ($1,$2,$3,$4,$5,$6,false,$7,$8,$9,$10,$11)`,
+          [row.id, row.name, row.content, row.mode, row.match_pattern, row.priority, row.layer, row.created_at, row.updated_at, row.trust_tier, sid]);
+        imported.steering++; resurrected.steering.push(row.id);
+      }
+    }
+    // review_lessons — no natural key; dedup by (task_type, rule) (fixes importBrain's
+    // blind-append duplication on the snapshot path)
+    for (const row of (await tmp.query('SELECT task_type, rule, source_item_id, layer, created_at FROM review_lessons')).rows) {
+      const ex = await tx.query('SELECT 1 FROM review_lessons WHERE task_type = $1 AND rule = $2 LIMIT 1', [row.task_type, row.rule]);
+      if (ex.rows[0]) { skipped++; continue; }
+      await tx.query(`INSERT INTO review_lessons (task_type, rule, source_item_id, layer, created_at, restored_from) VALUES ($1,$2,$3,$4,$5,$6)`,
+        [row.task_type, row.rule, row.source_item_id, row.layer, row.created_at, sid]);
+      imported.review_lessons++; resurrected.review_lessons++;
+    }
+    // captures — set-union dedup by content-hash; skip those at/under the prune
+    // watermark (deliberately time-pruned noise must not resurrect — Steve's call)
+    const liveHashes = new Set((await tx.query('SELECT source, type, ts, data FROM captures')).rows.map(_captureHash));
+    for (const row of (await tmp.query('SELECT source, type, ts, data FROM captures')).rows) {
+      if (pruneWatermark && row.ts && row.ts <= pruneWatermark) { skipped++; continue; }
+      const h = _captureHash(row);
+      if (liveHashes.has(h)) { skipped++; continue; }
+      liveHashes.add(h);
+      await tx.query('INSERT INTO captures (source, type, ts, data) VALUES ($1,$2,$3,$4)', [row.source, row.type, row.ts, row.data == null ? null : JSON.stringify(row.data)]);
+      imported.captures++; resurrected.captures++;
+    }
+    // brain_meta + identity + keyholders are intentionally NOT merged: same bowl, so
+    // identity + signing key + Nose match live's; merging keyholders would resurrect
+    // forgotten trust anchors and could roll the anti-replay high-water BACKWARD.
+    // (replace mode inherently restores old keyholders + high-water — by design.)
+
+    // audit capture — one row listing exactly what came back, atomic with the merge
+    const auditData = { snapshot_id: sid, safety_snapshot_id: safety.snapshot_id, nose_match: noseMatch, note: 'forward-merge resurrect-and-flag; re-z86 anything you meant to delete. same-second identical captures may collapse (replace mode is exact-recovery).', resurrected };
+    const ar = await tx.query("INSERT INTO captures (source, type, ts, data) VALUES ('snapshot-restore','forward-merge',$1,$2) RETURNING id", [_ts(), JSON.stringify(auditData)]);
+    auditId = String(ar.rows[0].id);
+  });
+  await tmp.close();
+  return { snapshot_id: sid, mode: 'forward-merge', imported, skipped, conflicts, safety_snapshot_id: safety.snapshot_id, resurrected_counts: { state: resurrected.state.length, memories: resurrected.memories.length, steering: resurrected.steering.length, review_lessons: resurrected.review_lessons, captures: resurrected.captures }, audit_capture_id: auditId };
 }
 
 /**
- * Enumerate available restore points. Metadata only — keyholder picks an id, then calls rollback().
- *
- * @param {object} [filter]
- * @param {string} [filter.since_ts]      ISO-8601 UTC
- * @param {string} [filter.until_ts]
- * @param {string} [filter.trigger]
- * @param {string} [filter.reason_match]  substring match on reason field
- * @param {number} [filter.limit]
- * @returns {Promise<Array<object>>} SnapshotManifest list
+ * Enumerate available restore points. Metadata only (SnapshotManifest), newest-first.
+ * @param {object} [filter] {since_ts, until_ts, trigger, reason_match, limit}
+ * @returns {Promise<Array<object>>}
  */
 async function listSnapshots(filter = {}) {
   _ensure();
-  throw new Error('listSnapshots: not yet implemented in this version (skeleton in v0.3.0-dev; full impl ships with protocol v0.1 amendment)');
+  let receipts = _readIndex();
+  if (filter.since_ts) { const s = _parseStamp(filter.since_ts); receipts = receipts.filter(r => _parseStamp(r.exported_at) >= s); }
+  if (filter.until_ts) { const u = _parseStamp(filter.until_ts); receipts = receipts.filter(r => _parseStamp(r.exported_at) <= u); }
+  if (filter.trigger) receipts = receipts.filter(r => r.trigger === filter.trigger);
+  if (filter.reason_match) receipts = receipts.filter(r => (r.reason || '').includes(filter.reason_match));
+  receipts.sort((a, b) => (_parseStamp(b.exported_at) || 0) - (_parseStamp(a.exported_at) || 0));
+  if (filter.limit) receipts = receipts.slice(0, filter.limit);
+  return receipts.map(r => ({ snapshot_id: r.snapshot_id, reason: r.reason, trigger: r.trigger, exported_at: r.exported_at, table_counts: r.table_counts || {}, bytes: r.bytes || 0 }));
 }
 
 /**
- * Substrate self-diagnostic. The "is something off?" health-check gesture. Returns a
- * baseline-delta report covering capture volume, director changes, pattern-layer
- * additions from unknown sources, recall-distribution shifts, etc.
- *
- * Kernel-ethics #12: implementations MAY refuse to answer a specific question
- * but MUST acknowledge it was asked. This skeleton returns "not yet implemented"
- * (the substrate's most-honest current state for v0.3.0-dev).
- *
+ * Substrate self-diagnostic (HealthReport per elifantic-protocol-v0.1). NEVER throws
+ * for a known question; an unanswerable facet emits an explicit "not available"
+ * observation rather than silently omitting (spec MUST; kernel-ethics #12 — MAY
+ * refuse but MUST acknowledge the question was asked).
  * @param {'overview'|'director-changes'|'pattern-additions'|'recall-shift'|'capture-volume'|'unknown-sources'} [question='overview']
- * @returns {Promise<object>} HealthReport
+ * @returns {Promise<object>} HealthReport {question, baseline_window, observations, proposals?}
  */
 async function health(question = 'overview') {
   _ensure();
-  throw new Error('health: not yet implemented in this version (skeleton in v0.3.0-dev; full impl ships with protocol v0.1 amendment)');
+  const KNOWN = ['overview', 'director-changes', 'pattern-additions', 'recall-shift', 'capture-volume', 'unknown-sources'];
+  const observations = [];
+  const na = (dimension, note) => ({ dimension, baseline: 'n/a', current: 'not available', delta: 0, significance: 'normal', note });
+  let asked = question;
+  if (!KNOWN.includes(question)) {
+    observations.push({ dimension: 'question', baseline: 'n/a', current: String(question), delta: 0, significance: 'normal', note: 'unrecognized question; returning overview' });
+    question = 'overview';
+  }
+  const want = (q) => question === 'overview' || question === q;
+
+  if (want('capture-volume')) {
+    try {
+      const last24 = (await _db.query('SELECT count(*)::int n FROM captures WHERE ts >= $1', [_tsAgo(_DAY_MS)])).rows[0].n;
+      const last7 = (await _db.query('SELECT count(*)::int n FROM captures WHERE ts >= $1', [_tsAgo(7 * _DAY_MS)])).rows[0].n;
+      const dailyAvg = last7 / 7;
+      let significance = 'normal';
+      if (dailyAvg > 0) { const ratio = last24 / dailyAvg; if (ratio >= 5) significance = 'anomalous'; else if (ratio >= 2.5) significance = 'notable'; }
+      observations.push({ dimension: 'capture volume — last 24h vs trailing-7d daily average', baseline: Number(dailyAvg.toFixed(2)), current: last24, delta: dailyAvg > 0 ? Number((last24 - dailyAvg).toFixed(2)) : last24, significance });
+    } catch (e) { observations.push(na('capture volume', 'query failed: ' + e.message)); }
+  }
+  if (want('overview')) {
+    try {
+      const counts = await _tableCounts(_db);
+      observations.push({ dimension: 'table row counts', baseline: 'n/a', current: JSON.stringify(counts), delta: 0, significance: 'normal' });
+    } catch (e) { observations.push(na('table row counts', e.message)); }
+    try {
+      const snaps = _readIndex();
+      const stamps = snaps.map(s => _parseStamp(s.exported_at)).filter(Number.isFinite);
+      observations.push({ dimension: 'snapshots (restore points) available', baseline: 'n/a', current: snaps.length, delta: 0, significance: snaps.length === 0 ? 'notable' : 'normal', note: snaps.length === 0 ? 'no restore points yet — a snapshot is recommended' : `latest ${stamps.length ? new Date(Math.max(...stamps)).toISOString().replace(/\.\d{3}Z$/, 'Z') : 'unknown'}` });
+    } catch (e) { observations.push(na('snapshots', e.message)); }
+    try {
+      const k = (await _db.query("SELECT count(*)::int total, count(*) FILTER (WHERE trusted)::int trusted FROM keyholders")).rows[0];
+      observations.push({ dimension: 'pinned keyholders (trust anchors)', baseline: 'n/a', current: `${k.total} (${k.trusted} trusted)`, delta: 0, significance: 'normal' });
+    } catch (e) { observations.push(na('keyholders', e.message)); }
+    try {
+      const t = (await _db.query("SELECT count(*) FILTER (WHERE trust_tier='tier-3-observed-external')::int t3, count(*) FILTER (WHERE trust_tier='tier-4-raw-exhaust')::int t4 FROM memories")).rows[0];
+      observations.push({ dimension: 'memories by trust tier (observed/raw)', baseline: 'n/a', current: `tier-3: ${t.t3}, tier-4: ${t.t4}`, delta: 0, significance: 'normal' });
+    } catch (e) { observations.push(na('trust tiers', e.message)); }
+  }
+  if (want('pattern-additions')) {
+    try {
+      const n = (await _db.query("SELECT count(*)::int n FROM memories WHERE layer='pattern'")).rows[0].n;
+      observations.push({ dimension: 'pattern-layer memories (template/seeded)', baseline: 'n/a', current: n, delta: 0, significance: 'normal' });
+    } catch (e) { observations.push(na('pattern additions', e.message)); }
+  }
+  if (want('unknown-sources')) {
+    if (await _tableExists('consent')) {
+      try { const n = (await _db.query("SELECT count(*)::int n FROM consent WHERE status='unknown-flagged'")).rows[0].n; observations.push({ dimension: 'unknown-flagged capture sources', baseline: 'n/a', current: n, delta: 0, significance: n > 0 ? 'notable' : 'normal' }); }
+      catch (e) { observations.push(na('unknown capture sources', e.message)); }
+    } else {
+      observations.push(na('unknown capture sources', 'consent projection not present until H3 — cannot enumerate unknown-flagged sources'));
+    }
+  }
+  if (want('director-changes')) observations.push(na('director (router) changes', 'director-change history not retained in this build'));
+  if (want('recall-shift')) observations.push(na('recall distribution shift', 'recall history not retained in this build'));
+
+  const proposals = [];
+  if (observations.some(o => o.significance === 'notable' || o.significance === 'anomalous')) {
+    proposals.push({ kind: 'snapshot', reason: 'one or more observations are above baseline — a snapshot now preserves a clean restore point before anything drifts further' });
+  }
+  return { question: asked, baseline_window: 'trailing 7 days', observations, proposals: proposals.length ? proposals : undefined };
 }
 
 // -- Sync (skeleton; full implementation lands alongside the sync server) --
