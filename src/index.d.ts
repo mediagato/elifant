@@ -271,6 +271,12 @@ export interface SnapshotReceipt {
   table_counts: { [table: string]: number };
   bytes: number;
   storage_uri?: string;
+  /** "sha256:" + hex digest of the tarball; verified before a rollback restores from it. */
+  sha256?: string;
+  /** Kernel version that produced the snapshot. */
+  brain_version?: string;
+  /** The bowl's substrate_identity at snapshot time. */
+  substrate_identity?: string;
 }
 
 /** Metadata returned from listSnapshots() (no payload). */
@@ -299,8 +305,22 @@ export interface RollbackResult {
   imported: ImportedCounts;
   skipped: number;
   conflicts: number;
-  /** Set if mode='fork' — the sibling bowl's id. */
+  /** Set if mode='fork' — the sibling bowl's (new) substrate_identity. */
   fork_bowl_id?: string;
+  /** Set if mode='fork' — filesystem path of the materialized sibling bowl. */
+  fork_path?: string;
+  /** The auto-snapshot taken before a 'replace'/'forward-merge' (the undo for the op). */
+  safety_snapshot_id?: string;
+  /** forward-merge: per-table count of rows resurrected (absent-in-live, re-added + flagged). */
+  resurrected_counts?: { [table: string]: number };
+  /** forward-merge: id of the audit capture listing what was resurrected. */
+  audit_capture_id?: string | null;
+}
+
+/** Options for rollback(). */
+export interface RollbackOptions {
+  /** REQUIRED true for mode='replace' (the only data-losing mode) — keyholder confirmation. */
+  confirm?: boolean;
 }
 
 /** Question the keyholder asks of HEALTH. Default: 'overview'. */
@@ -584,27 +604,27 @@ export function importBrain(input: ImportInput): Promise<ImportResult>;
 // ── SNAPSHOT / ROLLBACK / LIST_SNAPSHOTS / HEALTH (v0.3 — protocol v0.1) ──
 
 /**
- * Capture a portable restore point. Sugar over exportBrain with retention
- * discipline. Skeleton in v0.3.0-dev (throws NotImplementedError until full
- * impl lands in a future release).
+ * Capture a portable restore point: a full-fidelity filesystem dumpDataDir copy of
+ * the whole store (every table, embedding, flag, identity — NOT an exportBrain dump).
  */
 export function snapshot(reason: string, options?: SnapshotOptions): Promise<SnapshotReceipt>;
 
 /**
- * Restore from a snapshot. Default mode: 'forward-merge' (safest). 'replace'
- * mode requires explicit keyholder confirmation per spec. Skeleton in v0.3.0-dev.
+ * Restore from a snapshot. Default mode 'forward-merge' (safest — resurrect-and-flag,
+ * newer-wins). 'replace' (full restore, the only data-losing mode) requires
+ * options.confirm===true. 'fork' materializes a sibling bowl with a fresh identity.
  */
-export function rollback(snapshotId: string, mode?: RollbackMode): Promise<RollbackResult>;
+export function rollback(snapshotId: string, mode?: RollbackMode, options?: RollbackOptions): Promise<RollbackResult>;
 
 /**
- * Enumerate available restore points. Metadata only. Skeleton in v0.3.0-dev.
+ * Enumerate available restore points (metadata only), newest-first.
  */
 export function listSnapshots(filter?: SnapshotFilter): Promise<SnapshotManifest[]>;
 
 /**
- * Self-diagnostic; reports drift or poisoning signals. Skeleton in
- * v0.3.0-dev. Implementations MAY refuse to answer specific questions but
- * MUST acknowledge the question was asked.
+ * Self-diagnostic; reports drift/poisoning signals vs baseline. Never throws for a
+ * known question; an unanswerable facet emits an explicit "not available" observation
+ * (MAY refuse a facet but MUST acknowledge the question was asked).
  */
 export function health(question?: HealthQuestion): Promise<HealthReport>;
 
