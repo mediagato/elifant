@@ -41,6 +41,10 @@ function _debug(...args) {
 let _db = null;
 let _dbPath = null;
 let _ready = false;
+// True only during a replace-rollback directory swap. While set, _ensure() rejects
+// external writes/reads so a concurrent write can't land in live brain/ mid-swap and
+// be silently lost when brain/ is renamed to brain.old and deleted.
+let _swapInProgress = false;
 
 /**
  * Initialize the brain.
@@ -198,6 +202,10 @@ async function _applySchema(db) {
   await db.exec(`ALTER TABLE steering ADD COLUMN IF NOT EXISTS restored_from TEXT;`);
   await db.exec(`ALTER TABLE review_lessons ADD COLUMN IF NOT EXISTS restored_from TEXT;`);
 
+  // 0.16.1: index the forward-merge dedup key so the per-row (task_type, rule) lookup
+  // isn't a sequential scan on a large lessons table inside the exclusive merge txn.
+  await db.exec(`CREATE INDEX IF NOT EXISTS review_lessons_dedup_idx ON review_lessons (task_type, rule);`);
+
   // v0.7.0 — record the Nose (embedder) identity so a brain knows which model
   // produced its Scents. Seeds the historical MiniLM/384 Nose ONLY if absent,
   // so existing brains stay byte-identical. A future Nose swap bumps these via
@@ -261,6 +269,7 @@ function _resolveImportTier(rowTier, policy) {
 
 function _ensure() {
   if (!_ready) throw new Error('Brain not initialized. Call init() first.');
+  if (_swapInProgress) throw new Error('Brain is mid-rollback swap; retry shortly.');
 }
 
 /** Get the database directory path. */
@@ -1793,10 +1802,18 @@ function _rmDir(dir) {
     catch (e) { if (i === 4) throw e; _sleepSync(150); }
   }
 }
+// Same backoff for the swap renames: directory rename can transiently fail EPERM/EBUSY
+// on Windows (AV/indexer probing a freshly-closed dir) right after close().
+function _renameRetry(from, to) {
+  for (let i = 0; i < 5; i++) {
+    try { fs.renameSync(from, to); return; }
+    catch (e) { if (i === 4) throw e; _sleepSync(150); }
+  }
+}
 function _writeJournal(obj) {
   // Durable: fsync so a power loss can't persist rename#1 while the journal blocks are
   // lost/torn (which would strand recovery). Mirrors snapshot()'s tarball write.
-  const fd = fs.openSync(_rollbackJournalPath(), 'w');
+  const fd = fs.openSync(_rollbackJournalPath(), 'w', 0o600);
   try { fs.writeSync(fd, JSON.stringify(obj)); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
 }
 function _clearJournal() { try { fs.unlinkSync(_rollbackJournalPath()); } catch { /* already gone */ } }
@@ -1852,7 +1869,7 @@ async function snapshot(reason, options = {}) {
   _ensure();
   const trigger = options.trigger || 'keyholder-explicit';
   const snapDir = _snapDir();
-  fs.mkdirSync(snapDir, { recursive: true });
+  fs.mkdirSync(snapDir, { recursive: true, mode: 0o700 }); // tarballs hold the plaintext signing key
   const id = _snapId();
   // ms-precision (still valid ISO-8601 UTC) so two snapshots in the same second order
   // deterministically newest-first; the rest of the kernel keeps second-precision _ts().
@@ -1874,7 +1891,7 @@ async function snapshot(reason, options = {}) {
   // a truncated tarball at the real path (discovered only at restore).
   const finalPath = path.join(snapDir, `${id}.tar.gz`);
   const tmpPath = finalPath + '.tmp';
-  const fd = fs.openSync(tmpPath, 'w');
+  const fd = fs.openSync(tmpPath, 'w', 0o600); // tarball holds the plaintext signing key
   try { fs.writeSync(fd, buf); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
   fs.renameSync(tmpPath, finalPath);
 
@@ -1937,49 +1954,80 @@ async function _rollbackReplace(receipt, buf) {
   const oldDir = brainDir + '.old';
   const safety = await snapshot(`pre-rollback-replace safety net (before ${receipt.snapshot_id})`, { trigger: 'pre-action' });
 
-  if (fs.existsSync(newDir)) _rmDir(newDir); // stale from a prior crashed replace (loadDataDir refuses a populated dir)
-  if (fs.existsSync(oldDir)) _rmDir(oldDir);
+  // From here until the swap completes, block concurrent external writes/reads: they
+  // would otherwise land in live brain/ during the verify-load, then be renamed into
+  // brain.old and deleted = silent loss. _ensure() rejects while _swapInProgress; the
+  // rollback's own ops use the separate `verify` instance or direct _db (no _ensure).
+  _swapInProgress = true;
+  let verify = null;
+  try {
+    if (fs.existsSync(newDir)) _rmDir(newDir); // stale from a prior crashed replace (loadDataDir refuses a populated dir)
+    if (fs.existsSync(oldDir)) _rmDir(oldDir);
 
-  // Load into brain.new + VERIFY (counts + vector probe) BEFORE touching live. A bad
-  // blob fails here with live untouched.
-  const verify = _newPglite(newDir, { loadDataDir: _blobFromBuffer(buf) });
-  await verify.query('SELECT 1');
-  await _applySchema(verify);
-  const restored_counts = await _tableCounts(verify);
-  try { await verify.query('SELECT embedding::text FROM memories WHERE embedding IS NOT NULL LIMIT 1'); }
-  catch (e) { await verify.close(); _rmDir(newDir); throw new Error(`rollback replace: vector probe failed on snapshot — aborting, live untouched (${e.message})`); }
-  await verify.close();
+    // Load into brain.new + VERIFY (counts + vector probe) BEFORE touching live. A bad
+    // blob fails here with live untouched.
+    verify = _newPglite(newDir, { loadDataDir: _blobFromBuffer(buf) });
+    await verify.query('SELECT 1');
+    await _applySchema(verify);
+    const restored_counts = await _tableCounts(verify);
+    await verify.query('SELECT embedding::text FROM memories WHERE embedding IS NOT NULL LIMIT 1'); // exercise the vector ext
+    await verify.close(); verify = null;
 
-  // Journaled directory swap. _recoverInterruptedSwap completes/reverts on next init.
-  _writeJournal({ phase: 'swapping', snapshot_id: receipt.snapshot_id, safety_snapshot_id: safety.snapshot_id, at: _ts() });
-  _ready = false;
-  await close(); // close live _db so the rename can't hit an open handle (Windows EPERM)
-  fs.renameSync(brainDir, oldDir);
-  fs.renameSync(newDir, brainDir);
-  _clearJournal(); // brain/ is the restored store; past the no-empty-bootstrap risk
+    // Journaled directory swap. _recoverInterruptedSwap completes/reverts on next init.
+    _writeJournal({ phase: 'swapping', snapshot_id: receipt.snapshot_id, safety_snapshot_id: safety.snapshot_id, at: _ts() });
+    _ready = false;
+    await close(); // close live _db so the rename can't hit an open handle (Windows EPERM)
+    try {
+      _renameRetry(brainDir, oldDir); // rename#1
+    } catch (e) {
+      // rename#1 never moved brain/ — it's intact. Reopen live and bail cleanly so the
+      // brain isn't left offline; no changes were applied.
+      _clearJournal();
+      try { _rmDir(newDir); } catch { /* best effort */ }
+      _db = _newPglite(brainDir); await _applySchema(_db); _ready = true;
+      throw new Error(`rollback replace: directory swap blocked (${e.message}); live brain intact, no changes applied`);
+    }
+    // rename#2: if this fails after retries, brain/ is missing but the journal +
+    // brain.new are intact → next init()'s _recoverInterruptedSwap completes it forward.
+    _renameRetry(newDir, brainDir);
+    _clearJournal(); // brain/ is the restored store; past the no-empty-bootstrap risk
 
-  _db = _newPglite(brainDir);
-  await _applySchema(_db);
-  _ready = true;
-  _rmDir(oldDir);
-  return { snapshot_id: receipt.snapshot_id, mode: 'replace', imported: restored_counts, skipped: 0, conflicts: 0, safety_snapshot_id: safety.snapshot_id };
+    _db = _newPglite(brainDir);
+    await _applySchema(_db);
+    _ready = true;
+    _rmDir(oldDir);
+    return { snapshot_id: receipt.snapshot_id, mode: 'replace', imported: restored_counts, skipped: 0, conflicts: 0, safety_snapshot_id: safety.snapshot_id };
+  } catch (e) {
+    if (verify) { try { await verify.close(); } catch { /* ignore */ } try { _rmDir(newDir); } catch { /* ignore */ } }
+    throw e;
+  } finally {
+    _swapInProgress = false;
+  }
 }
 
 async function _rollbackFork(receipt, buf) {
   const forkId = `fork_${_compactTs()}_${crypto.randomBytes(4).toString('hex')}`;
-  const forkBrain = path.join(path.dirname(_dbPath), 'forks', forkId, 'brain');
-  fs.mkdirSync(path.dirname(forkBrain), { recursive: true });
-  const forkDb = _newPglite(forkBrain, { loadDataDir: _blobFromBuffer(buf) });
-  await forkDb.query('SELECT 1');
-  await _applySchema(forkDb);
-  // A fork is a NEW being: fresh substrate_identity + fresh signing keypair (must
-  // never sign as the parent). The forking bowl's own identity is untouched.
-  const newIdentity = crypto.randomUUID();
-  await forkDb.query("INSERT INTO brain_meta (key, value) VALUES ('substrate_identity', $1) ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value", [newIdentity]);
-  await forkDb.query("INSERT INTO brain_meta (key, value) VALUES ('signing_keypair_v1', $1) ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value", [_generateSigningKeypairJson()]);
-  const counts = await _tableCounts(forkDb);
-  await forkDb.close();
-  return { snapshot_id: receipt.snapshot_id, mode: 'fork', imported: counts, skipped: 0, conflicts: 0, fork_bowl_id: newIdentity, fork_path: path.dirname(forkBrain) };
+  const forkRoot = path.join(path.dirname(_dbPath), 'forks', forkId);
+  const forkBrain = path.join(forkRoot, 'brain');
+  fs.mkdirSync(path.dirname(forkBrain), { recursive: true, mode: 0o700 });
+  let forkDb = null;
+  try {
+    forkDb = _newPglite(forkBrain, { loadDataDir: _blobFromBuffer(buf) });
+    await forkDb.query('SELECT 1');
+    await _applySchema(forkDb);
+    // A fork is a NEW being: fresh substrate_identity + fresh signing keypair (must
+    // never sign as the parent). The forking bowl's own identity is untouched.
+    const newIdentity = crypto.randomUUID();
+    await forkDb.query("INSERT INTO brain_meta (key, value) VALUES ('substrate_identity', $1) ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value", [newIdentity]);
+    await forkDb.query("INSERT INTO brain_meta (key, value) VALUES ('signing_keypair_v1', $1) ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value", [_generateSigningKeypairJson()]);
+    const counts = await _tableCounts(forkDb);
+    await forkDb.close(); forkDb = null;
+    return { snapshot_id: receipt.snapshot_id, mode: 'fork', imported: counts, skipped: 0, conflicts: 0, fork_bowl_id: newIdentity, fork_path: forkRoot };
+  } catch (e) {
+    if (forkDb) { try { await forkDb.close(); } catch { /* ignore */ } }
+    try { _rmDir(forkRoot); } catch { /* don't strand a forks/<id>/ holding the parent's keypair */ }
+    throw e;
+  }
 }
 
 async function _rollbackForwardMerge(receipt, buf) {
@@ -1987,8 +2035,10 @@ async function _rollbackForwardMerge(receipt, buf) {
   // merge itself, so even a surprising merge is rollback-able).
   const safety = await snapshot(`pre-forward-merge safety net (before ${receipt.snapshot_id})`, { trigger: 'pre-action' });
 
-  // IN-MEMORY temp instance — options-first form is REQUIRED (see _newPglite).
+  // IN-MEMORY temp instance — options-first form is REQUIRED (see _newPglite). Wrapped
+  // in try/finally so a throw mid-merge never leaks the in-memory WASM instance.
   const tmp = _newPglite({ loadDataDir: _blobFromBuffer(buf) });
+  try {
   await tmp.query('SELECT 1');
   await _applySchema(tmp); // backfill columns a pre-migration snapshot predates
 
@@ -2076,12 +2126,12 @@ async function _rollbackForwardMerge(receipt, buf) {
     // captures — set-union dedup by content-hash; skip those at/under the prune
     // watermark (deliberately time-pruned noise must not resurrect — Steve's call)
     const liveHashes = new Set((await tx.query('SELECT source, type, ts, data FROM captures')).rows.map(_captureHash));
-    for (const row of (await tmp.query('SELECT source, type, ts, data FROM captures')).rows) {
+    for (const row of (await tmp.query('SELECT source, type, ts, data, layer, anonymizable FROM captures')).rows) {
       if (pruneWatermark && row.ts && row.ts <= pruneWatermark) { skipped++; continue; }
       const h = _captureHash(row);
       if (liveHashes.has(h)) { skipped++; continue; }
       liveHashes.add(h);
-      await tx.query('INSERT INTO captures (source, type, ts, data) VALUES ($1,$2,$3,$4)', [row.source, row.type, row.ts, row.data == null ? null : JSON.stringify(row.data)]);
+      await tx.query('INSERT INTO captures (source, type, ts, data, layer, anonymizable) VALUES ($1,$2,$3,$4,$5,$6)', [row.source, row.type, row.ts, row.data == null ? null : JSON.stringify(row.data), row.layer, row.anonymizable]);
       imported.captures++; resurrected.captures++;
     }
     // brain_meta + identity + keyholders are intentionally NOT merged: same bowl, so
@@ -2094,8 +2144,13 @@ async function _rollbackForwardMerge(receipt, buf) {
     const ar = await tx.query("INSERT INTO captures (source, type, ts, data) VALUES ('snapshot-restore','forward-merge',$1,$2) RETURNING id", [_ts(), JSON.stringify(auditData)]);
     auditId = String(ar.rows[0].id);
   });
-  await tmp.close();
+  // Bound snapshots/ growth on the repeated default-mode path (each rollback took a
+  // safety snapshot). Exempt the target + the just-taken safety net.
+  try { _applyRetention([sid, safety.snapshot_id]); } catch (e) { _debug(`[brain] retention after merge: ${e.message}`); }
   return { snapshot_id: sid, mode: 'forward-merge', imported, skipped, conflicts, safety_snapshot_id: safety.snapshot_id, resurrected_counts: { state: resurrected.state.length, memories: resurrected.memories.length, steering: resurrected.steering.length, review_lessons: resurrected.review_lessons, captures: resurrected.captures }, audit_capture_id: auditId };
+  } finally {
+    try { await tmp.close(); } catch { /* ignore */ }
+  }
 }
 
 /**
@@ -2141,7 +2196,9 @@ async function health(question = 'overview') {
       const last7 = (await _db.query('SELECT count(*)::int n FROM captures WHERE ts >= $1', [_tsAgo(7 * _DAY_MS)])).rows[0].n;
       const dailyAvg = last7 / 7;
       let significance = 'normal';
-      if (dailyAvg > 0) { const ratio = last24 / dailyAvg; if (ratio >= 5) significance = 'anomalous'; else if (ratio >= 2.5) significance = 'notable'; }
+      // Require a meaningful baseline (~a week of activity) before flagging drift, so a
+      // brand-new brain's very first capture isn't reported 'anomalous'.
+      if (last7 >= 7 && dailyAvg > 0) { const ratio = last24 / dailyAvg; if (ratio >= 5) significance = 'anomalous'; else if (ratio >= 2.5) significance = 'notable'; }
       observations.push({ dimension: 'capture volume — last 24h vs trailing-7d daily average', baseline: Number(dailyAvg.toFixed(2)), current: last24, delta: dailyAvg > 0 ? Number((last24 - dailyAvg).toFixed(2)) : last24, significance });
     } catch (e) { observations.push(na('capture volume', 'query failed: ' + e.message)); }
   }

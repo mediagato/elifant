@@ -208,6 +208,7 @@ test('listSnapshots: a corrupt mid-file index line is skipped, valid receipts st
     const all = await brain.listSnapshots();
     assert.equal(all.length, 2, 'both valid receipts survive a garbage line between them');
     assert.deepEqual(all.map(s => s.snapshot_id).sort(), [s1.snapshot_id, s2.snapshot_id].sort());
+    assert.ok(all.every(s => s.reason === 'one' || s.reason === 'two'), 'reasons came from the index parser, not the glob fallback (which would say "recovered")');
   } finally { await brain.close(); }
 });
 
@@ -319,5 +320,77 @@ test('forward-merge: a SCOPED prune (until+source) does NOT block an unrelated s
     await brain.deleteCaptures({ source: 'important' });                            // separately lose the important stream
     await brain.rollback(snap.snapshot_id, 'forward-merge');
     assert.equal((await brain.getCaptures({ source: 'important' })).length, 1, 'unrelated lost capture resurrected (watermark not wrongly advanced)');
+  } finally { await brain.close(); }
+});
+
+// ── 0.16.1 hardening regression tests ─────────────────────────────────────────
+
+test('fork: gets a FRESH signing keypair — cannot sign as the parent', async () => {
+  const dir = tmpDir();
+  await brain.init(dir);
+  try {
+    await brain.setMemory('m.md', 'x', 'test', 'instance');
+    const parentPub = (await brain.exportBrain()).manifest.signature.keyholder_public_key;
+    const snap = await brain.snapshot('pre-fork');
+    const res = await brain.rollback(snap.snapshot_id, 'fork');
+    const { PGlite } = require('@electric-sql/pglite');
+    const { vector } = require('@electric-sql/pglite/vector');
+    const fk = new PGlite(path.join(res.fork_path, 'brain'), { extensions: { vector } });
+    const r = await fk.query("SELECT value FROM brain_meta WHERE key='signing_keypair_v1'");
+    await fk.close();
+    const forkPub = JSON.parse(r.rows[0].value).public_b64;
+    assert.ok(forkPub && forkPub !== parentPub, 'fork signing key differs from the parent');
+  } finally { await brain.close(); }
+});
+
+test('forward-merge: snapshot-WINS conflict UPDATES the live row (not a resurrection)', async () => {
+  const dir = tmpDir();
+  await brain.init(dir);
+  try {
+    await brain.setMemory('m.md', 'OLD', 'test', 'instance');
+    const sOld = await brain.snapshot('old');
+    await new Promise(r => setTimeout(r, 1100)); // force a later second (updated_at is sec-precision)
+    await brain.setMemory('m.md', 'NEW', 'test', 'instance');
+    const sNew = await brain.snapshot('new');
+    await brain.rollback(sOld.snapshot_id, 'replace', { confirm: true }); // live regresses to m='OLD'
+    const res = await brain.rollback(sNew.snapshot_id, 'forward-merge');   // snapshot 'NEW' is strictly newer
+    assert.equal((await brain.getMemory('m.md')).content, 'NEW', 'newer snapshot row won the conflict');
+    assert.equal(res.imported.memories, 1);
+    assert.equal((await brain.getMemory('m.md')).restored_from ?? null, null, 'conflict-update, not flagged as a resurrection');
+  } finally { await brain.close(); }
+});
+
+test('rollback: a CORRUPTED tarball fails the sha256 integrity check, live untouched', async () => {
+  const dir = tmpDir();
+  await brain.init(dir);
+  try {
+    await brain.setMemory('safe.md', 'here', 'test', 'instance');
+    const snap = await brain.snapshot('s');
+    const p = path.join(dir, 'snapshots', `${snap.snapshot_id}.tar.gz`);
+    const b = fs.readFileSync(p); b[Math.floor(b.length / 2)] ^= 0xff; fs.writeFileSync(p, b);
+    await assert.rejects(() => brain.rollback(snap.snapshot_id, 'forward-merge'), /integrity check/);
+    assert.equal((await brain.getMemory('safe.md')).content, 'here', 'live intact after the integrity abort');
+  } finally { await brain.close(); }
+});
+
+test('snapshot retention: same-bucket old snapshots are thinned to one (recent kept)', async () => {
+  const dir = tmpDir();
+  await brain.init(dir);
+  try {
+    await brain.snapshot('seed'); // creates snapshots/ + index
+    const snapDir = path.join(dir, 'snapshots');
+    const ts = new Date(Date.now() - 10 * 86400000).toISOString(); // 10d ago → same daily bucket
+    for (const id of ['snap_olda', 'snap_oldb']) {
+      fs.writeFileSync(path.join(snapDir, `${id}.tar.gz`), 'x'); // dummy tarball
+      fs.appendFileSync(path.join(snapDir, 'index.jsonl'), JSON.stringify({ snapshot_id: id, reason: 'old', trigger: 'schedule', exported_at: ts, table_counts: {}, bytes: 1 }) + '\n');
+    }
+    await brain.snapshot('trigger-retention'); // fires _applyRetention
+    const ids = (await brain.listSnapshots()).map(s => s.snapshot_id);
+    const keptOld = ids.filter(i => i === 'snap_olda' || i === 'snap_oldb');
+    assert.equal(keptOld.length, 1, 'two old snapshots in the same bucket thinned to one');
+    assert.ok(ids.some(i => /^snap_2/.test(i)), 'recent (real) snapshots kept');
+    // the reaped tarball is gone and does not resurrect via the glob fallback
+    const onDisk = fs.readdirSync(snapDir).filter(f => f.endsWith('.tar.gz')).map(f => f.replace('.tar.gz', ''));
+    assert.equal(onDisk.filter(i => i === 'snap_olda' || i === 'snap_oldb').length, 1, 'reaped tarball unlinked');
   } finally { await brain.close(); }
 });
