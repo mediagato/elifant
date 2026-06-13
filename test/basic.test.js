@@ -130,10 +130,11 @@ test('isSeeded returns null on fresh brain', async () => {
   await brain.close();
 });
 
-test('getName defaults to Bob; setName sticks', async () => {
+test('getName is persona-agnostic by default; setName sticks', async () => {
   const dir = tmpDir();
   await brain.init(dir);
-  assert.equal(await brain.getName(), 'Bob');
+  // Kernel ships nameless: neutral default, no baked persona. Shells name it.
+  assert.equal(await brain.getName(), 'your brain');
   await brain.setName('Mags');
   assert.equal(await brain.getName(), 'Mags');
   await brain.close();

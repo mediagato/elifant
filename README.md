@@ -76,7 +76,7 @@ await brain.close();
 - `close()` — close the database and release file handles.
 
 ### Identity
-- `getName()` — returns the stored display name. Default: `'Bob'`.
+- `getName()` — returns the stored display name. Persona-agnostic default: `ELIFANT_DEFAULT_NAME` if set, else `'your brain'`. The kernel ships nameless; shells (and users) name the brain.
 - `setName(name)` — set the display name.
 
 ### State

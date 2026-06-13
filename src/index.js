@@ -275,11 +275,14 @@ function _ensure() {
 /** Get the database directory path. */
 function dbPath() { return _dbPath; }
 
-/** Get this brain's name. Default: Bob. */
+/** Get this brain's display name. The kernel ships persona-agnostic: a stored
+ *  name wins, else ELIFANT_DEFAULT_NAME (a shell can inject its own default),
+ *  else a neutral 'your brain'. Shells name the brain (e.g. Ed, Roz); the
+ *  elifant kernel itself owns no persona. */
 async function getName() {
   _ensure();
   const result = await _db.query("SELECT value FROM brain_meta WHERE key = 'brain_name'");
-  return result.rows[0] ? result.rows[0].value : 'Bob';
+  return result.rows[0] ? result.rows[0].value : (process.env.ELIFANT_DEFAULT_NAME || 'your brain');
 }
 
 /** Name this brain. */

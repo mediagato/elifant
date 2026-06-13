@@ -400,7 +400,8 @@ export function close(): Promise<void>;
 
 // ── Brain identity ────────────────────────────────────────────────────────
 
-/** Get this brain's display name. Default: 'Bob'. */
+/** Get this brain's display name. Persona-agnostic: stored name, else
+ *  ELIFANT_DEFAULT_NAME, else 'your brain'. Shells name the brain. */
 export function getName(): Promise<string>;
 
 /** Set this brain's display name. */
