@@ -1,5 +1,5 @@
 /**
- * Smoke tests for @mediagato/brain.
+ * Smoke tests for @mediagato/elifant.
  *
  * Each test gets its own temp directory so PGlite instances don't collide.
  * Run with: node --test test/

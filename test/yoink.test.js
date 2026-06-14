@@ -3,7 +3,7 @@
  *
  * Each test creates a tmpDir + brain instance, exercises export/import, and
  * closes the brain so subsequent tests get fresh state. Module-level _db state
- * inside @mediagato/brain forces sequential testing — that's fine for now.
+ * inside @mediagato/elifant forces sequential testing — that's fine for now.
  *
  * Run with: node --test test/yoink.test.js
  */
@@ -19,7 +19,7 @@ function tmpDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'brain-yoink-test-'));
 }
 
-/** Re-import @mediagato/brain with fresh module-level state. */
+/** Re-import @mediagato/elifant with fresh module-level state. */
 function freshBrain() {
   delete require.cache[require.resolve('../src/index.js')];
   return require('../src/index.js');
