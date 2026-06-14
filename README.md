@@ -237,4 +237,8 @@ All optional.
 
 ## License
 
-BSL 1.1 — see [LICENSE](LICENSE). Free for personal, non-commercial, and small-organization use (< 5 deployments or < $1M revenue); embedded use by end users of applications licensed by the Licensor is free. Commercial redistribution requires a license from the Licensor. Converts to Apache 2.0 on 2030-05-22.
+**BSL 1.1 — source-available. Read it, run it, fork it, and build on it.** See [LICENSE](LICENSE) (which opens with a plain-English summary).
+
+Free for production use if you **embed it in an app you ship**, use it **personally / non-commercially**, or run it in a **small org** (< 5 deployments or < $1M/yr revenue). The only thing that needs a commercial license is offering elifant *itself* to third parties as a hosted service or product — i.e. reselling the engine. Converts to Apache 2.0 on 2030-05-22.
+
+The protocol it implements (Elifantic v0.1) and the client SDKs (e.g. `elifant-py`) are MIT — the joints anyone can plug into. The kernel is the protected engine; the protocol and clients are the open on-ramps.

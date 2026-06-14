@@ -34,6 +34,30 @@ please contact: steve@mediagato.com
 
 -----------------------------------------------------------------------------
 
+Plain-English summary (NON-BINDING — the Parameters above and the Terms below
+are what legally govern; this is here only to save you reading legalese):
+
+elifant is SOURCE-AVAILABLE. You can read every line, run it, fork it, and
+BUILD ON IT. You may use it in production, for free, if ANY of these is true:
+
+  * You EMBED it in an application you ship — your users get it as part of your
+    product. (This is the common case: build your thing on elifant.)
+  * You use it PERSONALLY or for non-commercial work.
+  * Your ORGANIZATION runs it internally and is small — fewer than 5 deployments
+    in aggregate, OR under $1,000,000/yr in revenue.
+
+The ONE thing that needs a commercial license is offering elifant ITSELF to
+third parties as a hosted/managed service, library, or product — i.e.
+repackaging the engine as a competing service — or running it past the
+thresholds above.
+
+So: build freely on top of elifant. Just don't resell elifant as a service. And
+on the Change Date (2030-05-22) the whole thing converts to Apache 2.0 anyway.
+
+Commercial license / questions: steve@mediagato.com
+
+-----------------------------------------------------------------------------
+
 Business Source License 1.1
 
 License text copyright (c) 2017 MariaDB Corporation Ab, All Rights Reserved.
