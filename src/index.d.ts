@@ -489,6 +489,23 @@ export function searchMemories(options: {
   recencyWeight?: number;
 }): Promise<MemorySearchHit[]>;
 
+/** A named relevance tier. `strict` (auto/ambient surfaces) favors precision; `loose` (user-initiated exploration) favors recall. */
+export type RelevanceTier = 'strict' | 'loose';
+
+/**
+ * Canonical cosine-distance floors — the single source of "close enough".
+ * MEASURED on the live nomic-embed-text Nose (2026-06-16). A hit is relevant
+ * when its `distance` is below the tier's floor. Change the numbers HERE when
+ * the embedder changes; shells name a tier instead of hardcoding a value.
+ */
+export const RELEVANCE_FLOORS: Readonly<Record<RelevanceTier, number>>;
+
+/** True if a hit is relevant at the given tier (default `strict`). A hit with no numeric distance is always relevant. */
+export function isRelevant(hit: { distance?: number } | null | undefined, tier?: RelevanceTier): boolean;
+
+/** Filter a hit list to those relevant at the given tier (default `strict`), order preserved. */
+export function filterRelevant<T extends { distance?: number }>(hits: T[] | null | undefined, tier?: RelevanceTier): T[];
+
 /** The Nose (embedder) identity recorded in a brain. */
 export interface EmbedMeta {
   model: string;

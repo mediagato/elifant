@@ -605,6 +605,39 @@ function _fuseRerank(rows, queryText, recencyWeight) {
   return score;
 }
 
+// ── Relevance floors (the single source of "close enough") ───────────────────
+// searchMemories returns the raw cosine `distance` per row, but "how close is
+// close enough to act on?" is a policy every surface used to re-answer on its
+// own — and the copies DRIFTED (an auto-inject shell sat at 0.33 while an
+// exploration shell sat at 0.40, with no shared anchor). These constants are
+// the ONE canonical answer; shells name a tier instead of hardcoding a number.
+//
+// MEASURED on the live nomic-embed-text Nose (2026-06-16): genuine matches land
+// ~0.27-0.33; ambient / off-topic noise compresses to ~0.45+; the clean gap
+// sits ~0.40. Two named tiers, because precision-vs-recall is a real per-surface
+// trade, not a global constant:
+//   - strict (0.33): ambient / auto-injected surfaces. Silent unless confident —
+//     "better silence than the wrong book." Recall is sacrificed for precision.
+//   - loose  (0.40): user-initiated exploration (related rails, manual search).
+//     The keyholder asked, so a weak-but-present link still earns its place.
+// Smaller distance = more similar, so a hit is relevant when distance < floor.
+// When the embedder changes the numbers move — change them HERE, once.
+const RELEVANCE_FLOORS = Object.freeze({ strict: 0.33, loose: 0.40 });
+
+// Is a search hit relevant enough at the given tier? A hit with no numeric
+// distance (e.g. an exact-id fetch that was never ranked) is always relevant.
+function isRelevant(hit, tier = 'strict') {
+  const floor = RELEVANCE_FLOORS[tier];
+  if (floor == null) throw new Error(`isRelevant: unknown relevance tier "${tier}" (want strict|loose)`);
+  const d = hit && hit.distance;
+  return typeof d !== 'number' || d < floor;
+}
+
+// Filter a hit list to those relevant at the given tier (order preserved).
+function filterRelevant(hits, tier = 'strict') {
+  return (hits || []).filter((h) => isRelevant(h, tier));
+}
+
 // Semantic search over memories.
 //
 // Base mode (queryEmbedding only): top-K rows ordered by cosine distance to the
@@ -2313,6 +2346,10 @@ module.exports = {
   setMemoryEmbedding,
   getMemoriesNeedingEmbedding,
   searchMemories,
+  // v0.18.0 — canonical relevance floors (one source of "close enough", named tiers)
+  RELEVANCE_FLOORS,
+  isRelevant,
+  filterRelevant,
   deleteMemory,
   getAllMemories,
   // v0.6.0 — memory curation (pin + archive)
