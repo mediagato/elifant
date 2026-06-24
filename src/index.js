@@ -206,6 +206,22 @@ async function _applySchema(db) {
   // isn't a sequential scan on a large lessons table inside the exclusive merge txn.
   await db.exec(`CREATE INDEX IF NOT EXISTS review_lessons_dedup_idx ON review_lessons (task_type, rule);`);
 
+  // Migration (0.19.0 — continuity fix, multi-device-sync foundation): per-row
+  // causal version_vector + content_hash + soft-delete tombstone (deleted_at). Let
+  // the merge path replace silent wall-clock last-write-wins (updated_at >=) with
+  // CAUSAL domination: concurrent edits surface as conflict-copies instead of one
+  // silently eating the other, and a delete propagates as a tombstone instead of a
+  // stale present-row silently resurrecting it. All idempotent. version_vector
+  // defaults to '{}' (= "no recorded history yet") so existing rows backfill as the
+  // earliest lineage — the first local write after upgrade stamps them; deleted_at
+  // NULL = live. The three importable/recall-surfaced tables only (review_lessons is
+  // append-dedup'd by (task_type, rule); captures is a prune-watermarked event stream).
+  for (const t of ['memories', 'state', 'steering']) {
+    await db.exec(`ALTER TABLE ${t} ADD COLUMN IF NOT EXISTS version_vector TEXT DEFAULT '{}';`);
+    await db.exec(`ALTER TABLE ${t} ADD COLUMN IF NOT EXISTS content_hash TEXT;`);
+    await db.exec(`ALTER TABLE ${t} ADD COLUMN IF NOT EXISTS deleted_at TEXT;`);
+  }
+
   // v0.7.0 — record the Nose (embedder) identity so a brain knows which model
   // produced its Scents. Seeds the historical MiniLM/384 Nose ONLY if absent,
   // so existing brains stay byte-identical. A future Nose swap bumps these via
@@ -1697,6 +1713,76 @@ function _liveWins(liveStamp, snapStamp) {
   return String(liveStamp) >= String(snapStamp);
 }
 
+// ── Version vectors (continuity fix — causal merge) ─────────────────────────
+//
+// A per-row version vector is a map {device_id: counter} recording how many edits
+// each device has contributed to THAT row's history (device_id = the writing
+// bowl's substrate_identity). It replaces the wall-clock `updated_at >=` arbiter,
+// which silently loses concurrent edits and lets a future-stamped row clobber
+// everything. Comparison is CAUSAL, not chronological:
+//   - 'a-dominates'  → a's history already includes all of b's (a is strictly ahead)
+//   - 'b-dominates'  → vice versa  → fast-forward to b
+//   - 'equal'        → identical history (same lineage; content should match)
+//   - 'concurrent'   → each side has edits the other never saw → a real conflict
+// Per-row vectors suffice because a memory is a whole-blob replace — no need for a
+// character-level CRDT. An empty vector ('{}', the backfill default) is the
+// earliest possible lineage, so any stamped edit dominates a legacy row.
+
+function _vvParse(s) {
+  if (s == null || s === '') return {};
+  const raw = typeof s === 'object' ? s : (() => { try { return JSON.parse(s); } catch { return null; } })();
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  // Coerce to a clean {non-empty-string: positive-int} map; drop garbage entries
+  // so a malformed/hostile vector can't poison comparison with NaN or fractions.
+  const out = {};
+  for (const [k, v] of Object.entries(raw)) {
+    const n = Math.floor(Number(v));
+    if (typeof k === 'string' && k && Number.isFinite(n) && n > 0) out[k] = n;
+  }
+  return out;
+}
+
+// Deterministic serialization (sorted keys) so the same vector is byte-identical
+// across devices — it rides inside the hashed/signed payload, so stability matters.
+function _vvStringify(vv) {
+  const clean = _vvParse(vv);
+  const out = {};
+  for (const k of Object.keys(clean).sort()) out[k] = clean[k];
+  return JSON.stringify(out);
+}
+
+// Record one new local edit: bump this device's counter by 1. Never bumps under a
+// missing identity (would create an unattributable, non-converging entry).
+function _vvBump(vv, deviceId) {
+  const next = _vvParse(vv);
+  if (!deviceId) return next;
+  next[deviceId] = (next[deviceId] || 0) + 1;
+  return next;
+}
+
+// Element-wise max — the join of two histories. Used on fast-forward so the
+// surviving row records that it has now "seen" the lineage it superseded.
+function _vvMerge(a, b) {
+  const x = _vvParse(a), y = _vvParse(b), out = { ...x };
+  for (const [k, v] of Object.entries(y)) out[k] = Math.max(out[k] || 0, v);
+  return out;
+}
+
+// 'a-dominates' | 'b-dominates' | 'equal' | 'concurrent'
+function _vvCompare(a, b) {
+  const x = _vvParse(a), y = _vvParse(b);
+  let aGreater = false, bGreater = false;
+  for (const k of new Set([...Object.keys(x), ...Object.keys(y)])) {
+    const av = x[k] || 0, bv = y[k] || 0;
+    if (av > bv) aGreater = true;
+    else if (bv > av) bGreater = true;
+    if (aGreater && bGreater) return 'concurrent'; // short-circuit: both ahead somewhere
+  }
+  if (aGreater) return 'a-dominates';
+  if (bGreater) return 'b-dominates';
+  return 'equal';
+}
+
 // Construct a PGlite. CRITICAL (PGlite 0.2.x): loadDataDir for an IN-MEMORY instance
 // must use the OPTIONS-FIRST form `new PGlite({loadDataDir})`. `new PGlite(undefined,
 // {loadDataDir})` silently drops the options (the constructor only reads options
@@ -2380,4 +2466,17 @@ module.exports = {
   close,
   // v0.10.0 — polyglot-skills layer (read + carry over the host-map registry)
   skills,
+  // Internal, test-only — NOT a stable public API. Exposed so the version-vector
+  // algebra (the causal-merge continuity primitive) can be unit-tested directly.
+  _internal: {
+    vvParse: _vvParse,
+    vvStringify: _vvStringify,
+    vvBump: _vvBump,
+    vvMerge: _vvMerge,
+    vvCompare: _vvCompare,
+    sha256: _sha256,
+    // Read-through to the live PGlite, so tests can assert on columns the public
+    // API doesn't surface (version_vector, deleted_at, conflict-copies). Test-only.
+    query: (sql, params) => { _ensure(); return _db.query(sql, params); },
+  },
 };
