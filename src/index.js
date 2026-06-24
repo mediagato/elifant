@@ -41,6 +41,10 @@ function _debug(...args) {
 let _db = null;
 let _dbPath = null;
 let _ready = false;
+// Cached local device identity (= this bowl's substrate_identity) used as the
+// version-vector key on local writes. Reset on close() so a re-init on a different
+// dir picks up that bowl's id. Lazily filled by _localDeviceId().
+let _deviceIdCache = null;
 // True only during a replace-rollback directory swap. While set, _ensure() rejects
 // external writes/reads so a concurrent write can't land in live brain/ mid-swap and
 // be silently lost when brain/ is renamed to brain.old and deleted.
@@ -384,16 +388,44 @@ async function getState(key) {
   return result.rows[0] || null;
 }
 
+// This bowl's stable version-vector key (= its substrate_identity, which is unique
+// per install and never overwritten on import). Cached after first read.
+async function _localDeviceId() {
+  if (_deviceIdCache) return _deviceIdCache;
+  _deviceIdCache = await _getSubstrateIdentity();
+  return _deviceIdCache;
+}
+
+// Compute the {version_vector, content_hash} to persist for a LOCAL content write.
+// Bumps THIS device's counter only when the content actually changed — an identical
+// re-save must NOT advance causal history (that would manufacture phantom conflicts
+// and break sync convergence). A brand-new row inherits the existing row's vector if
+// one is present (e.g. overwriting a tombstone) else starts from '{}' (genesis).
+// updated_at is left as the caller's wall-clock (demoted to a display tiebreak).
+async function _stampWrite(table, keyCol, keyVal, content) {
+  const deviceId = await _localDeviceId();
+  const newHash = _sha256(content);
+  const ex = await _db.query(`SELECT version_vector, content_hash FROM ${table} WHERE ${keyCol} = $1`, [keyVal]);
+  const cur = ex.rows[0];
+  if (cur && cur.content_hash === newHash) {
+    return { vv: _vvStringify(cur.version_vector), hash: newHash }; // unchanged → no advance
+  }
+  return { vv: _vvStringify(_vvBump(cur && cur.version_vector, deviceId)), hash: newHash };
+}
+
 async function setState(key, value, updatedBy = 'brain') {
   _ensure();
+  const { vv, hash } = await _stampWrite('state', 'key', key, value);
   await _db.query(`
-    INSERT INTO state (key, value, updated_by, updated_at)
-    VALUES ($1, $2, $3, $4)
+    INSERT INTO state (key, value, updated_by, updated_at, version_vector, content_hash)
+    VALUES ($1, $2, $3, $4, $5, $6)
     ON CONFLICT(key) DO UPDATE SET
       value = EXCLUDED.value,
       updated_by = EXCLUDED.updated_by,
-      updated_at = EXCLUDED.updated_at
-  `, [key, value, updatedBy, _ts()]);
+      updated_at = EXCLUDED.updated_at,
+      version_vector = EXCLUDED.version_vector,
+      content_hash = EXCLUDED.content_hash
+  `, [key, value, updatedBy, _ts(), vv, hash]);
 }
 
 async function getAllState() {
@@ -431,29 +463,34 @@ function _vectorLiteral(arr) {
 
 async function setMemory(filename, content, updatedBy = 'brain', layer = 'instance', embedding = null) {
   _ensure();
+  const { vv, hash } = await _stampWrite('memories', 'filename', filename, content);
   if (embedding == null) {
     await _db.query(`
-      INSERT INTO memories (filename, content, updated_by, updated_at, layer)
-      VALUES ($1, $2, $3, $4, $5)
+      INSERT INTO memories (filename, content, updated_by, updated_at, layer, version_vector, content_hash)
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
       ON CONFLICT(filename) DO UPDATE SET
         content = EXCLUDED.content,
         updated_by = EXCLUDED.updated_by,
         updated_at = EXCLUDED.updated_at,
-        layer = EXCLUDED.layer
-    `, [filename, content, updatedBy, _ts(), layer]);
+        layer = EXCLUDED.layer,
+        version_vector = EXCLUDED.version_vector,
+        content_hash = EXCLUDED.content_hash
+    `, [filename, content, updatedBy, _ts(), layer, vv, hash]);
     return;
   }
   const vec = _vectorLiteral(embedding);
   await _db.query(`
-    INSERT INTO memories (filename, content, updated_by, updated_at, layer, embedding)
-    VALUES ($1, $2, $3, $4, $5, $6::vector)
+    INSERT INTO memories (filename, content, updated_by, updated_at, layer, embedding, version_vector, content_hash)
+    VALUES ($1, $2, $3, $4, $5, $6::vector, $7, $8)
     ON CONFLICT(filename) DO UPDATE SET
       content = EXCLUDED.content,
       updated_by = EXCLUDED.updated_by,
       updated_at = EXCLUDED.updated_at,
       layer = EXCLUDED.layer,
-      embedding = EXCLUDED.embedding
-  `, [filename, content, updatedBy, _ts(), layer, vec]);
+      embedding = EXCLUDED.embedding,
+      version_vector = EXCLUDED.version_vector,
+      content_hash = EXCLUDED.content_hash
+  `, [filename, content, updatedBy, _ts(), layer, vec, vv, hash]);
 }
 
 // Update only the embedding for an existing memory. Used by callers that
@@ -2411,6 +2448,7 @@ async function close() {
     await _db.close();
     _db = null;
     _ready = false;
+    _deviceIdCache = null;
     _debug('[brain] closed');
   }
 }

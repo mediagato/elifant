@@ -112,15 +112,18 @@ test('migration: memories/state/steering gain version_vector, content_hash, dele
   const dir = tmpDir();
   try {
     await brain.init(dir);
-    await brain.setMemory('vv-probe.md', 'hello');
-    await brain.setState('vv-key', 'v');
 
-    // Step 1 only ADDS the columns; the write path stamping them is step 2. So a
-    // freshly-set row must read back with the column DEFAULTS: version_vector '{}'
+    // Test the column DEFAULTS purely by RAW inserts that bypass the stamping setter
+    // (setMemory/setState now stamp version_vector — step 2). A row that pre-dates
+    // the feature (or any non-setter writer) must read back: version_vector '{}'
     // (earliest lineage), content_hash NULL, deleted_at NULL (live).
+    await brain._internal.query(
+      "INSERT INTO memories (filename, content, updated_at) VALUES ('raw.md', 'x', '2026-01-01T00:00:00Z')");
+    await brain._internal.query(
+      "INSERT INTO state (key, value, updated_at) VALUES ('raw', 'x', '2026-01-01T00:00:00Z')");
     for (const [t, col, val] of [
-      ['memories', 'filename', 'vv-probe.md'],
-      ['state', 'key', 'vv-key'],
+      ['memories', 'filename', 'raw.md'],
+      ['state', 'key', 'raw'],
     ]) {
       const r = await brain._internal.query(
         `SELECT version_vector, content_hash, deleted_at FROM ${t} WHERE ${col} = $1`, [val]);
@@ -137,6 +140,80 @@ test('migration: memories/state/steering gain version_vector, content_hash, dele
     assert.ok(s.fields.some((f) => f.name === 'version_vector'), 'steering.version_vector exists');
     assert.ok(s.fields.some((f) => f.name === 'content_hash'), 'steering.content_hash exists');
     assert.ok(s.fields.some((f) => f.name === 'deleted_at'), 'steering.deleted_at exists');
+  } finally {
+    await brain.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── Step 2: local write path stamps version_vector + content_hash ──────────
+
+async function deviceId() {
+  const r = await brain._internal.query("SELECT value FROM brain_meta WHERE key = 'substrate_identity'");
+  return r.rows[0].value;
+}
+
+test('setMemory stamps version_vector keyed by this bowl + content_hash', async () => {
+  const dir = tmpDir();
+  try {
+    await brain.init(dir);
+    const sha256 = brain._internal.sha256;
+
+    await brain.setMemory('note.md', 'first');
+    const me = await deviceId(); // substrate_identity is created lazily on first write
+    let r = await brain._internal.query('SELECT version_vector, content_hash FROM memories WHERE filename=$1', ['note.md']);
+    assert.equal(r.rows[0].version_vector, JSON.stringify({ [me]: 1 }), 'first write → counter 1');
+    assert.equal(r.rows[0].content_hash, sha256('first'), 'content_hash set');
+
+    // a genuine edit advances this device's counter
+    await brain.setMemory('note.md', 'second');
+    r = await brain._internal.query('SELECT version_vector, content_hash FROM memories WHERE filename=$1', ['note.md']);
+    assert.equal(r.rows[0].version_vector, JSON.stringify({ [me]: 2 }), 'edit → counter 2');
+    assert.equal(r.rows[0].content_hash, sha256('second'));
+
+    // re-saving IDENTICAL content must NOT advance (no phantom causal history)
+    await brain.setMemory('note.md', 'second');
+    r = await brain._internal.query('SELECT version_vector FROM memories WHERE filename=$1', ['note.md']);
+    assert.equal(r.rows[0].version_vector, JSON.stringify({ [me]: 2 }), 'identical re-save → no advance');
+  } finally {
+    await brain.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('setMemory stamps on the embedding path too', async () => {
+  const dir = tmpDir();
+  try {
+    await brain.init(dir);
+    const emb = Array.from({ length: 384 }, () => 0.01);
+    await brain.setMemory('emb.md', 'body', 'brain', 'instance', emb);
+    const me = await deviceId();
+    const r = await brain._internal.query('SELECT version_vector, content_hash FROM memories WHERE filename=$1', ['emb.md']);
+    assert.equal(r.rows[0].version_vector, JSON.stringify({ [me]: 1 }));
+    assert.equal(r.rows[0].content_hash, brain._internal.sha256('body'));
+  } finally {
+    await brain.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('setState stamps version_vector + content_hash, idempotent on identical value', async () => {
+  const dir = tmpDir();
+  try {
+    await brain.init(dir);
+    await brain.setState('k', 'v1');
+    const me = await deviceId();
+    let r = await brain._internal.query('SELECT version_vector, content_hash FROM state WHERE key=$1', ['k']);
+    assert.equal(r.rows[0].version_vector, JSON.stringify({ [me]: 1 }));
+    assert.equal(r.rows[0].content_hash, brain._internal.sha256('v1'));
+
+    await brain.setState('k', 'v1'); // identical → no advance
+    r = await brain._internal.query('SELECT version_vector FROM state WHERE key=$1', ['k']);
+    assert.equal(r.rows[0].version_vector, JSON.stringify({ [me]: 1 }));
+
+    await brain.setState('k', 'v2'); // changed → advance
+    r = await brain._internal.query('SELECT version_vector FROM state WHERE key=$1', ['k']);
+    assert.equal(r.rows[0].version_vector, JSON.stringify({ [me]: 2 }));
   } finally {
     await brain.close();
     fs.rmSync(dir, { recursive: true, force: true });
