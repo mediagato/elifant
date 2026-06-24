@@ -14,8 +14,15 @@ export type Layer = 'instance' | 'pattern';
 /** Layer filter accepts the wildcard 'any' in addition to the layer enum. */
 export type LayerFilter = Layer | 'any';
 
-/** Conflict-resolution mode for importBrain. Default: 'newer-wins'. */
-export type ConflictMode = 'skip' | 'overwrite' | 'newer-wins';
+/**
+ * Conflict-resolution mode for importBrain. Default: 'newer-wins'.
+ * 'skip'|'overwrite'|'newer-wins' are the one-shot YOINK policies (wall-clock).
+ * 'merge' is the causal multi-device sync policy: per-row version-vector
+ * domination → fast-forward; concurrent divergence → deterministic winner +
+ * the loser preserved as a `<key>.conflict-<hash>` copy + a surfaced capture;
+ * tombstones propagate; a delete-vs-edit keeps the edit.
+ */
+export type ConflictMode = 'skip' | 'overwrite' | 'newer-wins' | 'merge';
 
 // ── State + memory row shapes ─────────────────────────────────────────────
 
@@ -226,6 +233,8 @@ export interface ImportResult {
   imported: ImportedCounts;
   skipped: number;
   conflicts: number;
+  /** `merge` policy only: count of concurrent-edit losers preserved as `<key>.conflict-<hash>` copies. */
+  conflict_copies?: number;
   manifest: SoulManifest;
   /**
    * Outcome of the signature + payload-integrity check. See SignatureStatus.
@@ -541,8 +550,20 @@ export function setMemoryPin(filename: string, pinned: boolean): Promise<void>;
 /** Toggle the archived flag on a memory. No-op if the memory doesn't exist. */
 export function setMemoryArchive(filename: string, archived: boolean): Promise<void>;
 
-/** Delete a memory by filename. No-op if it doesn't exist. */
+/**
+ * Soft-delete a memory by filename: a tombstone (deleted_at + version-vector bump)
+ * so the delete propagates on sync instead of being resurrected. Filtered from every
+ * read. No-op if absent or already a tombstone.
+ */
 export function deleteMemory(filename: string): Promise<void>;
+
+/**
+ * Garbage-collect tombstones (memories + state) whose deleted_at is at/older than the
+ * cutoff. Requires an explicit `olderThan` — a tombstone is only safe to reap once every
+ * device has seen the delete, which has no safe default without a sync cursor. Advances
+ * `tombstone_prune_watermark`. Returns the number of tombstones reaped.
+ */
+export function pruneTombstones(opts: { olderThan: string }): Promise<number>;
 
 // ── Captures (event stream / projection sink, v0.5.0-dev) ─────────────────
 
