@@ -374,7 +374,7 @@ async function migrateEmbedDim(newDim, { model = null, version = null } = {}) {
   await _db.exec('ALTER TABLE memories DROP COLUMN IF EXISTS embedding;');
   await _db.exec(`ALTER TABLE memories ADD COLUMN embedding vector(${newDim});`);
   await setEmbedMeta({ model, dim: newDim, version });
-  const r = await _db.query('SELECT COUNT(*)::int AS n FROM memories');
+  const r = await _db.query('SELECT COUNT(*)::int AS n FROM memories WHERE deleted_at IS NULL');
   return r.rows[0] ? r.rows[0].n : 0;
 }
 
@@ -383,7 +383,7 @@ async function migrateEmbedDim(newDim, { model = null, version = null } = {}) {
 async function getState(key) {
   _ensure();
   const result = await _db.query(
-    'SELECT value, layer, updated_at FROM state WHERE key = $1', [key]
+    'SELECT value, layer, updated_at FROM state WHERE key = $1 AND deleted_at IS NULL', [key]
   );
   return result.rows[0] || null;
 }
@@ -405,10 +405,14 @@ async function _localDeviceId() {
 async function _stampWrite(table, keyCol, keyVal, content) {
   const deviceId = await _localDeviceId();
   const newHash = _sha256(content);
-  const ex = await _db.query(`SELECT version_vector, content_hash FROM ${table} WHERE ${keyCol} = $1`, [keyVal]);
+  const ex = await _db.query(`SELECT version_vector, content_hash, deleted_at FROM ${table} WHERE ${keyCol} = $1`, [keyVal]);
   const cur = ex.rows[0];
-  if (cur && cur.content_hash === newHash) {
-    return { vv: _vvStringify(cur.version_vector), hash: newHash }; // unchanged → no advance
+  const wasTombstoned = !!(cur && cur.deleted_at);
+  // A live row re-saved with identical content is a no-op for causal history. But
+  // resurrecting a tombstone (deleted_at set) is a NEW event that must dominate the
+  // delete — so it always advances, even if the content matches what was deleted.
+  if (cur && cur.content_hash === newHash && !wasTombstoned) {
+    return { vv: _vvStringify(cur.version_vector), hash: newHash };
   }
   return { vv: _vvStringify(_vvBump(cur && cur.version_vector, deviceId)), hash: newHash };
 }
@@ -424,19 +428,28 @@ async function setState(key, value, updatedBy = 'brain') {
       updated_by = EXCLUDED.updated_by,
       updated_at = EXCLUDED.updated_at,
       version_vector = EXCLUDED.version_vector,
-      content_hash = EXCLUDED.content_hash
+      content_hash = EXCLUDED.content_hash,
+      deleted_at = NULL
   `, [key, value, updatedBy, _ts(), vv, hash]);
 }
 
 async function getAllState() {
   _ensure();
-  const result = await _db.query('SELECT key, value, layer, updated_at FROM state ORDER BY key');
+  const result = await _db.query('SELECT key, value, layer, updated_at FROM state WHERE deleted_at IS NULL ORDER BY key');
   return result.rows;
 }
 
 async function deleteState(key) {
   _ensure();
-  await _db.query('DELETE FROM state WHERE key = $1', [key]);
+  // Soft-delete: a tombstone (deleted_at set + version-vector bumped) so the delete
+  // propagates as a causal event and dominates a stale present-row on another device,
+  // instead of a hard DELETE that the next merge silently resurrects. Idempotent: a
+  // missing key or an existing tombstone is left alone (no double-bump).
+  const deviceId = await _localDeviceId();
+  const ex = await _db.query('SELECT version_vector, deleted_at FROM state WHERE key = $1', [key]);
+  if (!ex.rows[0] || ex.rows[0].deleted_at) return;
+  const vv = _vvStringify(_vvBump(ex.rows[0].version_vector, deviceId));
+  await _db.query('UPDATE state SET deleted_at = $1, version_vector = $2 WHERE key = $3', [_ts(), vv, key]);
 }
 
 // ── Memory operations ─────────────────────────────────────────────────────
@@ -444,7 +457,7 @@ async function deleteState(key) {
 async function getMemory(filename) {
   _ensure();
   const result = await _db.query(
-    'SELECT content, layer, updated_at, trust_tier, restored_from FROM memories WHERE filename = $1', [filename]
+    'SELECT content, layer, updated_at, trust_tier, restored_from FROM memories WHERE filename = $1 AND deleted_at IS NULL', [filename]
   );
   return result.rows[0] || null;
 }
@@ -474,7 +487,8 @@ async function setMemory(filename, content, updatedBy = 'brain', layer = 'instan
         updated_at = EXCLUDED.updated_at,
         layer = EXCLUDED.layer,
         version_vector = EXCLUDED.version_vector,
-        content_hash = EXCLUDED.content_hash
+        content_hash = EXCLUDED.content_hash,
+        deleted_at = NULL
     `, [filename, content, updatedBy, _ts(), layer, vv, hash]);
     return;
   }
@@ -489,7 +503,8 @@ async function setMemory(filename, content, updatedBy = 'brain', layer = 'instan
       layer = EXCLUDED.layer,
       embedding = EXCLUDED.embedding,
       version_vector = EXCLUDED.version_vector,
-      content_hash = EXCLUDED.content_hash
+      content_hash = EXCLUDED.content_hash,
+      deleted_at = NULL
   `, [filename, content, updatedBy, _ts(), layer, vec, vv, hash]);
 }
 
@@ -513,7 +528,7 @@ async function setMemoryEmbedding(filename, embedding) {
 async function getMemoriesNeedingEmbedding(limit = 50) {
   _ensure();
   const result = await _db.query(
-    'SELECT filename, content FROM memories WHERE embedding IS NULL ORDER BY updated_at ASC LIMIT $1',
+    'SELECT filename, content FROM memories WHERE embedding IS NULL AND deleted_at IS NULL ORDER BY updated_at ASC LIMIT $1',
     [limit]
   );
   return result.rows;
@@ -526,13 +541,13 @@ async function getMemoriesNeedingEmbedding(limit = 50) {
 // ("why is this here?") without a follow-up fetch.
 async function getAllMemories({ includeArchived = false, onlyArchived = false } = {}) {
   _ensure();
-  const where = [];
+  const where = ['deleted_at IS NULL'];
   if (onlyArchived) {
     where.push('archived = true');
   } else if (!includeArchived) {
     where.push('archived = false');
   }
-  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  const whereSql = `WHERE ${where.join(' AND ')}`;
   const result = await _db.query(`
     SELECT filename, layer, updated_at, updated_by, pinned, archived, trust_tier, restored_from
     FROM memories
@@ -715,7 +730,7 @@ async function searchMemories({ queryEmbedding, queryText = null, k = 5, layer =
 
   const doRerank = rerank && typeof queryText === 'string' && queryText.trim().length > 0;
 
-  const where = ['embedding IS NOT NULL'];
+  const where = ['embedding IS NOT NULL', 'deleted_at IS NULL'];
   const params = [vec];
   let nextParam = 2;
   if (!includeArchived) { where.push('archived = false'); }
@@ -792,7 +807,50 @@ async function searchMemories({ queryEmbedding, queryText = null, k = 5, layer =
 
 async function deleteMemory(filename) {
   _ensure();
-  await _db.query('DELETE FROM memories WHERE filename = $1', [filename]);
+  // Soft-delete: a tombstone (deleted_at set + version-vector bumped) so the delete
+  // propagates as a causal event and dominates a stale present-row on another device,
+  // instead of a hard DELETE that the next merge silently resurrects. Content is
+  // retained (filtered from every read) until tombstone GC. Idempotent: a missing
+  // file or an existing tombstone is left alone (no double-bump).
+  const deviceId = await _localDeviceId();
+  const ex = await _db.query('SELECT version_vector, deleted_at FROM memories WHERE filename = $1', [filename]);
+  if (!ex.rows[0] || ex.rows[0].deleted_at) return;
+  const vv = _vvStringify(_vvBump(ex.rows[0].version_vector, deviceId));
+  await _db.query('UPDATE memories SET deleted_at = $1, version_vector = $2 WHERE filename = $3', [_ts(), vv, filename]);
+}
+
+/**
+ * Garbage-collect tombstones: hard-DELETE soft-deleted memories + state whose
+ * deleted_at is at/older than the cutoff. A tombstone can only be SAFELY reaped
+ * once EVERY device has seen the delete — otherwise a lagging device's stale
+ * present-row resurrects it on the next merge. Phase 0 has no sync cursor to prove
+ * "everyone has synced", so this is deliberately NOT auto-invoked and has no
+ * default cutoff: the caller must pass an `olderThan` it is confident every device
+ * has synced past. The relay phase makes the watermark precise (reap once the
+ * minimum device cursor passes it). Advances `tombstone_prune_watermark` (mirrors
+ * `captures_prune_watermark`) so a later merge won't resurrect a reaped tombstone's
+ * pre-delete row. ISO-8601 stamps compare correctly as TEXT.
+ * @param {object} opts
+ * @param {string} opts.olderThan - ISO-8601 cutoff (required; reap deleted_at <= this)
+ * @returns {Promise<number>} tombstones reaped
+ */
+async function pruneTombstones({ olderThan } = {}) {
+  _ensure();
+  if (!olderThan || typeof olderThan !== 'string') {
+    throw new Error('pruneTombstones: an explicit olderThan (ISO-8601) cutoff is required — there is no safe default without a sync cursor');
+  }
+  let reaped = 0;
+  for (const t of ['memories', 'state']) {
+    const r = await _db.query(`DELETE FROM ${t} WHERE deleted_at IS NOT NULL AND deleted_at <= $1`, [olderThan]);
+    reaped += r.affectedRows || 0;
+  }
+  if (reaped > 0) {
+    await _db.query(`
+      INSERT INTO brain_meta (key, value) VALUES ('tombstone_prune_watermark', $1)
+      ON CONFLICT(key) DO UPDATE SET value = GREATEST(brain_meta.value, EXCLUDED.value)
+    `, [olderThan]);
+  }
+  return reaped;
 }
 
 // ── Captures (event stream) ───────────────────────────────────────────────
@@ -2224,8 +2282,11 @@ async function _rollbackForwardMerge(receipt, buf) {
   await _db.transaction(async (tx) => {
     // state — full-column writes (a partial column list silently resets flags)
     for (const row of (await tmp.query('SELECT key, value, updated_by, updated_at, layer, anonymizable, trust_tier FROM state')).rows) {
-      const ex = await tx.query('SELECT updated_at FROM state WHERE key = $1', [row.key]);
-      if (ex.rows[0]) {
+      const ex = await tx.query('SELECT updated_at, deleted_at FROM state WHERE key = $1', [row.key]);
+      // A live tombstone counts as ABSENT here: a deliberate rollback is the keyholder
+      // asking to UNDO deletes since the snapshot, so the snapshot's row resurrects
+      // (clearing the tombstone). Sync merges respect tombstones; rollback overrides.
+      if (ex.rows[0] && !ex.rows[0].deleted_at) {
         conflicts++;
         if (_liveWins(ex.rows[0].updated_at, row.updated_at)) { skipped++; continue; }
         await tx.query(`INSERT INTO state (key,value,updated_by,updated_at,layer,anonymizable,trust_tier) VALUES ($1,$2,$3,$4,$5,$6,$7)
@@ -2233,7 +2294,8 @@ async function _rollbackForwardMerge(receipt, buf) {
           [row.key, row.value, row.updated_by, row.updated_at, row.layer, row.anonymizable, row.trust_tier]);
         imported.state++;
       } else {
-        await tx.query(`INSERT INTO state (key,value,updated_by,updated_at,layer,anonymizable,trust_tier,restored_from) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+        await tx.query(`INSERT INTO state (key,value,updated_by,updated_at,layer,anonymizable,trust_tier,restored_from) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+          ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value, updated_by=EXCLUDED.updated_by, updated_at=EXCLUDED.updated_at, layer=EXCLUDED.layer, anonymizable=EXCLUDED.anonymizable, trust_tier=EXCLUDED.trust_tier, restored_from=EXCLUDED.restored_from, deleted_at=NULL`,
           [row.key, row.value, row.updated_by, row.updated_at, row.layer, row.anonymizable, row.trust_tier, sid]);
         imported.state++; resurrected.state.push(row.key);
       }
@@ -2241,8 +2303,8 @@ async function _rollbackForwardMerge(receipt, buf) {
     // memories — embedding gated on noseMatch (NULL → re-embed queue)
     for (const row of (await tmp.query('SELECT filename, content, updated_by, updated_at, layer, anonymizable, embedding::text AS embedding, pinned, archived, trust_tier FROM memories')).rows) {
       const emb = noseMatch ? row.embedding : null;
-      const ex = await tx.query('SELECT updated_at FROM memories WHERE filename = $1', [row.filename]);
-      if (ex.rows[0]) {
+      const ex = await tx.query('SELECT updated_at, deleted_at FROM memories WHERE filename = $1', [row.filename]);
+      if (ex.rows[0] && !ex.rows[0].deleted_at) { // tombstone counts as absent → resurrect on rollback
         conflicts++;
         if (_liveWins(ex.rows[0].updated_at, row.updated_at)) { skipped++; continue; }
         await tx.query(`INSERT INTO memories (filename,content,updated_by,updated_at,layer,anonymizable,embedding,pinned,archived,trust_tier) VALUES ($1,$2,$3,$4,$5,$6,$7::vector,$8,$9,$10)
@@ -2250,7 +2312,8 @@ async function _rollbackForwardMerge(receipt, buf) {
           [row.filename, row.content, row.updated_by, row.updated_at, row.layer, row.anonymizable, emb, row.pinned, row.archived, row.trust_tier]);
         imported.memories++;
       } else {
-        await tx.query(`INSERT INTO memories (filename,content,updated_by,updated_at,layer,anonymizable,embedding,pinned,archived,trust_tier,restored_from) VALUES ($1,$2,$3,$4,$5,$6,$7::vector,$8,$9,$10,$11)`,
+        await tx.query(`INSERT INTO memories (filename,content,updated_by,updated_at,layer,anonymizable,embedding,pinned,archived,trust_tier,restored_from) VALUES ($1,$2,$3,$4,$5,$6,$7::vector,$8,$9,$10,$11)
+          ON CONFLICT(filename) DO UPDATE SET content=EXCLUDED.content, updated_by=EXCLUDED.updated_by, updated_at=EXCLUDED.updated_at, layer=EXCLUDED.layer, anonymizable=EXCLUDED.anonymizable, embedding=EXCLUDED.embedding, pinned=EXCLUDED.pinned, archived=EXCLUDED.archived, trust_tier=EXCLUDED.trust_tier, restored_from=EXCLUDED.restored_from, deleted_at=NULL`,
           [row.filename, row.content, row.updated_by, row.updated_at, row.layer, row.anonymizable, emb, row.pinned, row.archived, row.trust_tier, sid]);
         imported.memories++; resurrected.memories.push(row.filename);
       }
@@ -2259,8 +2322,8 @@ async function _rollbackForwardMerge(receipt, buf) {
     // keyholder re-enables deliberately). A snapshot-wins UPDATE keeps the snapshot's
     // enabled flag (it's a content update, not a resurrection).
     for (const row of (await tmp.query('SELECT id, name, content, mode, match_pattern, priority, enabled, layer, created_at, updated_at, trust_tier FROM steering')).rows) {
-      const ex = await tx.query('SELECT updated_at FROM steering WHERE id = $1', [row.id]);
-      if (ex.rows[0]) {
+      const ex = await tx.query('SELECT updated_at, deleted_at FROM steering WHERE id = $1', [row.id]);
+      if (ex.rows[0] && !ex.rows[0].deleted_at) { // tombstone counts as absent → resurrect on rollback
         conflicts++;
         if (_liveWins(ex.rows[0].updated_at, row.updated_at)) { skipped++; continue; }
         await tx.query(`INSERT INTO steering (id,name,content,mode,match_pattern,priority,enabled,layer,created_at,updated_at,trust_tier) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
@@ -2268,7 +2331,8 @@ async function _rollbackForwardMerge(receipt, buf) {
           [row.id, row.name, row.content, row.mode, row.match_pattern, row.priority, row.enabled, row.layer, row.created_at, row.updated_at, row.trust_tier]);
         imported.steering++;
       } else {
-        await tx.query(`INSERT INTO steering (id,name,content,mode,match_pattern,priority,enabled,layer,created_at,updated_at,trust_tier,restored_from) VALUES ($1,$2,$3,$4,$5,$6,false,$7,$8,$9,$10,$11)`,
+        await tx.query(`INSERT INTO steering (id,name,content,mode,match_pattern,priority,enabled,layer,created_at,updated_at,trust_tier,restored_from) VALUES ($1,$2,$3,$4,$5,$6,false,$7,$8,$9,$10,$11)
+          ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name, content=EXCLUDED.content, mode=EXCLUDED.mode, match_pattern=EXCLUDED.match_pattern, priority=EXCLUDED.priority, enabled=false, layer=EXCLUDED.layer, updated_at=EXCLUDED.updated_at, trust_tier=EXCLUDED.trust_tier, restored_from=EXCLUDED.restored_from, deleted_at=NULL`,
           [row.id, row.name, row.content, row.mode, row.match_pattern, row.priority, row.layer, row.created_at, row.updated_at, row.trust_tier, sid]);
         imported.steering++; resurrected.steering.push(row.id);
       }
@@ -2376,13 +2440,13 @@ async function health(question = 'overview') {
       observations.push({ dimension: 'pinned keyholders (trust anchors)', baseline: 'n/a', current: `${k.total} (${k.trusted} trusted)`, delta: 0, significance: 'normal' });
     } catch (e) { observations.push(na('keyholders', e.message)); }
     try {
-      const t = (await _db.query("SELECT count(*) FILTER (WHERE trust_tier='tier-3-observed-external')::int t3, count(*) FILTER (WHERE trust_tier='tier-4-raw-exhaust')::int t4 FROM memories")).rows[0];
+      const t = (await _db.query("SELECT count(*) FILTER (WHERE trust_tier='tier-3-observed-external')::int t3, count(*) FILTER (WHERE trust_tier='tier-4-raw-exhaust')::int t4 FROM memories WHERE deleted_at IS NULL")).rows[0];
       observations.push({ dimension: 'memories by trust tier (observed/raw)', baseline: 'n/a', current: `tier-3: ${t.t3}, tier-4: ${t.t4}`, delta: 0, significance: 'normal' });
     } catch (e) { observations.push(na('trust tiers', e.message)); }
   }
   if (want('pattern-additions')) {
     try {
-      const n = (await _db.query("SELECT count(*)::int n FROM memories WHERE layer='pattern'")).rows[0].n;
+      const n = (await _db.query("SELECT count(*)::int n FROM memories WHERE layer='pattern' AND deleted_at IS NULL")).rows[0].n;
       observations.push({ dimension: 'pattern-layer memories (template/seeded)', baseline: 'n/a', current: n, delta: 0, significance: 'normal' });
     } catch (e) { observations.push(na('pattern additions', e.message)); }
   }
@@ -2475,6 +2539,7 @@ module.exports = {
   isRelevant,
   filterRelevant,
   deleteMemory,
+  pruneTombstones,
   getAllMemories,
   // v0.6.0 — memory curation (pin + archive)
   setMemoryPin,

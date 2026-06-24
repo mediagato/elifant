@@ -219,3 +219,117 @@ test('setState stamps version_vector + content_hash, idempotent on identical val
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ── Step 3: soft-delete tombstones ─────────────────────────────────────────
+
+test('deleteMemory soft-deletes (tombstone + VV bump); reads filter it out', async () => {
+  const dir = tmpDir();
+  try {
+    await brain.init(dir);
+    await brain.setMemory('gone.md', 'body');          // {me:1}
+    const me = await deviceId();
+    await brain.deleteMemory('gone.md');
+
+    // user-facing reads no longer see it
+    assert.equal(await brain.getMemory('gone.md'), null, 'getMemory hides tombstone');
+    const all = await brain.getAllMemories();
+    assert.ok(!all.some((m) => m.filename === 'gone.md'), 'getAllMemories hides tombstone');
+
+    // but the row physically persists as a tombstone: deleted_at set, VV advanced
+    const r = await brain._internal.query('SELECT deleted_at, version_vector FROM memories WHERE filename=$1', ['gone.md']);
+    assert.equal(r.rows.length, 1, 'row retained as tombstone');
+    assert.ok(r.rows[0].deleted_at, 'deleted_at set');
+    assert.equal(r.rows[0].version_vector, JSON.stringify({ [me]: 2 }), 'delete advances VV (causal event)');
+  } finally {
+    await brain.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('deleteMemory is idempotent (missing key / existing tombstone do not re-bump)', async () => {
+  const dir = tmpDir();
+  try {
+    await brain.init(dir);
+    await brain.deleteMemory('never-existed.md'); // no throw, no row
+    let r = await brain._internal.query('SELECT 1 FROM memories WHERE filename=$1', ['never-existed.md']);
+    assert.equal(r.rows.length, 0);
+
+    await brain.setMemory('x.md', 'b');
+    const me = await deviceId();
+    await brain.deleteMemory('x.md');             // {me:2}, deleted
+    await brain.deleteMemory('x.md');             // second delete: no-op, no re-bump
+    r = await brain._internal.query('SELECT version_vector FROM memories WHERE filename=$1', ['x.md']);
+    assert.equal(r.rows[0].version_vector, JSON.stringify({ [me]: 2 }), 'no double-bump on re-delete');
+  } finally {
+    await brain.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('re-writing a deleted memory resurrects it (clears deleted_at, advances VV)', async () => {
+  const dir = tmpDir();
+  try {
+    await brain.init(dir);
+    await brain.setMemory('r.md', 'orig');         // {me:1}
+    const me = await deviceId();
+    await brain.deleteMemory('r.md');              // {me:2}, tombstone
+    await brain.setMemory('r.md', 'orig');         // resurrect with IDENTICAL content
+
+    const got = await brain.getMemory('r.md');
+    assert.ok(got, 'resurrected memory is visible again');
+    assert.equal(got.content, 'orig');
+    const r = await brain._internal.query('SELECT deleted_at, version_vector FROM memories WHERE filename=$1', ['r.md']);
+    assert.equal(r.rows[0].deleted_at, null, 'deleted_at cleared on resurrect');
+    // resurrect is a NEW event even though content matches the deleted body → VV must advance
+    assert.equal(r.rows[0].version_vector, JSON.stringify({ [me]: 3 }), 'resurrect advances VV past the tombstone');
+  } finally {
+    await brain.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('deleteState soft-deletes; getState/getAllState hide it', async () => {
+  const dir = tmpDir();
+  try {
+    await brain.init(dir);
+    await brain.setState('sk', 'sv');
+    await brain.deleteState('sk');
+    assert.equal(await brain.getState('sk'), null, 'getState hides tombstone');
+    const all = await brain.getAllState();
+    assert.ok(!all.some((s) => s.key === 'sk'), 'getAllState hides tombstone');
+    const r = await brain._internal.query('SELECT deleted_at FROM state WHERE key=$1', ['sk']);
+    assert.ok(r.rows[0].deleted_at, 'state tombstone persists');
+  } finally {
+    await brain.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('pruneTombstones reaps old tombstones, retains recent ones, advances watermark', async () => {
+  const dir = tmpDir();
+  try {
+    await brain.init(dir);
+    await brain.setMemory('old.md', 'a');
+    await brain.deleteMemory('old.md');
+    // back-date the tombstone so it is clearly older than the cutoff
+    await brain._internal.query("UPDATE memories SET deleted_at = '2020-01-01T00:00:00Z' WHERE filename='old.md'");
+    await brain.setMemory('recent.md', 'b');
+    await brain.deleteMemory('recent.md'); // tombstoned now (~today)
+
+    const reaped = await brain.pruneTombstones({ olderThan: '2021-01-01T00:00:00Z' });
+    assert.equal(reaped, 1, 'only the back-dated tombstone is reaped');
+
+    let r = await brain._internal.query('SELECT 1 FROM memories WHERE filename=$1', ['old.md']);
+    assert.equal(r.rows.length, 0, 'old tombstone hard-deleted');
+    r = await brain._internal.query('SELECT deleted_at FROM memories WHERE filename=$1', ['recent.md']);
+    assert.equal(r.rows.length, 1, 'recent tombstone retained');
+
+    const wm = await brain._internal.query("SELECT value FROM brain_meta WHERE key='tombstone_prune_watermark'");
+    assert.equal(wm.rows[0].value, '2021-01-01T00:00:00Z', 'watermark advanced');
+
+    await assert.rejects(() => brain.pruneTombstones({}), /olderThan/, 'requires an explicit cutoff');
+  } finally {
+    await brain.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
