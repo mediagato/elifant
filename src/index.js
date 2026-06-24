@@ -1248,13 +1248,13 @@ async function exportBrain(options = {}) {
     let sql;
     switch (t) {
       case 'state':
-        sql = 'SELECT key, value, updated_by, updated_at, layer, anonymizable, trust_tier FROM state ORDER BY key';
+        sql = 'SELECT key, value, updated_by, updated_at, layer, anonymizable, trust_tier, version_vector, content_hash, deleted_at FROM state ORDER BY key';
         break;
       case 'memories':
-        sql = 'SELECT filename, content, updated_by, updated_at, layer, anonymizable, trust_tier FROM memories ORDER BY filename';
+        sql = 'SELECT filename, content, updated_by, updated_at, layer, anonymizable, trust_tier, version_vector, content_hash, deleted_at FROM memories ORDER BY filename';
         break;
       case 'steering':
-        sql = 'SELECT id, name, content, mode, match_pattern, priority, enabled, layer, created_at, updated_at, trust_tier FROM steering ORDER BY id';
+        sql = 'SELECT id, name, content, mode, match_pattern, priority, enabled, layer, created_at, updated_at, trust_tier, version_vector, content_hash, deleted_at FROM steering ORDER BY id';
         break;
       case 'review_lessons':
         sql = 'SELECT id, task_type, rule, source_item_id, layer, created_at FROM review_lessons ORDER BY id';
@@ -1373,7 +1373,13 @@ async function exportBrain(options = {}) {
  * @param {object} input
  * @param {Buffer|string} input.payload                       — the tar bytes
  * @param {string} [input.passphrase]                         — v0.3 (Thu)
- * @param {'skip'|'overwrite'|'newer-wins'} [input.conflict='newer-wins']
+ * @param {'skip'|'overwrite'|'newer-wins'|'merge'} [input.conflict='newer-wins']
+ *   skip/overwrite/newer-wins are the one-shot YOINK policies (wall-clock).
+ *   'merge' is the causal multi-device sync policy: per-row version-vector
+ *   domination → fast-forward; concurrent divergence → deterministic winner +
+ *   the loser preserved as a `<key>.conflict-<hash>` copy + a surfaced capture
+ *   (never a silent clobber); tombstones propagate (a delete dominates a stale
+ *   present-row); a delete-vs-edit keeps the edit. Returns `conflict_copies`.
  * @param {Array<'instance'|'pattern'|'any'>} [input.layer_filter] — default ['any']
  * @param {boolean} [input.allow_unsigned]   — opt in to importing an UNSIGNED soul
  * @param {boolean} [input.allow_replay]     — opt in to a strictly-older export from a known keyholder (anti-replay override)
@@ -1389,7 +1395,7 @@ async function importBrain(input) {
     throw new Error('importBrain: encrypted import not yet implemented in this version; tracked for a future v0.3+ release alongside the sync server');
   }
   const conflict = input.conflict || 'newer-wins';
-  if (!['skip', 'overwrite', 'newer-wins'].includes(conflict)) {
+  if (!['skip', 'overwrite', 'newer-wins', 'merge'].includes(conflict)) {
     throw new Error(`importBrain: unknown conflict policy '${conflict}'`);
   }
   const layerFilter = input.layer_filter || ['any'];
@@ -1521,6 +1527,7 @@ async function importBrain(input) {
   const imported = { state: 0, memories: 0, steering: 0, review_lessons: 0 };
   let skipped = 0;
   let conflicts = 0;
+  let conflictCopies = 0; // merge policy: concurrent-edit losers preserved as copies
 
   // F (0.14.0) — apply the trust-anchor writes + ALL row mutations atomically.
   // PGlite is a single connection, so BEGIN/COMMIT here makes the whole import
@@ -1648,6 +1655,28 @@ async function importBrain(input) {
     const rows = _parseJsonl(byName['state.jsonl']);
     for (const row of rows) {
       if (!_layerOk(row, layerFilter)) { skipped++; continue; }
+      if (conflict === 'merge') {
+        const ex = (await _db.query('SELECT value, updated_at, version_vector, content_hash, deleted_at FROM state WHERE key = $1', [row.key])).rows[0] || null;
+        const d = _mergeDecision(ex, row);
+        if (d.action === 'skip') { skipped++; continue; }
+        if (d.action === 'ff') { await _db.query('UPDATE state SET version_vector=$1 WHERE key=$2', [d.vv, row.key]); imported.state++; continue; }
+        if (d.action === 'take') { await _mergeWriteState(row, { tierPolicy }); imported.state++; continue; }
+        // conflict: the winning edit holds the key with the joined vector; the loser is
+        // preserved (edit-vs-edit) and the conflict is surfaced — never a silent clobber.
+        if (d.winnerIsIncoming) await _mergeWriteState(row, { tierPolicy, vv: d.vv, deleted: null });
+        else await _db.query('UPDATE state SET version_vector=$1, deleted_at=NULL WHERE key=$2', [d.vv, row.key]);
+        let copyKey = null;
+        if (d.kind === 'edit-vs-edit') {
+          const loser = d.winnerIsIncoming ? ex : row;
+          copyKey = `${row.key}.conflict-${_conflictSuffix(loser.content_hash || _sha256(loser.value))}`;
+          await _mergeWriteState(loser, { tierPolicy, keyOverride: copyKey, vv: loser.version_vector || '{}', deleted: null });
+          conflictCopies++;
+        }
+        conflicts++;
+        await _surfaceConflict({ table: 'state', key: row.key, kind: d.kind, winner: d.winnerIsIncoming ? 'incoming' : 'local', conflict_copy: copyKey });
+        imported.state++;
+        continue;
+      }
       const existing = await _db.query('SELECT updated_at FROM state WHERE key = $1', [row.key]);
       if (existing.rows[0]) {
         conflicts++;
@@ -1655,16 +1684,19 @@ async function importBrain(input) {
         if (conflict === 'newer-wins' && existing.rows[0].updated_at >= row.updated_at) { skipped++; continue; }
       }
       await _db.query(`
-        INSERT INTO state (key, value, updated_by, updated_at, layer, anonymizable, trust_tier)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        INSERT INTO state (key, value, updated_by, updated_at, layer, anonymizable, trust_tier, version_vector, content_hash, deleted_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         ON CONFLICT(key) DO UPDATE SET
           value = EXCLUDED.value,
           updated_by = EXCLUDED.updated_by,
           updated_at = EXCLUDED.updated_at,
           layer = EXCLUDED.layer,
           anonymizable = EXCLUDED.anonymizable,
-          trust_tier = EXCLUDED.trust_tier
-      `, [row.key, row.value, row.updated_by || 'import', row.updated_at || _ts(), row.layer || 'instance', row.anonymizable !== false, _resolveImportTier(row.trust_tier, tierPolicy)]);
+          trust_tier = EXCLUDED.trust_tier,
+          version_vector = EXCLUDED.version_vector,
+          content_hash = EXCLUDED.content_hash,
+          deleted_at = EXCLUDED.deleted_at
+      `, [row.key, row.value, row.updated_by || 'import', row.updated_at || _ts(), row.layer || 'instance', row.anonymizable !== false, _resolveImportTier(row.trust_tier, tierPolicy), row.version_vector || '{}', row.content_hash || _sha256(row.value), row.deleted_at || null]);
       imported.state++;
     }
   }
@@ -1674,6 +1706,26 @@ async function importBrain(input) {
     const rows = _parseJsonl(byName['memories.jsonl']);
     for (const row of rows) {
       if (!_layerOk(row, layerFilter)) { skipped++; continue; }
+      if (conflict === 'merge') {
+        const ex = (await _db.query('SELECT content, updated_at, version_vector, content_hash, deleted_at FROM memories WHERE filename = $1', [row.filename])).rows[0] || null;
+        const d = _mergeDecision(ex, row);
+        if (d.action === 'skip') { skipped++; continue; }
+        if (d.action === 'ff') { await _db.query('UPDATE memories SET version_vector=$1 WHERE filename=$2', [d.vv, row.filename]); imported.memories++; continue; }
+        if (d.action === 'take') { await _mergeWriteMemory(row, { tierPolicy }); imported.memories++; continue; }
+        if (d.winnerIsIncoming) await _mergeWriteMemory(row, { tierPolicy, vv: d.vv, deleted: null });
+        else await _db.query('UPDATE memories SET version_vector=$1, deleted_at=NULL WHERE filename=$2', [d.vv, row.filename]);
+        let copyKey = null;
+        if (d.kind === 'edit-vs-edit') {
+          const loser = d.winnerIsIncoming ? ex : row;
+          copyKey = `${row.filename}.conflict-${_conflictSuffix(loser.content_hash || _sha256(loser.content))}`;
+          await _mergeWriteMemory(loser, { tierPolicy, keyOverride: copyKey, vv: loser.version_vector || '{}', deleted: null });
+          conflictCopies++;
+        }
+        conflicts++;
+        await _surfaceConflict({ table: 'memories', key: row.filename, kind: d.kind, winner: d.winnerIsIncoming ? 'incoming' : 'local', conflict_copy: copyKey });
+        imported.memories++;
+        continue;
+      }
       const existing = await _db.query('SELECT updated_at FROM memories WHERE filename = $1', [row.filename]);
       if (existing.rows[0]) {
         conflicts++;
@@ -1681,16 +1733,19 @@ async function importBrain(input) {
         if (conflict === 'newer-wins' && existing.rows[0].updated_at >= row.updated_at) { skipped++; continue; }
       }
       await _db.query(`
-        INSERT INTO memories (filename, content, updated_by, updated_at, layer, anonymizable, trust_tier)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        INSERT INTO memories (filename, content, updated_by, updated_at, layer, anonymizable, trust_tier, version_vector, content_hash, deleted_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         ON CONFLICT(filename) DO UPDATE SET
           content = EXCLUDED.content,
           updated_by = EXCLUDED.updated_by,
           updated_at = EXCLUDED.updated_at,
           layer = EXCLUDED.layer,
           anonymizable = EXCLUDED.anonymizable,
-          trust_tier = EXCLUDED.trust_tier
-      `, [row.filename, row.content, row.updated_by || 'import', row.updated_at || _ts(), row.layer || 'instance', row.anonymizable !== false, _resolveImportTier(row.trust_tier, tierPolicy)]);
+          trust_tier = EXCLUDED.trust_tier,
+          version_vector = EXCLUDED.version_vector,
+          content_hash = EXCLUDED.content_hash,
+          deleted_at = EXCLUDED.deleted_at
+      `, [row.filename, row.content, row.updated_by || 'import', row.updated_at || _ts(), row.layer || 'instance', row.anonymizable !== false, _resolveImportTier(row.trust_tier, tierPolicy), row.version_vector || '{}', row.content_hash || _sha256(row.content), row.deleted_at || null]);
       imported.memories++;
     }
   }
@@ -1700,6 +1755,26 @@ async function importBrain(input) {
     const rows = _parseJsonl(byName['steering.jsonl']);
     for (const row of rows) {
       if (!_layerOk(row, layerFilter)) { skipped++; continue; }
+      if (conflict === 'merge') {
+        const ex = (await _db.query('SELECT content, updated_at, version_vector, content_hash, deleted_at FROM steering WHERE id = $1', [row.id])).rows[0] || null;
+        const d = _mergeDecision(ex, row);
+        if (d.action === 'skip') { skipped++; continue; }
+        if (d.action === 'ff') { await _db.query('UPDATE steering SET version_vector=$1 WHERE id=$2', [d.vv, row.id]); imported.steering++; continue; }
+        if (d.action === 'take') { await _mergeWriteSteering(row, { tierPolicy }); imported.steering++; continue; }
+        if (d.winnerIsIncoming) await _mergeWriteSteering(row, { tierPolicy, vv: d.vv, deleted: null });
+        else await _db.query('UPDATE steering SET version_vector=$1, deleted_at=NULL WHERE id=$2', [d.vv, row.id]);
+        let copyKey = null;
+        if (d.kind === 'edit-vs-edit') {
+          const loser = d.winnerIsIncoming ? ex : row;
+          copyKey = `${row.id}.conflict-${_conflictSuffix(loser.content_hash || _sha256(loser.content))}`;
+          await _mergeWriteSteering(loser, { tierPolicy, keyOverride: copyKey, vv: loser.version_vector || '{}', deleted: null });
+          conflictCopies++;
+        }
+        conflicts++;
+        await _surfaceConflict({ table: 'steering', key: row.id, kind: d.kind, winner: d.winnerIsIncoming ? 'incoming' : 'local', conflict_copy: copyKey });
+        imported.steering++;
+        continue;
+      }
       const existing = await _db.query('SELECT updated_at FROM steering WHERE id = $1', [row.id]);
       if (existing.rows[0]) {
         conflicts++;
@@ -1707,8 +1782,8 @@ async function importBrain(input) {
         if (conflict === 'newer-wins' && existing.rows[0].updated_at >= row.updated_at) { skipped++; continue; }
       }
       await _db.query(`
-        INSERT INTO steering (id, name, content, mode, match_pattern, priority, enabled, layer, created_at, updated_at, trust_tier)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        INSERT INTO steering (id, name, content, mode, match_pattern, priority, enabled, layer, created_at, updated_at, trust_tier, version_vector, content_hash, deleted_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
         ON CONFLICT(id) DO UPDATE SET
           name = EXCLUDED.name,
           content = EXCLUDED.content,
@@ -1718,8 +1793,11 @@ async function importBrain(input) {
           enabled = EXCLUDED.enabled,
           layer = EXCLUDED.layer,
           updated_at = EXCLUDED.updated_at,
-          trust_tier = EXCLUDED.trust_tier
-      `, [row.id, row.name, row.content, row.mode || 'always', row.match_pattern || null, row.priority || 0, row.enabled !== false, row.layer || 'instance', row.created_at || _ts(), row.updated_at || _ts(), _resolveImportTier(row.trust_tier, tierPolicy)]);
+          trust_tier = EXCLUDED.trust_tier,
+          version_vector = EXCLUDED.version_vector,
+          content_hash = EXCLUDED.content_hash,
+          deleted_at = EXCLUDED.deleted_at
+      `, [row.id, row.name, row.content, row.mode || 'always', row.match_pattern || null, row.priority || 0, row.enabled !== false, row.layer || 'instance', row.created_at || _ts(), row.updated_at || _ts(), _resolveImportTier(row.trust_tier, tierPolicy), row.version_vector || '{}', row.content_hash || _sha256(row.content), row.deleted_at || null]);
       imported.steering++;
     }
   }
@@ -1765,7 +1843,7 @@ async function importBrain(input) {
   }
 
   _debug(`[brain] importBrain: imported ${JSON.stringify(imported)}, skipped ${skipped}, conflicts ${conflicts}`);
-  return { imported, skipped, conflicts, manifest, signature_status: signatureStatus, sender_trust: senderTrust };
+  return { imported, skipped, conflicts, conflict_copies: conflictCopies, manifest, signature_status: signatureStatus, sender_trust: senderTrust };
 }
 
 // ── SNAPSHOT / ROLLBACK / LIST_SNAPSHOTS / HEALTH (Elifantic protocol v0.1) ──
@@ -1876,6 +1954,80 @@ function _vvCompare(a, b) {
   if (aGreater) return 'a-dominates';
   if (bGreater) return 'b-dominates';
   return 'equal';
+}
+
+// Short deterministic suffix for a conflict-copy key — derived from the LOSER's
+// content hash so every device names the copy identically and converges (a local
+// sequence number would diverge across devices).
+function _conflictSuffix(contentHash) {
+  const h = (typeof contentHash === 'string' && contentHash) ? contentHash : _sha256('');
+  return h.replace(/^sha256:/, '').slice(0, 8);
+}
+
+// Decide how an incoming synced row reconciles against the local row under the
+// causal `merge` policy. Pure (no DB). localRow may be null (never seen).
+//   {action:'take'}     — incoming dominates, or local absent → write incoming
+//   {action:'skip'}     — local dominates, or identical lineage → keep local
+//   {action:'ff', vv}   — concurrent but identical outcome → just join the vectors
+//   {action:'conflict', winnerIsIncoming, vv, kind} — concurrent + divergent
+function _mergeDecision(localRow, incoming) {
+  if (!localRow) return { action: 'take' };
+  const inVV = incoming.version_vector || '{}';
+  const exVV = localRow.version_vector || '{}';
+  const cmp = _vvCompare(inVV, exVV);
+  if (cmp === 'equal') return { action: 'skip' };
+  if (cmp === 'a-dominates') return { action: 'take' };   // incoming ahead → fast-forward
+  if (cmp === 'b-dominates') return { action: 'skip' };   // local ahead → keep local
+  // ── concurrent: neither lineage contains the other → a genuine divergence ──
+  const vv = _vvStringify(_vvMerge(exVV, inVV));           // join so the survivor dominates both
+  const inDel = !!incoming.deleted_at, exDel = !!localRow.deleted_at;
+  const inHash = incoming.content_hash || null, exHash = localRow.content_hash || null;
+  // Same outcome reached independently (same content AND same liveness) → not a real
+  // conflict; collapse to the joined vector and keep what's there.
+  if (inDel === exDel && inHash && exHash && inHash === exHash) return { action: 'ff', vv };
+  // delete-vs-edit: the EDIT always wins (never silently lose content to a delete);
+  // the delete is surfaced, not obeyed. winnerIsIncoming = whichever side is the edit.
+  if (inDel !== exDel) return { action: 'conflict', winnerIsIncoming: !inDel, vv, kind: 'delete-vs-edit' };
+  // edit-vs-edit divergent: deterministic winner by greater content_hash (tiebreak the
+  // serialized vector) so both devices pick the SAME winner + name the SAME copy.
+  const winnerIsIncoming = (inHash || '') > (exHash || '') || ((inHash || '') === (exHash || '') && inVV > exVV);
+  return { action: 'conflict', winnerIsIncoming, vv, kind: 'edit-vs-edit' };
+}
+
+// Surface a merge conflict into the captures event stream (visible to HEALTH and any
+// consumer) — never silently. Best-effort: a capture failure must not abort the merge.
+async function _surfaceConflict(detail) {
+  try {
+    await _db.query("INSERT INTO captures (source, type, ts, data) VALUES ('sync-merge','conflict',$1,$2)",
+      [_ts(), JSON.stringify(detail)]);
+  } catch (e) { _debug(`[brain] surface conflict capture failed: ${e.message}`); }
+}
+
+// Merge-path row writers (causal `merge` policy only). Each writes a normalized
+// incoming/loser row carrying the continuity columns. `vv`/`deleted` override the
+// row's own values (for fast-forward winners + conflict copies); content_hash
+// defaults to the row's hash or a fresh digest. memories null the embedding so a
+// content change lands in the re-embed queue (never a stale Scent).
+async function _mergeWriteState(r, { tierPolicy, keyOverride, vv, deleted } = {}) {
+  await _db.query(`INSERT INTO state (key,value,updated_by,updated_at,layer,anonymizable,trust_tier,version_vector,content_hash,deleted_at)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+    ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_by=EXCLUDED.updated_by,updated_at=EXCLUDED.updated_at,layer=EXCLUDED.layer,anonymizable=EXCLUDED.anonymizable,trust_tier=EXCLUDED.trust_tier,version_vector=EXCLUDED.version_vector,content_hash=EXCLUDED.content_hash,deleted_at=EXCLUDED.deleted_at`,
+    [keyOverride || r.key, r.value, r.updated_by || 'import', r.updated_at || _ts(), r.layer || 'instance', r.anonymizable !== false, _resolveImportTier(r.trust_tier, tierPolicy),
+     vv !== undefined ? vv : (r.version_vector || '{}'), r.content_hash || _sha256(r.value), deleted !== undefined ? deleted : (r.deleted_at || null)]);
+}
+async function _mergeWriteMemory(r, { tierPolicy, keyOverride, vv, deleted } = {}) {
+  await _db.query(`INSERT INTO memories (filename,content,updated_by,updated_at,layer,anonymizable,trust_tier,version_vector,content_hash,deleted_at,embedding)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NULL)
+    ON CONFLICT(filename) DO UPDATE SET content=EXCLUDED.content,updated_by=EXCLUDED.updated_by,updated_at=EXCLUDED.updated_at,layer=EXCLUDED.layer,anonymizable=EXCLUDED.anonymizable,trust_tier=EXCLUDED.trust_tier,version_vector=EXCLUDED.version_vector,content_hash=EXCLUDED.content_hash,deleted_at=EXCLUDED.deleted_at,embedding=NULL`,
+    [keyOverride || r.filename, r.content, r.updated_by || 'import', r.updated_at || _ts(), r.layer || 'instance', r.anonymizable !== false, _resolveImportTier(r.trust_tier, tierPolicy),
+     vv !== undefined ? vv : (r.version_vector || '{}'), r.content_hash || _sha256(r.content), deleted !== undefined ? deleted : (r.deleted_at || null)]);
+}
+async function _mergeWriteSteering(r, { tierPolicy, keyOverride, vv, deleted } = {}) {
+  await _db.query(`INSERT INTO steering (id,name,content,mode,match_pattern,priority,enabled,layer,created_at,updated_at,trust_tier,version_vector,content_hash,deleted_at)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+    ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name,content=EXCLUDED.content,mode=EXCLUDED.mode,match_pattern=EXCLUDED.match_pattern,priority=EXCLUDED.priority,enabled=EXCLUDED.enabled,layer=EXCLUDED.layer,updated_at=EXCLUDED.updated_at,trust_tier=EXCLUDED.trust_tier,version_vector=EXCLUDED.version_vector,content_hash=EXCLUDED.content_hash,deleted_at=EXCLUDED.deleted_at`,
+    [keyOverride || r.id, r.name, r.content, r.mode || 'always', r.match_pattern || null, r.priority || 0, r.enabled !== false, r.layer || 'instance', r.created_at || _ts(), r.updated_at || _ts(), _resolveImportTier(r.trust_tier, tierPolicy),
+     vv !== undefined ? vv : (r.version_vector || '{}'), r.content_hash || _sha256(r.content), deleted !== undefined ? deleted : (r.deleted_at || null)]);
 }
 
 // Construct a PGlite. CRITICAL (PGlite 0.2.x): loadDataDir for an IN-MEMORY instance
