@@ -371,9 +371,24 @@ async function migrateEmbedDim(newDim, { model = null, version = null } = {}) {
   if (!Number.isInteger(newDim) || newDim < 1) {
     throw new Error('migrateEmbedDim: newDim must be a positive integer');
   }
-  await _db.exec('ALTER TABLE memories DROP COLUMN IF EXISTS embedding;');
-  await _db.exec(`ALTER TABLE memories ADD COLUMN embedding vector(${newDim});`);
-  await setEmbedMeta({ model, dim: newDim, version });
+  // ATOMIC (v0.19.1): the DROP + re-ADD + Nose-meta write must all commit together
+  // or not at all. A crash between them used to leave a TORN migration — the
+  // embedding column re-added at the new dim while brain_meta.embed_dim still named
+  // the old one, or the column dropped with no meta update — recoverable only from
+  // the pre-Nose backup. PGlite is a single connection (cf. the import path), so a
+  // raw BEGIN/COMMIT wraps the whole sequence including setEmbedMeta's writes; any
+  // failure rolls the lot back to the prior dim, leaving the brain consistent and
+  // the migration safely re-runnable.
+  await _db.query('BEGIN');
+  try {
+    await _db.exec('ALTER TABLE memories DROP COLUMN IF EXISTS embedding;');
+    await _db.exec(`ALTER TABLE memories ADD COLUMN embedding vector(${newDim});`);
+    await setEmbedMeta({ model, dim: newDim, version });
+    await _db.query('COMMIT');
+  } catch (e) {
+    try { await _db.query('ROLLBACK'); } catch { /* nothing to undo */ }
+    throw e;
+  }
   const r = await _db.query('SELECT COUNT(*)::int AS n FROM memories WHERE deleted_at IS NULL');
   return r.rows[0] ? r.rows[0].n : 0;
 }

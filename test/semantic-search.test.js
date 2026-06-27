@@ -285,6 +285,33 @@ test('dim-mismatch guard: a wrong-dimension query embedding returns [] (not a 50
   await brain.close();
 });
 
+test('migrateEmbedDim is atomic — a failed re-dimension rolls back to the prior dim (no torn migration)', async () => {
+  const dir = tmpDir();
+  await brain.init(dir);
+  await brain.setMemory('a.md', 'hello world', 'test', 'instance', normalize(axisVec(0))); // 384-dim
+  const before = await brain.getEmbedMeta();
+  assert.equal(before.dim, 384);
+
+  // pgvector caps a vector(N) column at 16000 dims, so this fails at the ADD step —
+  // AFTER the DROP — which is exactly the torn-migration window. With the migration
+  // wrapped in one transaction, the DROP must roll back. (Pre-fix, the DROP would
+  // have stuck: column gone, data lost, while embed_dim still read 384.)
+  await assert.rejects(
+    () => brain.migrateEmbedDim(100000, { model: 'oversize', version: '9' }),
+    'an over-max dim must throw'
+  );
+
+  // brain UNCHANGED: meta still 384 and the 384-dim Scent column + its row survived.
+  const after = await brain.getEmbedMeta();
+  assert.equal(after.dim, 384, 'embed_dim must be unchanged after a rolled-back migration');
+  assert.equal(after.model, before.model, 'embed_model must be unchanged');
+  assert.equal(after.version, before.version, 'embed_version must be unchanged');
+  const hits = await brain.searchMemories({ queryEmbedding: normalize(axisVec(0)), k: 1 });
+  assert.equal(hits.length, 1, 'the embedding column + data must survive the rollback');
+
+  await brain.close();
+});
+
 test('the Nose identity (embed_model/dim/version) is recorded + readable; setEmbedMeta updates it', async () => {
   const dir = tmpDir();
   await brain.init(dir);
