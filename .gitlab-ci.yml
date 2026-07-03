@@ -1,0 +1,27 @@
+# CI for @mediagato/elifant — the kernel. Runs the full node --test suite on
+# every push to the default branch and every MR. The suite is self-contained
+# (PGlite is in-process wasm; no network, no services), so a plain node image is
+# enough. Node is pinned to an LTS: the PGlite wasm suite is flaky on Node 24, and
+# `npm test` already forces --test-concurrency=1 (serial test files) to avoid
+# concurrent-wasm instability.
+
+stages:
+  - test
+
+variables:
+  # npm ci is reproducible from package-lock.json.
+  NPM_CONFIG_FUND: "false"
+  NPM_CONFIG_AUDIT: "false"
+
+test:
+  stage: test
+  image: node:22
+  tags:
+    - docker
+  script:
+    - node -v
+    - npm ci
+    - npm test
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
