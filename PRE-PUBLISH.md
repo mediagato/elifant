@@ -45,17 +45,19 @@ Its leak content is mild (no IPs, no secrets, no family names): repo-relative pa
 `watering.mrmags.org` (not yet live). **Action at publish:** keep it untracked, move it to
 an internal-only docs location, or `.gitignore` it — never let it into a public flatten.
 
-### FLAG-2 — SECURITY-DISCLOSURE: shipping comments document the plaintext signing key — MEDIUM (judgment call)
-`src/index.js` comments (notably ~1880-1883, also ~1103-1131, ~2256, ~2278) state plainly
-that the Ed25519 signing key (`signing_keypair_v1` / `private_pem`) is stored **plaintext at
-rest** in both the live `brain/` store and every snapshot tarball, and that at-rest
-encryption (AES-256-GCM / PBKDF2) is a tracked follow-on. This is honest and, for a
-local-first tool where the key lives on the keyholder's own disk anyway, low real-world
-added risk — but it publicly maps a still-open weakness (**crypto-04** in
-`elifantic/spec/audit-2026-06-10-kernel-daemon-security.md`) by exact field name. **Action
-before reveal:** either close crypto-04 (encrypt-at-rest) so the disclosure is moot, or
-soften the comments / move the detail to an internal SECURITY note. Not a data leak; a
-disclosure judgment call.
+### FLAG-2 — RESOLVED 2026-07-02: crypto-04 signing-key-at-rest closed (opt-in encrypt-at-rest)
+Was: shipping comments documented the Ed25519 signing key stored plaintext at rest (a
+still-open weakness, crypto-04). **Fixed in 0.20.0:** when a keyholder passphrase is
+configured (`init(dir, {keyPassphrase})` or `ELIFANT_KEY_PASSPHRASE`), the private key is
+AES-256-GCM sealed under a PBKDF2-600k KEK and never written in clear (born-sealed brains
+are airtight — proven by a dump-scan test; fork + migration paths seal too; wrong/missing
+passphrase fails loud; private↔public integrity checked on open). Default (no passphrase)
+stays plaintext for backward-compat, now honestly reported by `signingKeyProtection()` +
+HEALTH rather than only a buried comment. The stale "plaintext at rest" comments were
+updated to the truth. Residual (documented, not a leak): migrating an EXISTING plaintext
+key can't scrub prior plaintext from WAL/backups — born-sealed is the hard guarantee.
+Update `elifantic/spec/audit-2026-06-10-kernel-daemon-security.md` crypto-04 status from
+DEFERRED to RESOLVED when convenient.
 
 ### FLAG-3 — guard coverage gaps to remember at publish time — INFO
 `audit-substrate.ps1` passed clean, but note its scope: it scans **tracked files only**

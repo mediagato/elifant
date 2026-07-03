@@ -49,16 +49,45 @@ let _deviceIdCache = null;
 // external writes/reads so a concurrent write can't land in live brain/ mid-swap and
 // be silently lost when brain/ is renamed to brain.old and deleted.
 let _swapInProgress = false;
+// crypto-04 — signing key at rest. When a keyholder passphrase is configured (init
+// option keyPassphrase / ELIFANT_KEY_PASSPHRASE), the Ed25519 signing private key is
+// AES-256-GCM sealed under a PBKDF2-derived KEK and NEVER persisted in clear. Null =
+// no passphrase configured → legacy plaintext-at-rest behavior (unchanged, honestly
+// reported by health). Set once by init(); read by _getSigningKey().
+let _keyPassphrase = null;
+// Unwrapped signing key cached for the session so we PBKDF2 (~0.5s) at most once per
+// process, not on every sign/export. Same in-memory trust boundary as the key has
+// always had while in use. Cleared on close().
+let _signingKeyCache = null;
 
 /**
  * Initialize the brain.
  * @param {string} dataDir - directory under which a 'brain/' subdir will be created
+ * @param {object} [options]
+ * @param {string} [options.keyPassphrase] - crypto-04: if set (or via env
+ *   ELIFANT_KEY_PASSPHRASE), the Ed25519 signing private key is encrypted at rest
+ *   (AES-256-GCM under a PBKDF2-600k-derived KEK). An existing plaintext key is
+ *   migrated to encrypted on first use. Omit for legacy plaintext-at-rest behavior.
  * @returns {Promise<PGlite>} the underlying PGlite instance (advanced use only)
  */
-async function init(dataDir) {
+async function init(dataDir, options = {}) {
   const { PGlite } = require('@electric-sql/pglite');
   const { vector } = require('@electric-sql/pglite/vector');
 
+  // Resolve the key passphrase. An explicit option wins; a non-string or empty
+  // string is a HARD error (never silently downgrade to plaintext — that footgun
+  // would leave a caller who thinks they configured encryption unencrypted). An
+  // absent option falls back to the env var, where empty/unset means "no
+  // passphrase" per env convention.
+  if (options && Object.prototype.hasOwnProperty.call(options, 'keyPassphrase')) {
+    if (typeof options.keyPassphrase !== 'string' || options.keyPassphrase.length === 0) {
+      throw new Error('init: keyPassphrase must be a non-empty string when provided');
+    }
+    _keyPassphrase = options.keyPassphrase;
+  } else {
+    _keyPassphrase = process.env.ELIFANT_KEY_PASSPHRASE || null;
+  }
+  _signingKeyCache = null;
   _dbPath = path.join(dataDir, 'brain');
   // crash-safety: finish or revert an interrupted replace-rollback directory swap
   // BEFORE we open the brain dir — otherwise a missing brain/ (mid-swap crash) gets
@@ -1090,34 +1119,108 @@ async function _getSubstrateIdentity() {
   return r.rows[0].value;
 }
 
+// ── crypto-04: signing key encryption at rest ──────────────────────────────
+//
+// When a keyholder passphrase is configured, the Ed25519 private PEM is sealed
+// with AES-256-GCM under a KEK derived from the passphrase via PBKDF2-600k-SHA256
+// (the scheme the elifantic spec prescribes; same params as the ecosystem vault).
+// Only the sealed blob + salt/iv/tag are persisted — the plaintext PEM never
+// touches disk. Wrong passphrase fails the GCM auth tag and is rejected loudly.
+//
+// THREAT MODEL: this provides CONFIDENTIALITY of the signing key at rest against a
+// read-only disk attacker (the crypto-04 finding). It does NOT by itself provide
+// integrity of WHICH key the bowl uses: an attacker with brain_meta WRITE access
+// could swap in their own key. _getSigningKey re-derives the public key from the
+// recovered private key and rejects a private/public mismatch (catches corruption
+// and a private-key-only swap), but a full-record swap or a replay of an older
+// sealed record under the same passphrase is a signing-key rollback that this
+// layer does not detect — that needs an external/monotonic anchor and is out of
+// scope for at-rest confidentiality.
+const _KEK_ITER = 600000; // OWASP PBKDF2-SHA256 floor; must match unwrap
+const _KEK_HASH = 'sha256';
+const _KEK_LEN = 32; // AES-256
+const _KEK_SALT_LEN = 16;
+const _KEK_IV_LEN = 12; // AES-GCM
+
+function _deriveKek(passphrase, salt) {
+  return crypto.pbkdf2Sync(Buffer.from(passphrase, 'utf8'), salt, _KEK_ITER, _KEK_LEN, _KEK_HASH);
+}
+
+// Seal a private PEM string. Returns a self-describing JSON-able envelope.
+function _sealPrivatePem(pem, passphrase) {
+  const salt = crypto.randomBytes(_KEK_SALT_LEN);
+  const iv = crypto.randomBytes(_KEK_IV_LEN);
+  const kek = _deriveKek(passphrase, salt);
+  const cipher = crypto.createCipheriv('aes-256-gcm', kek, iv);
+  const ct = Buffer.concat([cipher.update(pem, 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return {
+    v: 1,
+    alg: 'aes-256-gcm',
+    kdf: 'pbkdf2',
+    hash: _KEK_HASH,
+    iter: _KEK_ITER,
+    salt: salt.toString('base64'),
+    iv: iv.toString('base64'),
+    ct: ct.toString('base64'),
+    tag: tag.toString('base64'),
+  };
+}
+
+// Recover a private PEM from a sealed envelope. Throws a clear error on a wrong
+// passphrase (GCM auth-tag mismatch) or a malformed/unknown envelope — never
+// returns garbage. The crypto params are FIXED here, deliberately NOT read from
+// the envelope's kdf/hash/iter/alg fields: honoring attacker-supplied params
+// would let a local writer downgrade (iter:1, aes-128) the record. Those fields
+// are descriptive metadata only; we fail closed on anything but the one shape we
+// wrote.
+function _openPrivatePem(enc, passphrase) {
+  if (!passphrase) {
+    throw new Error('signing key is encrypted at rest but no keyPassphrase is configured — pass it to init() or set ELIFANT_KEY_PASSPHRASE');
+  }
+  if (!enc || enc.v !== 1 || enc.alg !== 'aes-256-gcm') {
+    throw new Error('signing key envelope has an unsupported version or algorithm — refusing to open');
+  }
+  try {
+    const salt = Buffer.from(enc.salt, 'base64');
+    const iv = Buffer.from(enc.iv, 'base64');
+    const tag = Buffer.from(enc.tag, 'base64');
+    const ct = Buffer.from(enc.ct, 'base64');
+    const kek = _deriveKek(passphrase, salt);
+    const decipher = crypto.createDecipheriv('aes-256-gcm', kek, iv);
+    decipher.setAuthTag(tag);
+    return Buffer.concat([decipher.update(ct), decipher.final()]).toString('utf8');
+  } catch {
+    throw new Error('signing key decryption failed — wrong keyPassphrase or corrupted key material');
+  }
+}
+
 /**
  * Get or lazily-generate the bowl's Ed25519 signing keypair. Used to sign
  * soul-manifest.json on YOINK (export) and verify on SUMMON (import) per
- * elifantic-soul-v0.2. Private key persists in brain_meta; public key is
- * embedded in every exported manifest for receivers to verify against.
+ * elifantic-soul-v0.2. The private key persists in brain_meta; the public key
+ * is embedded in every exported manifest for receivers to verify against.
+ *
+ * At rest the private key is either PLAINTEXT PEM (legacy — no keyPassphrase) or
+ * an AES-256-GCM sealed envelope (crypto-04 — keyPassphrase configured). If a
+ * passphrase is configured and a legacy plaintext key is found, it is migrated
+ * to sealed on first use. The unwrapped key is cached for the session.
  *
  * Returns { privateKey, publicKeyB64 } where privateKey is a node KeyObject
  * suitable for crypto.sign, and publicKeyB64 is the base64-encoded raw
  * public key bytes (suitable for embedding in soul-manifest.json).
  */
 async function _getSigningKey() {
+  if (_signingKeyCache) return _signingKeyCache;
+
   let r = await _db.query("SELECT value FROM brain_meta WHERE key = 'signing_keypair_v1'");
   let stored = r.rows[0] && r.rows[0].value;
   if (!stored) {
-    // First-run generation. Ed25519 keys are 32 bytes raw, but node's
-    // crypto.generateKeyPairSync emits them as PEM/DER. We store as a JSON
-    // blob with PEM-encoded private + raw-bytes-base64 public for portability.
-    const { privateKey, publicKey } = crypto.generateKeyPairSync('ed25519');
-    const privPem = privateKey.export({ format: 'pem', type: 'pkcs8' });
-    const pubRaw = publicKey.export({ format: 'der', type: 'spki' });
-    // Strip the 12-byte SPKI prefix to get raw 32-byte key (Ed25519 public).
-    const pubRawKey = pubRaw.subarray(pubRaw.length - 32);
-    stored = JSON.stringify({
-      algorithm: 'ed25519',
-      private_pem: privPem.toString(),
-      public_b64: pubRawKey.toString('base64'),
-      created_at: new Date().toISOString(),
-    });
+    // First-run generation. Ed25519 keys are 32 bytes raw; node emits PEM/DER. We
+    // store a JSON blob with a base64 raw public key + either a sealed envelope
+    // (crypto-04, keyPassphrase set) or a plaintext PEM (legacy). Shared record
+    // builder keeps this identical to the fork path.
+    stored = JSON.stringify(_newSigningKeypairRecord());
     await _db.query(
       "INSERT INTO brain_meta (key, value) VALUES ('signing_keypair_v1', $1) ON CONFLICT(key) DO NOTHING",
       [stored]
@@ -1125,9 +1228,75 @@ async function _getSigningKey() {
     r = await _db.query("SELECT value FROM brain_meta WHERE key = 'signing_keypair_v1'");
     stored = r.rows[0].value;
   }
+
   const parsed = JSON.parse(stored);
-  const privateKey = crypto.createPrivateKey({ key: parsed.private_pem, format: 'pem' });
-  return { privateKey, publicKeyB64: parsed.public_b64 };
+  let pem;
+  if (parsed.enc) {
+    // Sealed at rest — recover under the configured passphrase.
+    pem = _openPrivatePem(parsed.enc, _keyPassphrase);
+  } else {
+    // Legacy plaintext key.
+    pem = parsed.private_pem;
+    // Opportunistic migration: a passphrase is now configured, so seal the
+    // plaintext key in place (drop private_pem). Guarded so a concurrent writer
+    // that already sealed it isn't clobbered.
+    //
+    // HONEST LIMITATION: this seals the ACTIVE key so no future write persists it
+    // in clear, but the key was ALREADY on disk in plaintext (heap, WAL, prior
+    // snapshots/backups). The in-place UPDATE leaves an MVCC dead tuple; we
+    // VACUUM FULL to drop the live dead copy as best-effort, but WAL segments and
+    // any existing backups may still hold the old plaintext until natural churn.
+    // A keyholder wanting a hard guarantee should start a fresh brain born with a
+    // passphrase (never writes the key in clear) — see signingKeyProtection() and
+    // the crypto-04 note. Airtight zero-plaintext is the born-sealed path.
+    if (_keyPassphrase) {
+      const sealedRecord = {
+        algorithm: parsed.algorithm,
+        public_b64: parsed.public_b64,
+        created_at: parsed.created_at,
+        enc: _sealPrivatePem(pem, _keyPassphrase),
+        migrated_at: new Date().toISOString(),
+      };
+      await _db.query(
+        "UPDATE brain_meta SET value = $1 WHERE key = 'signing_keypair_v1' AND value = $2",
+        [JSON.stringify(sealedRecord), stored]
+      );
+      // Best-effort scrub of the plaintext dead tuple from the live heap.
+      try { await _db.exec('VACUUM FULL brain_meta'); } catch { /* best-effort */ }
+    }
+  }
+
+  const privateKey = crypto.createPrivateKey({ key: pem, format: 'pem' });
+  // Integrity binding: the recovered private key MUST match the advertised public
+  // key. GCM gives confidentiality but the envelope isn't cryptographically tied to
+  // the cleartext public_b64, so a swap/corruption/migration-bug could leave the
+  // bowl signing with one key while advertising another → silently unverifiable
+  // exports (self-DoS). Re-derive and compare; fail loud on any drift.
+  const derivedPub = crypto.createPublicKey(privateKey).export({ format: 'der', type: 'spki' });
+  const derivedPubB64 = derivedPub.subarray(derivedPub.length - 32).toString('base64');
+  if (derivedPubB64 !== parsed.public_b64) {
+    throw new Error('signing key integrity check failed — the stored private key does not match its advertised public key (corruption or tampering)');
+  }
+  _signingKeyCache = { privateKey, publicKeyB64: parsed.public_b64 };
+  return _signingKeyCache;
+}
+
+/**
+ * Report how the signing private key is protected at rest, without touching key
+ * material. Returns 'encrypted' (AES-256-GCM sealed), 'plaintext' (legacy PEM on
+ * disk), or 'none' (no signing key generated yet). Powers HEALTH + lets a
+ * keyholder confirm crypto-04 is in force.
+ */
+async function signingKeyProtection() {
+  _ensure();
+  const r = await _db.query("SELECT value FROM brain_meta WHERE key = 'signing_keypair_v1'");
+  if (!r.rows[0]) return 'none';
+  const parsed = JSON.parse(r.rows[0].value);
+  // A plaintext PEM present at all means the key is exposed at rest, even if a
+  // sealed envelope also sits alongside — report 'plaintext' (defense in depth;
+  // no current path writes both, but never let a stray plaintext read 'encrypted').
+  if (parsed.private_pem) return 'plaintext';
+  return parsed.enc ? 'encrypted' : 'none';
 }
 
 // ── Keyholder key pinning (crypto-01 — TOFU trust anchor) ──────────────────
@@ -1877,10 +2046,12 @@ async function importBrain(input) {
 //   <dataDir>/snapshots/index.jsonl   — append-only, one SnapshotReceipt per line
 //   <dataDir>/.rollback-journal.json  — present only mid-swap; drives crash recovery
 //
-// Snapshots are PLAINTEXT at rest in v0.16: the tarball holds signing_keypair_v1 +
-// all data in clear. This is the SAME exposure as the live brain/ store, which
-// already persists the keypair in plaintext on disk — not a new leak. Encrypted-at-
-// rest (AES-256-GCM / PBKDF2 per the spec) is a tracked follow-on.
+// Snapshots carry the same at-rest posture as the live brain/ store — a snapshot is
+// a dumpDataDir of it. crypto-04: when a keyPassphrase is configured the signing
+// private key is AES-256-GCM sealed (PBKDF2-600k KEK), so neither the live store nor
+// any snapshot tarball holds it in clear; without a passphrase it stays plaintext PEM
+// (legacy). All OTHER brain data (memories/state/steering/captures) is plaintext in a
+// snapshot regardless — full at-rest data encryption is a separate tracked follow-on.
 
 const SNAP_RETENTION = { recentDays: 7, dailyDays: 30, weeklyDays: 180, hardCap: 200 };
 const SNAP_TABLES = ['state', 'memories', 'steering', 'review_lessons', 'captures', 'keyholders'];
@@ -2081,14 +2252,28 @@ async function _tableExists(name) {
   catch { return false; }
 }
 
-// Mint a fresh Ed25519 signing keypair blob (same shape _getSigningKey persists).
-// Used by fork: a fork is a new being and must never be able to sign as the parent.
-function _generateSigningKeypairJson() {
+// Mint a fresh Ed25519 signing keypair record (same shape _getSigningKey persists),
+// honoring crypto-04: when a keyPassphrase is configured the private key is SEALED,
+// never written in clear. Shared by first-run generation and fork so the two can't
+// drift (the fork path once wrote plaintext despite a passphrase — do not regress).
+function _newSigningKeypairRecord() {
   const { privateKey, publicKey } = crypto.generateKeyPairSync('ed25519');
-  const privPem = privateKey.export({ format: 'pem', type: 'pkcs8' });
+  const privPem = privateKey.export({ format: 'pem', type: 'pkcs8' }).toString();
   const pubRaw = publicKey.export({ format: 'der', type: 'spki' });
   const pubRawKey = pubRaw.subarray(pubRaw.length - 32);
-  return JSON.stringify({ algorithm: 'ed25519', private_pem: privPem.toString(), public_b64: pubRawKey.toString('base64'), created_at: new Date().toISOString() });
+  const record = {
+    algorithm: 'ed25519',
+    public_b64: pubRawKey.toString('base64'),
+    created_at: new Date().toISOString(),
+  };
+  if (_keyPassphrase) record.enc = _sealPrivatePem(privPem, _keyPassphrase);
+  else record.private_pem = privPem;
+  return record;
+}
+
+// Used by fork: a fork is a new being and must never be able to sign as the parent.
+function _generateSigningKeypairJson() {
+  return JSON.stringify(_newSigningKeypairRecord());
 }
 
 // Canonical, collision-free hash of a capture for forward-merge set-union dedup.
@@ -2253,7 +2438,7 @@ async function snapshot(reason, options = {}) {
   _ensure();
   const trigger = options.trigger || 'keyholder-explicit';
   const snapDir = _snapDir();
-  fs.mkdirSync(snapDir, { recursive: true, mode: 0o700 }); // tarballs hold the plaintext signing key
+  fs.mkdirSync(snapDir, { recursive: true, mode: 0o700 }); // 0700: snapshots mirror the brain (keyholder data; signing key sealed only when keyPassphrase set)
   const id = _snapId();
   // ms-precision (still valid ISO-8601 UTC) so two snapshots in the same second order
   // deterministically newest-first; the rest of the kernel keeps second-precision _ts().
@@ -2275,7 +2460,7 @@ async function snapshot(reason, options = {}) {
   // a truncated tarball at the real path (discovered only at restore).
   const finalPath = path.join(snapDir, `${id}.tar.gz`);
   const tmpPath = finalPath + '.tmp';
-  const fd = fs.openSync(tmpPath, 'w', 0o600); // tarball holds the plaintext signing key
+  const fd = fs.openSync(tmpPath, 'w', 0o600); // 0600: snapshot mirrors the brain's at-rest data (signing key sealed only when keyPassphrase set)
   try { fs.writeSync(fd, buf); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
   fs.renameSync(tmpPath, finalPath);
 
@@ -2607,6 +2792,22 @@ async function health(question = 'overview') {
       observations.push({ dimension: 'pinned keyholders (trust anchors)', baseline: 'n/a', current: `${k.total} (${k.trusted} trusted)`, delta: 0, significance: 'normal' });
     } catch (e) { observations.push(na('keyholders', e.message)); }
     try {
+      // crypto-04 — honestly report signing-key at-rest protection. 'plaintext' is
+      // reported 'normal' (not a drift anomaly) with a note nudging toward a
+      // keyPassphrase; it doesn't trigger the snapshot proposal.
+      const prot = await signingKeyProtection();
+      observations.push({
+        dimension: 'signing key protection at rest',
+        baseline: 'n/a',
+        current: prot,
+        delta: 0,
+        significance: 'normal',
+        note: prot === 'plaintext'
+          ? 'private key is plaintext on disk — configure a keyPassphrase (init option / ELIFANT_KEY_PASSPHRASE) to seal it (AES-256-GCM)'
+          : prot === 'encrypted' ? 'AES-256-GCM sealed under a PBKDF2-derived key' : 'no signing key generated yet',
+      });
+    } catch (e) { observations.push(na('signing key protection', e.message)); }
+    try {
       const t = (await _db.query("SELECT count(*) FILTER (WHERE trust_tier='tier-3-observed-external')::int t3, count(*) FILTER (WHERE trust_tier='tier-4-raw-exhaust')::int t4 FROM memories WHERE deleted_at IS NULL")).rows[0];
       observations.push({ dimension: 'memories by trust tier (observed/raw)', baseline: 'n/a', current: `tier-3: ${t.t3}, tier-4: ${t.t4}`, delta: 0, significance: 'normal' });
     } catch (e) { observations.push(na('trust tiers', e.message)); }
@@ -2680,6 +2881,7 @@ async function close() {
     _db = null;
     _ready = false;
     _deviceIdCache = null;
+    _signingKeyCache = null; // drop the unwrapped signing key from memory
     _debug('[brain] closed');
   }
 }
@@ -2725,6 +2927,8 @@ module.exports = {
   setKeyholderTrust,
   forgetKeyholder,
   pinKeyholder,
+  // crypto-04 — signing key encryption at rest
+  signingKeyProtection,
   // v0.3.0-dev — Elifantic protocol v0.1 (skeletons; throw NotImplementedError until a future release)
   snapshot,
   rollback,
@@ -2748,5 +2952,10 @@ module.exports = {
     // Read-through to the live PGlite, so tests can assert on columns the public
     // API doesn't surface (version_vector, deleted_at, conflict-copies). Test-only.
     query: (sql, params) => { _ensure(); return _db.query(sql, params); },
+    // crypto-04 — expose the seal/open primitives so tests can prove the sealed
+    // envelope round-trips and rejects a wrong passphrase. Test-only.
+    sealPrivatePem: _sealPrivatePem,
+    openPrivatePem: _openPrivatePem,
+    getSigningKey: _getSigningKey,
   },
 };

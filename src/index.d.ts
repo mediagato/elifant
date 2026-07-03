@@ -2,8 +2,8 @@
  * Type declarations for @mediagato/elifant -- a local-first PGlite memory
  * engine that is the reference implementation of Elifantic protocol v0
  * storage primitives, including YOINK/SUMMON (with v0.2 Ed25519 manifest
- * signing + file_hashes payload integrity) and skeleton operations for
- * SNAPSHOT / ROLLBACK / HEALTH (protocol v0.1).
+ * signing + file_hashes payload integrity), SNAPSHOT / ROLLBACK / HEALTH
+ * (protocol v0.1), and crypto-04 signing-key encryption at rest.
  */
 
 // ── Layer + tier vocabulary ───────────────────────────────────────────────
@@ -394,12 +394,31 @@ export interface SyncDownResult {
 
 // ── Lifecycle ─────────────────────────────────────────────────────────────
 
+export interface InitOptions {
+  /**
+   * crypto-04 — encrypt the Ed25519 signing private key at rest. When set (or via
+   * env ELIFANT_KEY_PASSPHRASE), the key is AES-256-GCM sealed under a
+   * PBKDF2-600k-SHA256-derived KEK; the plaintext PEM never touches disk. An
+   * existing plaintext key is migrated to sealed on first use. Omit for legacy
+   * plaintext-at-rest behavior. The same passphrase must be supplied on every
+   * init or signing (YOINK export) fails loudly rather than silently.
+   */
+  keyPassphrase?: string;
+}
+
 /**
  * Initialize the brain. Opens the database at `<dataDir>/brain/`. Must be
  * called before any other operation; functions throw "Brain not initialized"
  * if called before init.
  */
-export function init(dataDir: string): Promise<unknown>;
+export function init(dataDir: string, options?: InitOptions): Promise<unknown>;
+
+/**
+ * crypto-04 — report how the signing private key is protected at rest, without
+ * touching key material: 'encrypted' (AES-256-GCM sealed), 'plaintext' (legacy
+ * PEM on disk), or 'none' (no signing key generated yet).
+ */
+export function signingKeyProtection(): Promise<'encrypted' | 'plaintext' | 'none'>;
 
 /** Return the on-disk directory path. */
 export function dbPath(): string;
