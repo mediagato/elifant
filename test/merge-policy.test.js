@@ -87,6 +87,53 @@ test('merge: concurrent edits → winner keeps the key, loser preserved as a con
   } finally { fs.rmSync(a, { recursive: true, force: true }); fs.rmSync(b, { recursive: true, force: true }); }
 });
 
+// Regression: a steering edit-vs-edit conflict where the LOCAL row loses used to
+// crash the entire import — the merge SELECT dropped `name`, so writing the local
+// loser as a conflict-copy inserted name=NULL (steering.name is NOT NULL) → the
+// transaction rolled back and NOTHING synced. Force incoming-wins so the local row
+// is the loser copy, and prove the import succeeds with full-fidelity preservation.
+test('merge: steering conflict where the LOCAL row loses does not abort the import (name preserved)', async () => {
+  const a = tmpDir(), b = tmpDir();
+  // Insert a steering row directly (no public create API) with a chosen VV + hash.
+  async function putSteering(id, name, content, vvKey) {
+    const ch = brain._internal.sha256(content);
+    await brain._internal.query(
+      `INSERT INTO steering (id,name,content,mode,match_pattern,priority,enabled,layer,created_at,updated_at,trust_tier,version_vector,content_hash,deleted_at)
+       VALUES ($1,$2,$3,'always',NULL,0,true,'instance','2026-07-02T00:00:00Z','2026-07-02T00:00:00Z','tier-1-keyholder-direct',$4,$5,NULL)`,
+      [id, name, content, JSON.stringify({ [vvKey]: 1 }), ch]
+    );
+  }
+  try {
+    // Pick contents so the INCOMING (A) hashes greater → A wins → the LOCAL (B) row
+    // becomes the conflict-copy loser (the exact crash path).
+    const c1 = 'steering body ALPHA', c2 = 'steering body BETA';
+    const [incContent, locContent] =
+      brain._internal.sha256(c1) > brain._internal.sha256(c2) ? [c1, c2] : [c2, c1];
+
+    await brain.init(a);
+    await putSteering('s1', 'Rule From A', incContent, 'idA');
+    const expA = (await brain.exportBrain()).payload;
+    await brain.close();
+
+    await brain.init(b);
+    await putSteering('s1', 'Rule From B', locContent, 'idB'); // concurrent VV → edit-vs-edit
+    // Before the fix this threw "null value in column name ... violates not-null".
+    const res = await brain.importBrain({ payload: expA, conflict: 'merge' });
+    assert.equal(res.conflict_copies, 1, 'local loser preserved as a conflict copy (import did not abort)');
+
+    const rows = (await brain._internal.query('SELECT id, name, content FROM steering ORDER BY id')).rows;
+    // winner holds s1 with A's content; loser copy holds B's ORIGINAL name + content.
+    const winner = rows.find((r) => r.id === 's1');
+    const copy = rows.find((r) => /^s1\.conflict-[0-9a-f]{8}$/.test(r.id));
+    assert.ok(winner && winner.content === incContent, 'winner keeps the canonical id with incoming content');
+    assert.ok(copy, 'a deterministic .conflict-<hash> copy exists');
+    assert.equal(copy.name, 'Rule From B', 'loser copy preserved the keyholder name (was NULL → crash)');
+    assert.equal(copy.content, locContent, 'loser copy preserved the local content');
+    assert.ok(rows.every((r) => r.name), 'no steering row has a NULL name');
+    await brain.close();
+  } finally { fs.rmSync(a, { recursive: true, force: true }); fs.rmSync(b, { recursive: true, force: true }); }
+});
+
 test('merge: concurrent delete-vs-edit keeps the edit (never lose content to a delete)', async () => {
   const a = tmpDir(), b = tmpDir();
   try {

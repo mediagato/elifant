@@ -243,6 +243,12 @@ export interface ImportResult {
    * compatibility, but downstream consumers should gate trust on this value.
    */
   signature_status: SignatureStatus;
+  /**
+   * Trust of the sending keyholder as resolved against the local pin store
+   * (crypto-01 TOFU): 'trusted' | 'known' | 'first-contact' | 'unsigned' etc.
+   * Present when the import carried a signed manifest.
+   */
+  sender_trust?: string;
 }
 
 // ── SNAPSHOT / ROLLBACK / HEALTH (v0.3 — protocol v0.1) ───────────────────
@@ -658,6 +664,40 @@ export function exportBrain(options?: ExportOptions): Promise<ExportResult>;
  * per primary-key row (skip / overwrite / newer-wins; default: newer-wins).
  */
 export function importBrain(input: ImportInput): Promise<ImportResult>;
+
+// ── Keyholder key pinning (crypto-01 — TOFU trust anchor) ──
+
+/** A pinned keyholder (foreign substrate identity + its trusted signing key). */
+export interface KeyholderRow {
+  substrate_identity: string;
+  public_key: string;
+  display_name: string | null;
+  trusted: boolean;
+  first_seen: string;
+  last_seen: string;
+  last_exported_at: string | null;
+  last_signature: string | null;
+}
+
+/** List known keyholders (pinned signing keys). Powers CONSENT/HEALTH surfaces. */
+export function listKeyholders(): Promise<KeyholderRow[]>;
+
+/** Bless/unbless a known keyholder — the "I trust this keyholder" gesture. */
+export function setKeyholderTrust(identity: string, trusted: boolean): Promise<void>;
+
+/** Un-pin a keyholder. A later import from them becomes first-contact again. */
+export function forgetKeyholder(identity: string): Promise<void>;
+
+/**
+ * Pin a keyholder's public key OUT-OF-BAND (verified fingerprint / in person) —
+ * the strongest trust establishment. After this, an import claiming this identity
+ * with any other key is rejected as impersonation.
+ */
+export function pinKeyholder(
+  identity: string,
+  publicKey: string,
+  options?: { trusted?: boolean; displayName?: string | null },
+): Promise<void>;
 
 // ── SNAPSHOT / ROLLBACK / LIST_SNAPSHOTS / HEALTH (v0.3 — protocol v0.1) ──
 

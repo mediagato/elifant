@@ -1840,7 +1840,12 @@ async function importBrain(input) {
     for (const row of rows) {
       if (!_layerOk(row, layerFilter)) { skipped++; continue; }
       if (conflict === 'merge') {
-        const ex = (await _db.query('SELECT value, updated_at, version_vector, content_hash, deleted_at FROM state WHERE key = $1', [row.key])).rows[0] || null;
+        // Full column set: when this local row LOSES an edit-vs-edit conflict it is
+        // re-written as a conflict-copy via _mergeWriteState(ex, ...), which needs
+        // every column it persists. A narrow SELECT silently drops the keyholder's
+        // layer/updated_by/trust_tier on the copy (and for steering, name is NOT NULL
+        // → the whole import aborts). See the merge-conflict tests.
+        const ex = (await _db.query('SELECT key, value, updated_by, updated_at, layer, anonymizable, trust_tier, version_vector, content_hash, deleted_at FROM state WHERE key = $1', [row.key])).rows[0] || null;
         const d = _mergeDecision(ex, row);
         if (d.action === 'skip') { skipped++; continue; }
         if (d.action === 'ff') { await _db.query('UPDATE state SET version_vector=$1 WHERE key=$2', [d.vv, row.key]); imported.state++; continue; }
@@ -1891,7 +1896,9 @@ async function importBrain(input) {
     for (const row of rows) {
       if (!_layerOk(row, layerFilter)) { skipped++; continue; }
       if (conflict === 'merge') {
-        const ex = (await _db.query('SELECT content, updated_at, version_vector, content_hash, deleted_at FROM memories WHERE filename = $1', [row.filename])).rows[0] || null;
+        // Full column set (see the state merge note): a local-loser conflict-copy
+        // must preserve layer/updated_by/trust_tier/anonymizable.
+        const ex = (await _db.query('SELECT filename, content, updated_by, updated_at, layer, anonymizable, trust_tier, version_vector, content_hash, deleted_at FROM memories WHERE filename = $1', [row.filename])).rows[0] || null;
         const d = _mergeDecision(ex, row);
         if (d.action === 'skip') { skipped++; continue; }
         if (d.action === 'ff') { await _db.query('UPDATE memories SET version_vector=$1 WHERE filename=$2', [d.vv, row.filename]); imported.memories++; continue; }
@@ -1940,7 +1947,10 @@ async function importBrain(input) {
     for (const row of rows) {
       if (!_layerOk(row, layerFilter)) { skipped++; continue; }
       if (conflict === 'merge') {
-        const ex = (await _db.query('SELECT content, updated_at, version_vector, content_hash, deleted_at FROM steering WHERE id = $1', [row.id])).rows[0] || null;
+        // Full column set (see the state merge note). CRITICAL: steering.name is
+        // NOT NULL, so a narrow SELECT here made a local-loser conflict-copy insert
+        // name=NULL → constraint violation → the ENTIRE merge import rolled back.
+        const ex = (await _db.query('SELECT id, name, content, mode, match_pattern, priority, enabled, layer, created_at, updated_at, trust_tier, version_vector, content_hash, deleted_at FROM steering WHERE id = $1', [row.id])).rows[0] || null;
         const d = _mergeDecision(ex, row);
         if (d.action === 'skip') { skipped++; continue; }
         if (d.action === 'ff') { await _db.query('UPDATE steering SET version_vector=$1 WHERE id=$2', [d.vv, row.id]); imported.steering++; continue; }
