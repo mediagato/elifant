@@ -23,8 +23,8 @@
   "author": "Steve Kingsley <steve@mediagato.com>",
   "license": "BUSL-1.1",
   "publishConfig": {
-    "registry": "https://npm.pkg.github.com",
-    "access": "restricted"
+    "registry": "https://registry.npmjs.org",
+    "access": "public"
   },
   "repository": {
     "type": "git",
