@@ -60,6 +60,114 @@ let _keyPassphrase = null;
 // always had while in use. Cleared on close().
 let _signingKeyCache = null;
 
+// ── instance armor (capture-flood postmortem, 2026-07-28) ─────────────────────
+// PGlite runs all of Postgres inside one WASM instance with finite linear
+// memory. Reproduced against a real keyholder brain: a single query that
+// materializes a multi-MB result set has TWO failure modes, and both make the
+// brain lie rather than fail. (a) The instance traps 'memory access out of
+// bounds' and every later query returns that same error forever — a zombie
+// writer that still answers health checks. (b) Subtler: the instance survives
+// but every subsequent query silently returns ZERO rows with no error — a brain
+// that reports itself empty while the data sits intact on disk. The armor is
+// three invariants, not per-case patches:
+//   1. bounded I/O — no unbounded materialization (getCaptures' byte-budgeted
+//      reader; addCapture's size cap + consecutive-duplicate suppression);
+//   2. no zombie — a WASM-death error closes and reopens the instance, and the
+//      failed call retries once (never inside an explicit transaction);
+//   3. no lying — an empty SELECT runs a 'SELECT 1' canary; if the canary also
+//      returns nothing the instance is broken: reopen and retry instead of
+//      reporting false emptiness.
+let _PGliteCtor = null;   // captured at init so _reopen() can construct a replacement
+let _vectorExt = null;
+let _reopenPromise = null; // single-flight latch: concurrent failures share one reopen
+let _rawTxnDepth = 0;      // raw BEGIN/COMMIT depth seen through the guard — no auto-retry inside
+
+function _isWasmDeath(e) {
+  const m = (e && e.message) || '';
+  return /memory access out of bounds|table index is out of bounds|null function or function signature mismatch|unreachable|Aborted\(/i.test(m)
+    || (typeof WebAssembly !== 'undefined' && e instanceof WebAssembly.RuntimeError);
+}
+
+function _armPGlite(db) {
+  const rawQuery = db.query.bind(db);
+  const rawExec = db.exec.bind(db);
+  db.__rawQuery = rawQuery;
+  db.__rawExec = rawExec;
+  db.query = (...args) => _guardedCall(rawQuery, 'query', args);
+  db.exec = (...args) => _guardedCall(rawExec, 'exec', args);
+  return db;
+}
+
+async function _reopen(reason) {
+  if (!_reopenPromise) {
+    _reopenPromise = (async () => {
+      // console.error, not _debug: an unhealthy storage instance must be loud in
+      // every host's logs, debug flag or not.
+      try { console.error(`[brain] PGlite instance unhealthy (${reason}) — reopening ${_dbPath}`); } catch { /* host has no stderr */ }
+      // close() on a trapped instance can hang; give it 2s then abandon it.
+      try {
+        await Promise.race([
+          _db.close(),
+          new Promise((r) => { const t = setTimeout(r, 2000); if (t.unref) t.unref(); }),
+        ]);
+      } catch { /* dead instances often cannot close */ }
+      _db = _armPGlite(new _PGliteCtor(_dbPath, { extensions: { vector: _vectorExt } }));
+      // Apply schema through the RAW handles: routing it through the guard could
+      // re-enter _reopen while _reopenPromise is still this very promise — a
+      // self-await deadlock. _applySchema only uses query/exec.
+      await _applySchema({ query: _db.__rawQuery, exec: _db.__rawExec });
+      _rawTxnDepth = 0;
+    })().finally(() => { _reopenPromise = null; });
+  }
+  return _reopenPromise;
+}
+
+// Test-only failure injection: makes the next `count` guarded calls observe a
+// WASM death ('wasm-death') or an empty result ('silent-empty') at the raw
+// layer, so the recovery paths are testable end-to-end. Never set in production.
+let _simulate = null;
+function _simulateFailure(mode, count = 1) { _simulate = { mode, remaining: count }; }
+
+async function _guardedCall(rawFn, kind, args) {
+  const effFn = async (...a) => {
+    if (_simulate && _simulate.remaining > 0) {
+      _simulate.remaining--;
+      if (_simulate.mode === 'wasm-death') throw new Error('memory access out of bounds (simulated)');
+      return { rows: [], affectedRows: 0 };
+    }
+    return rawFn(...a);
+  };
+  const sql = typeof args[0] === 'string' ? args[0] : '';
+  const isBegin = /^\s*BEGIN\b/i.test(sql);
+  const isEnd = /^\s*(COMMIT|ROLLBACK)\b/i.test(sql);
+  try {
+    const result = await effFn(...args);
+    if (isBegin) _rawTxnDepth++;
+    else if (isEnd) _rawTxnDepth = Math.max(0, _rawTxnDepth - 1);
+    if (kind === 'query' && result && Array.isArray(result.rows) && result.rows.length === 0
+        && /^\s*(SELECT|WITH)\b/i.test(sql)) {
+      let alive = false;
+      try { const c = await effFn('SELECT 1 AS __canary'); alive = !!(c && c.rows && c.rows.length === 1); } catch { alive = false; }
+      if (!alive) {
+        await _reopen('silent-empty canary: SELECT 1 returned no rows');
+        if (_rawTxnDepth === 0) return await _db.__rawQuery(...args);
+        _rawTxnDepth = 0;
+        throw new Error('brain instance was broken mid-transaction (silent-empty canary); instance reopened — retry the operation');
+      }
+    }
+    return result;
+  } catch (e) {
+    if (_isWasmDeath(e)) {
+      const inTxn = _rawTxnDepth > 0;
+      await _reopen(`WASM death: ${e.message}`);
+      if (!inTxn && !isBegin && !isEnd) {
+        return kind === 'query' ? await _db.__rawQuery(...args) : await _db.__rawExec(...args);
+      }
+    }
+    throw e;
+  }
+}
+
 /**
  * Initialize the brain.
  * @param {string} dataDir - directory under which a 'brain/' subdir will be created
@@ -95,7 +203,9 @@ async function init(dataDir, options = {}) {
   _recoverInterruptedSwap(dataDir);
   fs.mkdirSync(_dbPath, { recursive: true });
 
-  _db = new PGlite(_dbPath, { extensions: { vector } });
+  _PGliteCtor = PGlite;
+  _vectorExt = vector;
+  _db = _armPGlite(new PGlite(_dbPath, { extensions: { vector } }));
 
   await _applySchema(_db);
 
@@ -911,20 +1021,65 @@ async function pruneTombstones({ olderThan } = {}) {
 
 /**
  * Write a capture event.
+ *
+ * Feeder armor (capture-flood postmortem, 2026-07-28): the event stream must
+ * survive a misbehaving producer. A real feeder once POSTed the same ~358 KB
+ * payload every minute for an hour — 96 rows, 11 distinct payloads — until
+ * reads crossed the WASM materialization ceiling and the whole brain read as
+ * empty. Two guards, both here at the sink so EVERY producer is covered:
+ *   - size cap: a single capture's serialized data may not exceed
+ *     ELIFANT_MAX_CAPTURE_BYTES (default 1 MiB) — rejected loudly, never
+ *     truncated silently;
+ *   - consecutive-duplicate suppression: if the newest capture for the same
+ *     (source, type) carries a byte-identical payload, the write is skipped and
+ *     the existing row is returned with deduped: true. Only CONSECUTIVE
+ *     duplicates collapse — an A→B→A sequence stores all three rows, because a
+ *     re-appearing payload after something else happened is a real event.
+ *     Producers that genuinely mean the repeat (heartbeats) pass
+ *     allowDuplicate: true.
+ *
  * @param {Object} cap
  * @param {string} cap.source - producer identifier ('extension', 'daemon', 'cli', ...)
  * @param {string} [cap.type] - source-specific event type ('conversation_visit', 'job_started', ...)
  * @param {Object} [cap.data] - structured payload, JSON-serializable
  * @param {string} [cap.ts] - ISO 8601 timestamp; defaults to now
- * @returns {Promise<{id: string, ts: string}>}
+ * @param {boolean} [cap.allowDuplicate=false] - store even if byte-identical to the newest (source, type) capture
+ * @returns {Promise<{id: string, ts: string, deduped?: true}>} deduped is present (true) only when the write was suppressed
  */
-async function addCapture({ source, type = null, data = null, ts = null } = {}) {
+async function addCapture({ source, type = null, data = null, ts = null, allowDuplicate = false } = {}) {
   _ensure();
   if (!source || typeof source !== 'string') {
     throw new Error('addCapture: source (string) required');
   }
   const timestamp = ts || _ts();
   const payload = data == null ? null : JSON.stringify(data);
+
+  const maxBytes = Math.max(1024, parseInt(process.env.ELIFANT_MAX_CAPTURE_BYTES, 10) || 1024 * 1024);
+  if (payload != null) {
+    const bytes = Buffer.byteLength(payload, 'utf8');
+    if (bytes > maxBytes) {
+      const err = new Error(`addCapture: data too large (${bytes} bytes > ${maxBytes}-byte cap) — split the payload or raise ELIFANT_MAX_CAPTURE_BYTES`);
+      err.code = 'ECAPTURETOOLARGE';
+      throw err;
+    }
+  }
+
+  if (!allowDuplicate) {
+    // Compare against the NEWEST row for this (source, type) only. jsonb::text is
+    // Postgres' own normalized rendering on both sides, so key order / whitespace
+    // differences in the incoming JSON can't defeat the comparison.
+    const prev = await _db.query(
+      `SELECT id, ts, (data::text IS NOT DISTINCT FROM $3::jsonb::text) AS same
+       FROM captures
+       WHERE source = $1 AND type IS NOT DISTINCT FROM $2
+       ORDER BY ts DESC, id DESC LIMIT 1`,
+      [source, type, payload]
+    );
+    if (prev.rows[0] && prev.rows[0].same === true) {
+      return { id: String(prev.rows[0].id), ts: prev.rows[0].ts, deduped: true };
+    }
+  }
+
   const result = await _db.query(
     `INSERT INTO captures (source, type, ts, data) VALUES ($1, $2, $3, $4) RETURNING id, ts`,
     [source, type, timestamp, payload]
@@ -932,8 +1087,73 @@ async function addCapture({ source, type = null, data = null, ts = null } = {}) 
   return { id: String(result.rows[0].id), ts: result.rows[0].ts };
 }
 
+// Greedy-pack rows into id batches whose summed payload size stays under
+// budgetBytes (always at least one row per batch, so a single oversized row
+// still fetches — alone). Pure; exported via __internals for the test suite.
+function _batchByBudget(rows /* [{id, len}] in desired order */, budgetBytes) {
+  const batches = [];
+  let cur = [];
+  let curBytes = 0;
+  for (const r of rows) {
+    const len = Number(r.len) || 0;
+    if (cur.length > 0 && curBytes + len > budgetBytes) {
+      batches.push(cur);
+      cur = [];
+      curBytes = 0;
+    }
+    cur.push(r.id);
+    curBytes += len;
+  }
+  if (cur.length > 0) batches.push(cur);
+  return batches;
+}
+
+// Bounded-materialization capture reader (armor invariant 1). One unbounded
+// `SELECT ... data FROM captures` materializing a multi-MB result inside
+// PGlite's WASM memory is exactly what broke a real brain — so no caller gets
+// to do that anymore. Two phases: (A) fetch only (id, octet_length(data)) —
+// integers, tiny result regardless of table size; (B) fetch full rows in id
+// batches packed so each query's summed payload stays under the byte budget.
+// Works against any query function (the live guarded _db, or a tx/tmp instance
+// inside rollback/merge). Order is ts DESC, id DESC throughout — the id
+// tiebreak also makes same-second events deterministic, which the old
+// ORDER BY ts DESC alone was not.
+async function _readCapturesBudgeted(queryFn, { whereClause = '', params = [], limit = null, columns = 'id, source, type, ts, data' } = {}) {
+  const budget = Math.max(65536, parseInt(process.env.ELIFANT_READ_BUDGET_BYTES, 10) || 4 * 1024 * 1024);
+  const scanParams = params.slice();
+  let scanSql = `SELECT id, COALESCE(octet_length(data::text), 0) AS len FROM captures ${whereClause} ORDER BY ts DESC, id DESC`;
+  if (limit != null) {
+    scanParams.push(limit);
+    scanSql += ` LIMIT $${scanParams.length}`;
+  }
+  const scan = await queryFn(scanSql, scanParams);
+  if (scan.rows.length === 0) return [];
+  const out = [];
+  for (const ids of _batchByBudget(scan.rows, budget)) {
+    // ids come from the server's own bigserial column this same transaction —
+    // integers by construction; Number() them anyway so nothing non-numeric can
+    // ever reach the interpolated list.
+    const idList = ids.map((v) => {
+      const n = Number(v);
+      if (!Number.isSafeInteger(n)) throw new Error(`_readCapturesBudgeted: non-integer capture id ${v}`);
+      return n;
+    }).join(',');
+    const batch = await queryFn(
+      `SELECT ${columns} FROM captures WHERE id IN (${idList}) ORDER BY ts DESC, id DESC`
+    );
+    out.push(...batch.rows);
+  }
+  return out;
+}
+
 /**
  * Read captures, newest first.
+ *
+ * Reads are byte-budgeted internally (ELIFANT_READ_BUDGET_BYTES, default 4 MiB
+ * per underlying query): a large result set is fetched in multiple bounded
+ * queries and concatenated, so no call can push the storage instance past its
+ * WASM memory ceiling no matter how fat the stored events are.
+ *
  * @param {Object} [opts]
  * @param {string} [opts.since] - inclusive lower bound on ts (ISO 8601)
  * @param {string} [opts.until] - inclusive upper bound on ts
@@ -954,16 +1174,8 @@ async function getCaptures(opts = {}) {
   if (source) { where.push(`source = $${i++}`); params.push(source); }
   if (type)   { where.push(`type = $${i++}`); params.push(type); }
   const whereClause = where.length ? `WHERE ${where.join(' AND ')}` : '';
-  // sqli-01: bind the LIMIT as a parameter rather than interpolate it. `limit` is
-  // already coerced to an integer in [1, 10000] above, so this is defense-in-depth
-  // (no live injection), but it keeps the query string free of any caller-derived
-  // value — the standing pattern, and one less thing to re-verify on every edit.
-  params.push(limit);
-  const result = await _db.query(
-    `SELECT id, source, type, ts, data FROM captures ${whereClause} ORDER BY ts DESC LIMIT $${params.length}`,
-    params
-  );
-  return result.rows.map(r => ({
+  const rows = await _readCapturesBudgeted((sql, p) => _db.query(sql, p), { whereClause, params, limit });
+  return rows.map(r => ({
     id: String(r.id),
     source: r.source,
     type: r.type,
@@ -2710,8 +2922,12 @@ async function _rollbackForwardMerge(receipt, buf) {
     }
     // captures — set-union dedup by content-hash; skip those at/under the prune
     // watermark (deliberately time-pruned noise must not resurrect — Steve's call)
-    const liveHashes = new Set((await tx.query('SELECT source, type, ts, data FROM captures')).rows.map(_captureHash));
-    for (const row of (await tmp.query('SELECT source, type, ts, data, layer, anonymizable FROM captures')).rows) {
+    // Both scans go through the byte-budgeted reader: either side can hold a
+    // capture stream too fat to materialize in one WASM query (armor invariant 1).
+    const liveHashes = new Set(
+      (await _readCapturesBudgeted((sql, p) => tx.query(sql, p), { columns: 'id, source, type, ts, data' })).map(_captureHash)
+    );
+    for (const row of await _readCapturesBudgeted((sql, p) => tmp.query(sql, p), { columns: 'id, source, type, ts, data, layer, anonymizable' })) {
       if (pruneWatermark && row.ts && row.ts <= pruneWatermark) { skipped++; continue; }
       const h = _captureHash(row);
       if (liveHashes.has(h)) { skipped++; continue; }
@@ -2788,6 +3004,23 @@ async function health(question = 'overview') {
     } catch (e) { observations.push(na('capture volume', 'query failed: ' + e.message)); }
   }
   if (want('overview')) {
+    // Read canary FIRST: 'SELECT 1' must return exactly one row on any healthy
+    // instance, so an empty/failed canary means every other count below is
+    // untrustworthy — the silent-empty failure mode reads as 0 everywhere with
+    // no error. (The query guard auto-reopens on this, so an anomalous reading
+    // here means recovery itself failed.)
+    try {
+      const c = await _db.query('SELECT 1 AS ok');
+      const alive = !!(c.rows && c.rows.length === 1);
+      observations.push({
+        dimension: 'storage read canary (SELECT 1)', baseline: '1 row',
+        current: alive ? '1 row' : 'EMPTY — instance cannot be trusted to read',
+        delta: 0, significance: alive ? 'normal' : 'anomalous',
+        ...(alive ? {} : { note: 'the storage instance returns empty results without erroring; all counts in this report are unreliable — reopen/restart required' }),
+      });
+    } catch (e) {
+      observations.push({ dimension: 'storage read canary (SELECT 1)', baseline: '1 row', current: 'ERROR: ' + e.message, delta: 0, significance: 'anomalous', note: 'reads are failing outright; all counts in this report are unreliable' });
+    }
     try {
       const counts = await _tableCounts(_db);
       observations.push({ dimension: 'table row counts', baseline: 'n/a', current: JSON.stringify(counts), delta: 0, significance: 'normal' });
@@ -2967,5 +3200,13 @@ module.exports = {
     sealPrivatePem: _sealPrivatePem,
     openPrivatePem: _openPrivatePem,
     getSigningKey: _getSigningKey,
+    // instance armor (2026-07-28) — expose the pure helpers + the failure
+    // injector so WASM-death recovery and the silent-empty canary can be
+    // proven end-to-end in the suite. Test-only.
+    armor: {
+      isWasmDeath: _isWasmDeath,
+      batchByBudget: _batchByBudget,
+      simulateFailure: _simulateFailure,
+    },
   },
 };

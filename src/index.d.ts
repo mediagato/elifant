@@ -606,6 +606,13 @@ export interface AddCaptureInput {
   type?: string | null;
   data?: Record<string, unknown> | null;
   ts?: string | null;
+  /**
+   * Store the capture even when it is byte-identical to the newest capture for
+   * the same (source, type). Default false: consecutive duplicates are
+   * suppressed and the existing row is returned with `deduped: true` — feeder
+   * armor against a producer re-sending the same payload in a loop.
+   */
+  allowDuplicate?: boolean;
 }
 
 export interface GetCapturesOptions {
@@ -626,10 +633,20 @@ export interface DeleteCapturesOptions {
  * Append a capture event. Source-specific fields go on `data`; top-level
  * columns are the protocol contract. Designed so any process that can POST
  * JSON can append events without depending on this library directly.
+ *
+ * Armor: serialized `data` over ELIFANT_MAX_CAPTURE_BYTES (default 1 MiB)
+ * is rejected (error code ECAPTURETOOLARGE); a byte-identical consecutive
+ * duplicate for the same (source, type) is suppressed unless
+ * `allowDuplicate: true`, returning the existing row with `deduped: true`.
  */
-export function addCapture(cap: AddCaptureInput): Promise<{ id: string; ts: string }>;
+export function addCapture(cap: AddCaptureInput): Promise<{ id: string; ts: string; deduped?: true }>;
 
-/** Read captures, newest first. Returns at most `limit` rows (default 1000, max 10000). */
+/**
+ * Read captures, newest first. Returns at most `limit` rows (default 1000,
+ * max 10000). Internally byte-budgeted (ELIFANT_READ_BUDGET_BYTES, default
+ * 4 MiB per underlying query) so no result set can push the WASM instance
+ * past its memory ceiling.
+ */
 export function getCaptures(opts?: GetCapturesOptions): Promise<CaptureRow[]>;
 
 /**
