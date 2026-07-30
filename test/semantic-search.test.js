@@ -327,3 +327,73 @@ test('the Nose identity (embed_model/dim/version) is recorded + readable; setEmb
   assert.equal(after.version, '2');
   await brain.close();
 });
+
+// ── elifant#4 regression: a content edit must not keep the stale vector ────
+//
+// setMemory's no-embedding UPDATE used to leave the embedding column alone,
+// so editing a memory's content made the row semantically findable by its
+// PREVIOUS meaning and invisible under its current one — forever, because
+// the backfill queue only looks for NULL embeddings. The fix nulls the
+// vector when (and only when) the content hash changes.
+
+test('editing content without a new embedding drops the stale vector', async () => {
+  const dir = tmpDir();
+  await brain.init(dir);
+
+  const vecOld = normalize(axisVec(3));
+  await brain.setMemory('edit-me.md', 'the old meaning', 'test', 'instance', vecOld);
+
+  // Sanity: findable by the old vector before the edit.
+  let hits = await brain.searchMemories({ queryEmbedding: vecOld, k: 5 });
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].filename, 'edit-me.md');
+
+  // Edit the content — the shape every shell uses: save now, embed later.
+  await brain.setMemory('edit-me.md', 'a completely new meaning', 'test', 'instance');
+
+  // The old vector must be GONE: not findable by the previous meaning...
+  hits = await brain.searchMemories({ queryEmbedding: vecOld, k: 5 });
+  assert.equal(hits.length, 0, 'stale vector must not survive a content edit');
+
+  // ...and queued for re-embedding with the NEW content.
+  const todo = await brain.getMemoriesNeedingEmbedding(10);
+  assert.equal(todo.length, 1);
+  assert.equal(todo[0].filename, 'edit-me.md');
+  assert.equal(todo[0].content, 'a completely new meaning');
+  await brain.close();
+});
+
+test('re-saving identical content keeps the vector (no needless re-embed)', async () => {
+  const dir = tmpDir();
+  await brain.init(dir);
+
+  const vec = normalize(axisVec(7));
+  await brain.setMemory('same.md', 'unchanged words', 'test', 'instance', vec);
+
+  // Same bytes, no vector supplied — e.g. a shell re-save or a sync echo.
+  await brain.setMemory('same.md', 'unchanged words', 'test', 'instance');
+
+  const hits = await brain.searchMemories({ queryEmbedding: vec, k: 5 });
+  assert.equal(hits.length, 1, 'an unchanged re-save must not drop the vector');
+  assert.equal(hits[0].filename, 'same.md');
+
+  const todo = await brain.getMemoriesNeedingEmbedding(10);
+  assert.equal(todo.length, 0, 'an unchanged re-save must not enter the backfill queue');
+  await brain.close();
+});
+
+test('a tombstone resurrected with identical content keeps its vector', async () => {
+  const dir = tmpDir();
+  await brain.init(dir);
+
+  const vec = normalize(axisVec(9));
+  await brain.setMemory('lazarus.md', 'come back', 'test', 'instance', vec);
+  await brain.deleteMemory('lazarus.md');
+
+  // Resurrection with the same bytes: content unchanged, vector still valid.
+  await brain.setMemory('lazarus.md', 'come back', 'test', 'instance');
+
+  const hits = await brain.searchMemories({ queryEmbedding: vec, k: 5 });
+  assert.equal(hits.length, 1, 'same-content resurrection must keep the vector');
+  await brain.close();
+});

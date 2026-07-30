@@ -632,6 +632,14 @@ async function setMemory(filename, content, updatedBy = 'brain', layer = 'instan
   _ensure();
   const { vv, hash } = await _stampWrite('memories', 'filename', filename, content);
   if (embedding == null) {
+    // No new vector supplied. If the CONTENT changed, the old vector must go
+    // with it — otherwise the row stays semantically findable by its previous
+    // meaning and invisible under its current one. Nulling (not keeping)
+    // degrades to "not yet searchable", and getMemoriesNeedingEmbedding picks
+    // it up on the next backfill. The CASE compares the stored hash against
+    // the incoming one inside the same UPDATE, so an unchanged re-save (or a
+    // tombstone resurrected with identical content) keeps its vector and
+    // never round-trips through the embedder.
     await _db.query(`
       INSERT INTO memories (filename, content, updated_by, updated_at, layer, version_vector, content_hash)
       VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -641,6 +649,8 @@ async function setMemory(filename, content, updatedBy = 'brain', layer = 'instan
         updated_at = EXCLUDED.updated_at,
         layer = EXCLUDED.layer,
         version_vector = EXCLUDED.version_vector,
+        embedding = CASE WHEN memories.content_hash IS DISTINCT FROM EXCLUDED.content_hash
+                         THEN NULL ELSE memories.embedding END,
         content_hash = EXCLUDED.content_hash,
         deleted_at = NULL
     `, [filename, content, updatedBy, _ts(), layer, vv, hash]);
