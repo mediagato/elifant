@@ -862,3 +862,39 @@ export namespace skills {
   /** Absolute path to the vendored registry snapshot. */
   const VENDORED_REGISTRY: string;
 }
+
+// ── the Keeper (0.22.0 — idle-time librarian) ──────────────────────────────
+
+/** Receipt returned by one bounded Keeper pass — every number re-derives from
+ *  the rows the tick wrote. */
+export interface KeeperTickReceipt {
+  at: string;
+  /** Memories drained from the neighbour queue this tick. */
+  processed: number;
+  /** first-light thoughts emitted (new-territory notices). */
+  firstLights: number;
+  shelvesWritten: number;
+  shelvesArchived: number;
+  /** Total thought captures emitted (shelf + first-light). */
+  thoughts: number;
+  prunedEdges: number;
+  /** True when the pre-write snapshot guard fired (kernel-ethic #11). */
+  snapshotTaken: boolean;
+}
+
+export interface KeeperStatus {
+  /** Memories awaiting neighbour computation (embedding present, neighbours_at NULL). */
+  queue: number;
+  edges: number;
+  /** Live (unarchived) shelves. */
+  shelves: number;
+  lastTick: KeeperTickReceipt | null;
+}
+
+/** Run one bounded Keeper pass: drain a batch of the neighbour queue, refresh
+ *  shelves from the edge graph, emit receipted thought captures. Deterministic,
+ *  model-free, idempotent; sources are never modified. */
+export function keeperTick(opts?: { batch?: number }): Promise<KeeperTickReceipt>;
+
+/** The Keeper's own liveness: queue depth, graph size, last tick receipt. */
+export function keeperStatus(): Promise<KeeperStatus>;

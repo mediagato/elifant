@@ -365,6 +365,30 @@ async function _applySchema(db) {
     await db.exec(`ALTER TABLE ${t} ADD COLUMN IF NOT EXISTS deleted_at TEXT;`);
   }
 
+  // Migration (0.22.0 — the Keeper, elifant#1/#2/#3). Three additions:
+  //   synthesized_via  — names the producer of a derived row ('keeper/shelving-v1'),
+  //                      the unwired protocol-v0.1 hook finally getting its writer.
+  //   neighbours_at    — per-row Keeper watermark, mirroring the embedding-backfill
+  //                      idiom: NULL = "neighbours never computed (or stale)". Set
+  //                      when a row's edges land; NULLed by any content/vector
+  //                      change. Device-local derived bookkeeping (not exported —
+  //                      an imported soul arrives NULL and gets met by the Keeper).
+  //   memory_edges     — the neighbour graph: canonical (a<b) pairs with cosine
+  //                      distance. Derived, recomputable, device-local.
+  // All idempotent.
+  await db.exec(`ALTER TABLE memories ADD COLUMN IF NOT EXISTS synthesized_via TEXT;`);
+  await db.exec(`ALTER TABLE memories ADD COLUMN IF NOT EXISTS neighbours_at TEXT;`);
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS memory_edges (
+      a_filename TEXT NOT NULL,
+      b_filename TEXT NOT NULL,
+      distance REAL NOT NULL,
+      computed_at TEXT NOT NULL,
+      PRIMARY KEY (a_filename, b_filename)
+    );
+  `);
+  await db.exec(`CREATE INDEX IF NOT EXISTS memory_edges_b_idx ON memory_edges (b_filename);`);
+
   // v0.7.0 — record the Nose (embedder) identity so a brain knows which model
   // produced its Scents. Seeds the historical MiniLM/384 Nose ONLY if absent,
   // so existing brains stay byte-identical. A future Nose swap bumps these via
@@ -639,7 +663,9 @@ async function setMemory(filename, content, updatedBy = 'brain', layer = 'instan
     // it up on the next backfill. The CASE compares the stored hash against
     // the incoming one inside the same UPDATE, so an unchanged re-save (or a
     // tombstone resurrected with identical content) keeps its vector and
-    // never round-trips through the embedder.
+    // never round-trips through the embedder. neighbours_at (the Keeper's
+    // per-row watermark) follows the same rule: changed content = stale
+    // neighbours, so the row re-enters the neighbour queue.
     await _db.query(`
       INSERT INTO memories (filename, content, updated_by, updated_at, layer, version_vector, content_hash)
       VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -651,11 +677,15 @@ async function setMemory(filename, content, updatedBy = 'brain', layer = 'instan
         version_vector = EXCLUDED.version_vector,
         embedding = CASE WHEN memories.content_hash IS DISTINCT FROM EXCLUDED.content_hash
                          THEN NULL ELSE memories.embedding END,
+        neighbours_at = CASE WHEN memories.content_hash IS DISTINCT FROM EXCLUDED.content_hash
+                             THEN NULL ELSE memories.neighbours_at END,
         content_hash = EXCLUDED.content_hash,
         deleted_at = NULL
     `, [filename, content, updatedBy, _ts(), layer, vv, hash]);
     return;
   }
+  // A fresh vector always invalidates the neighbour set — the edges were
+  // computed against the vector this one replaces.
   const vec = _vectorLiteral(embedding);
   await _db.query(`
     INSERT INTO memories (filename, content, updated_by, updated_at, layer, embedding, version_vector, content_hash)
@@ -666,10 +696,42 @@ async function setMemory(filename, content, updatedBy = 'brain', layer = 'instan
       updated_at = EXCLUDED.updated_at,
       layer = EXCLUDED.layer,
       embedding = EXCLUDED.embedding,
+      neighbours_at = NULL,
       version_vector = EXCLUDED.version_vector,
       content_hash = EXCLUDED.content_hash,
       deleted_at = NULL
   `, [filename, content, updatedBy, _ts(), layer, vec, vv, hash]);
+}
+
+// Stamped write for a DERIVED row (the Keeper's shelves; future producers).
+// Same causal discipline as setMemory (version vector, content hash, tombstone
+// resurrection) plus the two columns that make a derived row honest: an
+// explicit trust tier (tier-2-synthesized — never the tier-1 default, K-CARBON-4)
+// and synthesized_via naming the producer. Kernel-internal: shells never mint
+// synthesized rows directly.
+async function _setMemoryDerived(filename, content, { updatedBy = 'keeper', layer = 'instance', embedding = null, trustTier, synthesizedVia } = {}) {
+  _ensure();
+  if (!trustTier || !synthesizedVia) {
+    throw new Error('_setMemoryDerived: trustTier and synthesizedVia are required — an unmarked derived row is a silent promotion');
+  }
+  const { vv, hash } = await _stampWrite('memories', 'filename', filename, content);
+  const vec = embedding == null ? null : _vectorLiteral(embedding);
+  await _db.query(`
+    INSERT INTO memories (filename, content, updated_by, updated_at, layer, embedding, trust_tier, synthesized_via, version_vector, content_hash)
+    VALUES ($1, $2, $3, $4, $5, $6::vector, $7, $8, $9, $10)
+    ON CONFLICT(filename) DO UPDATE SET
+      content = EXCLUDED.content,
+      updated_by = EXCLUDED.updated_by,
+      updated_at = EXCLUDED.updated_at,
+      layer = EXCLUDED.layer,
+      embedding = EXCLUDED.embedding,
+      trust_tier = EXCLUDED.trust_tier,
+      synthesized_via = EXCLUDED.synthesized_via,
+      version_vector = EXCLUDED.version_vector,
+      content_hash = EXCLUDED.content_hash,
+      archived = false,
+      deleted_at = NULL
+  `, [filename, content, updatedBy, _ts(), layer, vec, trustTier, synthesizedVia, vv, hash]);
 }
 
 // Update only the embedding for an existing memory. Used by callers that
@@ -679,8 +741,10 @@ async function setMemory(filename, content, updatedBy = 'brain', layer = 'instan
 async function setMemoryEmbedding(filename, embedding) {
   _ensure();
   const vec = _vectorLiteral(embedding);
+  // A replaced vector stales the neighbour set too — the Keeper's per-row
+  // watermark resets so the row re-enters the neighbour queue.
   await _db.query(
-    'UPDATE memories SET embedding = $1::vector WHERE filename = $2',
+    'UPDATE memories SET embedding = $1::vector, neighbours_at = NULL WHERE filename = $2',
     [vec, filename]
   );
 }
@@ -3139,6 +3203,29 @@ async function close() {
   }
 }
 
+// ── the Keeper (0.22.0 — elifant#1/#2/#3) ─────────────────────────────────
+// The idle-time librarian: neighbour graph + shelving pass + thought producer.
+// All mechanics live in src/keeper.js (pure, model-free); this is the wiring
+// that hands it the live store and the kernel's own primitives. The daemon
+// calls keeperTick() when the keyholder is idle; every call is bounded and
+// every write is receipted.
+const _keeperModule = require('./keeper');
+const _keeper = _keeperModule.createKeeper({
+  query: (sql, params) => { _ensure(); return _db.query(sql, params); },
+  addCapture,
+  setMemoryDerived: _setMemoryDerived,
+  setMemoryArchive,
+  snapshot,
+  ts: _ts,
+  trustTier: TRUST_TIER,
+});
+
+/** Run one bounded Keeper pass. Returns the tick receipt. */
+async function keeperTick(opts) { _ensure(); return _keeper.tick(opts); }
+
+/** The Keeper's own liveness: queue depth, edge/shelf counts, last tick receipt. */
+async function keeperStatus() { _ensure(); return _keeper.status(); }
+
 module.exports = {
   init,
   dbPath,
@@ -3193,6 +3280,9 @@ module.exports = {
   close,
   // v0.10.0 — polyglot-skills layer (read + carry over the host-map registry)
   skills,
+  // v0.22.0 — the Keeper (idle-time librarian: neighbour graph, shelves, thoughts)
+  keeperTick,
+  keeperStatus,
   // Internal, test-only — NOT a stable public API. Exposed so the version-vector
   // algebra (the causal-merge continuity primitive) can be unit-tested directly.
   _internal: {
