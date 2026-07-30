@@ -54,12 +54,21 @@
  */
 'use strict';
 
-// Tunables. Distances are pgvector cosine distances (smaller = more similar);
-// the floors deliberately reuse the kernel's calibrated relevance tiers so
-// "close enough to shelve" and "close enough to recall" stay one vocabulary.
+// Tunables. Distances are pgvector cosine distances (smaller = more similar).
+// EDGE_KEEP reuses the kernel's loose RECALL floor (the graph remembers weak
+// links so future passes can reason about them), but SHELF binding is its own,
+// much tighter calibration: memory-to-memory distances run far closer than
+// query-to-memory relevance. Calibrated 2026-07-30 on the first real corpus
+// (29 browser-captured memories, nomic Nose): genuinely same-subject pairs
+// landed at 0.01-0.10, while UNRELATED captures sat at only 0.13-0.15 because
+// the capture template's shared boilerplate dominates their embeddings — at
+// the recall floor (0.33) transitive chaining fused 22 of 29 memories into
+// one shelf whose "common thread" was the template's own words. 0.12 carves
+// that corpus correctly. Re-examine when birth quality improves (mrmags#8) or
+// the Nose changes; an ambient-distance-adaptive floor is the follow-up idea.
 const NEIGHBOUR_K = 8;            // edges considered per queued memory
-const EDGE_KEEP_FLOOR = 0.40;     // loose tier: store the edge at all
-const SHELF_EDGE_FLOOR = 0.33;    // strict tier: an edge that can bind a shelf
+const EDGE_KEEP_FLOOR = 0.40;     // store the edge at all (graph memory)
+const SHELF_EDGE_FLOOR = 0.12;    // an edge tight enough to bind a shelf
 const MIN_SHELF = 3;              // pairs are near-dup territory (elifant#6), not a shelf
 const QUEUE_BATCH = 50;           // bounded work per tick
 const FIRST_LIGHT_MIN_CORPUS = 8; // below this, everything is new territory — stay quiet
@@ -82,18 +91,33 @@ function _tokens(text) {
 }
 
 // The common thread across member contents: tokens present in >= 60% of the
-// members (at least 2), strongest-first, at most three. Purely lexical and
-// deterministic — a weak thread yields [], and the copy degrades honestly to
-// "say similar things" rather than inventing a subject.
-function commonThread(contents) {
+// members (at least 2), at most three, ranked by DISTINCTIVENESS — presence
+// inside the cluster divided by presence outside it. Without the outside leg,
+// capture-template boilerplate ("auto-captured…") named every shelf on the
+// first real corpus: it had perfect within-cluster frequency, because it has
+// perfect frequency EVERYWHERE, which is exactly why it can't be a subject.
+// Purely lexical and deterministic — a weak thread yields [], and the copy
+// degrades honestly to "say similar things" rather than inventing a subject.
+function commonThread(contents, outsideContents = []) {
   const df = new Map();
   for (const c of contents) {
     for (const t of _tokens(c)) df.set(t, (df.get(t) || 0) + 1);
   }
+  const odf = new Map();
+  for (const c of outsideContents) {
+    for (const t of _tokens(c)) odf.set(t, (odf.get(t) || 0) + 1);
+  }
   const need = Math.max(2, Math.ceil(contents.length * 0.6));
+  const score = (t, n) => n / (1 + (odf.get(t) || 0));
+  // score >= 1 = "at least as present inside the cluster as outside it" — a
+  // token that fails this is corpus wallpaper, and an open slot in the top-3
+  // never excuses it. Ties keep the keyholder's own word order ("ice, cream",
+  // not "cream, ice") — first appearance in the members wins.
+  const joined = contents.map((c) => String(c).toLowerCase()).join('\n');
+  const pos = (t) => { const i = joined.indexOf(t); return i === -1 ? Infinity : i; };
   return [...df.entries()]
-    .filter(([, n]) => n >= need)
-    .sort((a, b) => (b[1] - a[1]) || (a[0] < b[0] ? -1 : 1))
+    .filter(([t, n]) => n >= need && score(t, n) >= 1)
+    .sort((a, b) => (score(b[0], b[1]) - score(a[0], a[1])) || (pos(a[0]) - pos(b[0])) || (a[0] < b[0] ? -1 : 1))
     .slice(0, 3)
     .map(([t]) => t);
 }
@@ -362,11 +386,24 @@ function createKeeper(ctx) {
     const { clusterMatched, shelfTaken } = matchClusters(clusters, shelves);
     const shelfByName = new Map(shelves.map((s) => [s.filename, s]));
 
+    // Fetched once per tick, only when a shelf might be written: the outside-
+    // cluster contents that let the thread namer tell a subject from template
+    // boilerplate. Bounded (newest 1000) so shelf naming never becomes an
+    // O(history) read on a big library.
+    let corpusRows = null;
+
     for (let ci = 0; ci < clusters.length; ci++) {
       const cluster = clusters[ci];
       const details = await _memberDetails(cluster);
       if (details.length < MIN_SHELF) continue;
-      const thread = commonThread(details.map((d) => d.content));
+      if (corpusRows == null) {
+        corpusRows = (await query(
+          `SELECT filename, content FROM memories WHERE embedding IS NOT NULL AND ${SOURCE_WHERE}
+           ORDER BY updated_at DESC LIMIT 1000`)).rows;
+      }
+      const inCluster = new Set(cluster);
+      const outside = corpusRows.filter((r) => !inCluster.has(r.filename)).map((r) => r.content);
+      const thread = commonThread(details.map((d) => d.content), outside);
       const members = details.map((d) => ({ filename: d.filename, day: String(d.updated_at).slice(0, 10) }));
       const content = renderShelf(members, thread);
 

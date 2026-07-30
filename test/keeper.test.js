@@ -81,6 +81,20 @@ test('commonThread: shared meaningful tokens, stopwords out, honest empty', () =
     'no shared tokens -> empty thread, not an invented subject');
 });
 
+test('commonThread: corpus-wide boilerplate never names a shelf', () => {
+  // The first real corpus taught this one: every browser capture shares the
+  // template's own words ("captured automatically…"), which therefore have
+  // perfect within-cluster frequency — and perfect frequency everywhere else,
+  // which is exactly why they cannot be a subject.
+  const wrap = (s) => `captured automatically from chat. ${s}`;
+  const cluster = [wrap('the garden tomatoes ripen'), wrap('garden compost pile turned'), wrap('garden fence rotting')];
+  const outside = [wrap('dentist appointment moved'), wrap('passport renewal due'), wrap('quarterly report draft')];
+  const thread = keeper.commonThread(cluster, outside);
+  assert.ok(thread.includes('garden'), `garden must win, got ${thread}`);
+  assert.ok(!thread.includes('captured') && !thread.includes('automatically') && !thread.includes('chat'),
+    `template words must lose to the distinctive subject, got ${thread}`);
+});
+
 test('renderShelf/parseMembers round-trip', () => {
   const content = keeper.renderShelf(
     [{ filename: 'a.md', day: '2026-07-01' }, { filename: 'b.md', day: '2026-07-02' }, { filename: 'c.md', day: '2026-07-03' }],
