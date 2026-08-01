@@ -880,6 +880,9 @@ export interface KeeperTickReceipt {
   prunedEdges: number;
   /** True when the pre-write snapshot guard fired (kernel-ethic #11). */
   snapshotTaken: boolean;
+  /** The Mind's promotion-pass receipt (0.23.0 — rides the tail of every
+   *  keeperTick). null when skipped via {mind:false}. */
+  mind: MindTickReceipt | null;
 }
 
 export interface KeeperStatus {
@@ -892,9 +895,88 @@ export interface KeeperStatus {
 }
 
 /** Run one bounded Keeper pass: drain a batch of the neighbour queue, refresh
- *  shelves from the edge graph, emit receipted thought captures. Deterministic,
- *  model-free, idempotent; sources are never modified. */
-export function keeperTick(opts?: { batch?: number }): Promise<KeeperTickReceipt>;
+ *  shelves from the edge graph, emit receipted thought captures — then run the
+ *  Mind's promotion pass over the fresh shelves (opt out with {mind:false},
+ *  override its thresholds with {mind:{...}}). Deterministic, model-free,
+ *  idempotent; sources are never modified. */
+export function keeperTick(opts?: { batch?: number; mind?: false | MindTickOptions }): Promise<KeeperTickReceipt>;
 
 /** The Keeper's own liveness: queue depth, graph size, last tick receipt. */
 export function keeperStatus(): Promise<KeeperStatus>;
+
+// ── the Mind (0.23.0 — promotion ladder, elifant#5) ────────────────────────
+
+/** Threshold overrides for one Mind pass. `now` (ISO 8601) overrides the
+ *  clock — a test hook, the Keeper `batch` twin. */
+export interface MindTickOptions {
+  now?: string;
+  promoteConf?: number;
+  promoteN?: number;
+  promoteAgeH?: number;
+  reviseConf?: number;
+  retireConf?: number;
+  targetN?: number;
+  freshDays?: number;
+  horizonDays?: number;
+}
+
+/** Receipt returned by one Mind pass — every number re-derives from the
+ *  ledger rows the tick wrote. */
+export interface MindTickReceipt {
+  at: string;
+  /** New patterns first sighted this tick (each emitted a `pattern` capture). */
+  upserted: number;
+  /** Patterns hardened into pinned knowledge (each emitted a `knowledge` capture). */
+  promoted: number;
+  /** Visible revisions (each emitted a `revision` capture). */
+  revised: number;
+  /** Visible retirements (knowledge archived; each emitted a `retirement` capture). */
+  retired: number;
+  /** Retired patterns pulled back to forming by fresh evidence. */
+  revived: number;
+  /** Fizzled forming patterns culled from the ledger (quiet — never narrated). */
+  culled: number;
+  forming: number;
+  hardened: number;
+  patterns: number;
+}
+
+/** One transition on the ladder, as carried in a {source:'mind'} capture's
+ *  data. Stage vocabulary: 'pattern' | 'knowledge' | 'revision' | 'retirement'. */
+export interface MindEvent {
+  t: string;
+  stage: 'pattern' | 'knowledge' | 'revision' | 'retirement';
+  patternId: string;
+  kind: string;
+  theme: string;
+  themeLabel: string;
+  /** Stable public grouping key (hash of theme) — thread events without the raw id. */
+  threadKey: string;
+  /** Deterministic template line; hosts may re-voice it through a narrator. */
+  text: string;
+  confidence: number;
+  evidenceSummary: string;
+  /** The durable knowledge row (knowledge/revision/retirement stages). */
+  knowledge?: string;
+  retired?: boolean;
+}
+
+export interface MindStatus {
+  /** Days since the mind's epoch (0 before the first tick). */
+  day: number;
+  forming: number;
+  hardened: number;
+  retired: number;
+  patterns: number;
+  lastTick: MindTickReceipt | null;
+}
+
+/** Run one Mind pass standalone: read the Keeper's live shelves as pattern
+ *  candidates, earn/decay confidence, walk the ladder (promote / revise /
+ *  retire / revive), emit a receipted {source:'mind'} capture per transition.
+ *  Knowledge lands as durable PINNED tier-2-synthesized memories
+ *  (producer 'mind/promotion-v1') — never through the keyholder's pin path. */
+export function mindTick(opts?: MindTickOptions): Promise<MindTickReceipt>;
+
+/** The Mind's own liveness: day N, ladder counts, last tick receipt. */
+export function mindStatus(): Promise<MindStatus>;

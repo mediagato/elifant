@@ -709,7 +709,7 @@ async function setMemory(filename, content, updatedBy = 'brain', layer = 'instan
 // explicit trust tier (tier-2-synthesized — never the tier-1 default, K-CARBON-4)
 // and synthesized_via naming the producer. Kernel-internal: shells never mint
 // synthesized rows directly.
-async function _setMemoryDerived(filename, content, { updatedBy = 'keeper', layer = 'instance', embedding = null, trustTier, synthesizedVia } = {}) {
+async function _setMemoryDerived(filename, content, { updatedBy = 'keeper', layer = 'instance', embedding = null, trustTier, synthesizedVia, pinned = false } = {}) {
   _ensure();
   if (!trustTier || !synthesizedVia) {
     throw new Error('_setMemoryDerived: trustTier and synthesizedVia are required — an unmarked derived row is a silent promotion');
@@ -732,6 +732,14 @@ async function _setMemoryDerived(filename, content, { updatedBy = 'keeper', laye
       archived = false,
       deleted_at = NULL
   `, [filename, content, updatedBy, _ts(), layer, vec, trustTier, synthesizedVia, vv, hash]);
+  // Pin WITHOUT the tier re-tag: setMemoryPin is the keyholder's tier-1 vouch
+  // (decision-a) and a machine-derived row must never take that path — a mind
+  // knowledge row is pinned AND tier-2-synthesized, honestly both. Pin-only
+  // (never unpins): a keyholder's manual pin on a derived row survives the
+  // producer's rewrites.
+  if (pinned) {
+    await _db.query('UPDATE memories SET pinned = true WHERE filename = $1', [filename]);
+  }
 }
 
 // Update only the embedding for an existing memory. Used by callers that
@@ -3220,11 +3228,67 @@ const _keeper = _keeperModule.createKeeper({
   trustTier: TRUST_TIER,
 });
 
-/** Run one bounded Keeper pass. Returns the tick receipt. */
-async function keeperTick(opts) { _ensure(); return _keeper.tick(opts); }
+// ── the Mind (0.23.0 — elifant#5) ─────────────────────────────────────────
+// The promotion ladder: thought -> pattern -> knowledge, with visible revision
+// and retirement. Watches the Keeper's shelves persist across ticks; recurrence
+// earns confidence, confidence crosses thresholds, transitions are receipted
+// captures {source:'mind'} and knowledge lands as durable pinned tier-2 rows.
+// All mechanics live in src/mind.js (pure, model-free); this is the wiring.
+const _mindModule = require('./mind');
+const _mind = _mindModule.createMind({
+  query: (sql, params) => { _ensure(); return _db.query(sql, params); },
+  addCapture,
+  setMemoryDerived: _setMemoryDerived,
+  setMemoryArchive,
+  getState,
+  setState,
+  deleteState,
+  ts: _ts,
+  trustTier: TRUST_TIER,
+});
+
+/**
+ * Run one bounded Keeper pass, then the Mind's promotion pass over the fresh
+ * shelves (pass {mind:false} to skip it; pass {mind:{...}} to override its
+ * thresholds). Shipped shells calling keeperTick() bare get the ladder for
+ * free on a kernel upgrade — that is the point of it living here.
+ * Returns the tick receipt, with the mind's own receipt at receipt.mind
+ * (null when skipped).
+ */
+async function keeperTick(opts = {}) {
+  _ensure();
+  const receipt = await _keeper.tick(opts);
+  // opts.mind: false OR null skips the pass (the receipt already uses `mind:
+  // null` as its own "skipped" sentinel, so a host writing that back to opt
+  // out — the natural symmetric behavior — must not crash. typeof null ===
+  // 'object', so a bare `typeof === 'object'` check would route null into
+  // _mind.tick() as its options argument and blow up on `opts.now` after the
+  // keeper phase above has already committed its writes.
+  if (opts.mind === false || opts.mind === null) {
+    receipt.mind = null;
+  } else {
+    receipt.mind = await _mind.tick(typeof opts.mind === 'object' ? opts.mind : {});
+  }
+  // keeper.js already persisted 'keeper_last_tick' from INSIDE its own tick(),
+  // before .mind existed on this object — so that write is mind-less and
+  // keeperStatus().lastTick.mind would silently never appear, contradicting
+  // the KeeperTickReceipt type. Re-persist the now-complete receipt so the
+  // stored liveness record matches what keeperTick() actually returned.
+  await _db.query(
+    "INSERT INTO brain_meta (key, value) VALUES ('keeper_last_tick', $1) ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value",
+    [JSON.stringify(receipt)]
+  );
+  return receipt;
+}
 
 /** The Keeper's own liveness: queue depth, edge/shelf counts, last tick receipt. */
 async function keeperStatus() { _ensure(); return _keeper.status(); }
+
+/** Run one Mind pass standalone (opts.now overrides the clock — test hook). */
+async function mindTick(opts) { _ensure(); return _mind.tick(opts); }
+
+/** The Mind's liveness: day N, forming/hardened/retired counts, last receipt. */
+async function mindStatus() { _ensure(); return _mind.status(); }
 
 module.exports = {
   init,
@@ -3283,6 +3347,9 @@ module.exports = {
   // v0.22.0 — the Keeper (idle-time librarian: neighbour graph, shelves, thoughts)
   keeperTick,
   keeperStatus,
+  // v0.23.0 — the Mind (promotion ladder: pattern -> knowledge, visible revision)
+  mindTick,
+  mindStatus,
   // Internal, test-only — NOT a stable public API. Exposed so the version-vector
   // algebra (the causal-merge continuity primitive) can be unit-tested directly.
   _internal: {

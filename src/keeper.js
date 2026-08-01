@@ -51,6 +51,11 @@
  * the receiving Keeper treats it as content, not as one of its own shelves.
  * Harmless — it can no longer be auto-archived, that's all. A protocol rev
  * that carries the column is the fix, not a v1 hack.
+ *
+ * SINCE 0.23.0 the kernel's keeperTick() also drives the Mind's promotion
+ * pass over the fresh shelves (src/mind.js, elifant#5). The Keeper itself
+ * still NEVER promotes — the Mind promotes visibly, under its own producer
+ * tag, per its own contract.
  */
 'use strict';
 
