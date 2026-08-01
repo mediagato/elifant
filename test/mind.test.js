@@ -475,6 +475,192 @@ test('revision and retirement carry the knowledge row\'s embedding forward, neve
   await brain.close();
 });
 
+// ── elifant#16: the third-party inference guard ─────────────────────────────
+
+test('#16 acceptance: a grievance corpus shelves as observations and promotes ZERO verdicts', async () => {
+  await freshBrain();
+  const T = Date.now();
+  // Five keyholder-authored vents about a coworker — tier-1, backdated 9 days,
+  // n=5, fresh: this corpus clears EVERY promotion gate. Before the guard it
+  // hardened into pinned knowledge exactly like a garden.
+  const gripes = [
+    'Dave was late to standup again and the whole morning slipped',
+    'Dave shipped the broken build again, he never runs the tests',
+    'so tired of covering for Dave, he is impossible to plan around',
+    'Dave talked over me for the entire retro meeting',
+    'another Dave morning, he left the build red and went home',
+  ];
+  for (let i = 0; i < gripes.length; i++) {
+    const fn = `gripe-${i}.md`;
+    await brain.setMemory(fn, gripes[i], 'test', 'instance', nearVec(30, 31 + i));
+    await backdate(fn, T - (4 - i) * 2.25 * DAY);
+  }
+
+  const r = await brain.keeperTick({ mind: { now: iso(T) } });
+  // Observations still shelve — structure is allowed, verdicts are not.
+  assert.equal(r.shelvesWritten, 1, 'the grievance cluster still shelves (an observation, receipted)');
+  assert.equal(r.mind.upserted, 1, 'the pattern is seen and tracked');
+  assert.equal(r.mind.promoted, 0, 'zero promoted verdicts about a third party');
+  assert.equal(r.mind.guarded, 1, 'the guard is what held it — not the thresholds');
+
+  // The shelf carries the third-party mark, machine-readably, in its content.
+  const shelf = (await brain._internal.query(
+    "SELECT content FROM memories WHERE synthesized_via = 'keeper/shelving-v1'")).rows[0];
+  assert.match(shelf.content, /^about: a third party/m, 'the shelf says who it is about');
+  assert.equal(brain.injectDisposition({ content: shelf.content, trust_tier: 'tier-2-synthesized' }), 'hold',
+    'the marked shelf can never travel into an injected context block');
+
+  // The floor is PERMANENT: gates zeroed out AND a plausible "guard off" flag
+  // must change nothing (nothing reads cfg in the guard, by construction).
+  const r2 = await brain.mindTick({ now: iso(T + 60000), promoteConf: 0, promoteN: 0, promoteAgeH: 0, guard: false });
+  assert.equal(r2.promoted, 0, 'no dial reaches the floor');
+  assert.equal(r2.guarded, 1);
+  const know = (await brain._internal.query(
+    `SELECT 1 FROM memories WHERE synthesized_via = $1`, [mind.MIND_VIA])).rows;
+  assert.equal(know.length, 0, 'zero knowledge rows, ever');
+
+  // The refusal is visible ONCE (K-CARBON-4: no silent ladder decisions), then quiet.
+  const guards = await brain.getCaptures({ source: 'mind', type: 'guard' });
+  assert.equal(guards.length, 1, 'one visible guard receipt, not a nag');
+  assert.match(guards[0].data.text, /someone who isn't you/);
+  assert.equal(guards[0].data.guard, 'third-party');
+  await brain.mindTick({ now: iso(T + HOUR) });
+  assert.equal((await brain.getCaptures({ source: 'mind', type: 'guard' })).length, 1, 'announced once');
+
+  // Recall for the keyholder's own use is untouched: the raw memories are
+  // live, unarchived, and readable by name — the guard gates INJECTION and
+  // PROMOTION, never the keyholder's access to their own words.
+  const raw = await brain.getMemory('gripe-2.md');
+  assert.ok(raw && /covering for Dave/.test(raw.content), 'the keyholder keeps their own words');
+  await brain.close();
+});
+
+test('#16: a keyholder\'s own first-person pattern still promotes — the guard reads subjects, not sentiment', async () => {
+  await freshBrain();
+  const T = Date.now();
+  // Self-directed and even self-critical — but about the KEYHOLDER, so the
+  // ladder must work exactly as before (the control for the guard).
+  const notes = [
+    'i was late to standup again this morning, third time',
+    'i keep skipping the standup prep and it shows',
+    'late again today, i need a standing alarm for standup',
+    'i promised the team i would fix my standup timing',
+    'made it to standup on time once this week, i have to do better',
+  ];
+  for (let i = 0; i < notes.length; i++) {
+    const fn = `self-${i}.md`;
+    await brain.setMemory(fn, notes[i], 'test', 'instance', nearVec(80, 81 + i));
+    await backdate(fn, T - (4 - i) * 2.25 * DAY);
+  }
+  const r = await brain.keeperTick({ mind: { now: iso(T) } });
+  assert.equal(r.mind.guarded, 0, 'no third-party signal — the guard stays out of the way');
+  assert.equal(r.mind.promoted, 1, 'the keyholder\'s own pattern climbs exactly as before');
+  await brain.close();
+});
+
+// ── elifant#17: crisis lexicon + permanent domain denylist ──────────────────
+
+test('#17 acceptance: health/grief/finance corpora that clear every gate produce ZERO knowledge', async () => {
+  await freshBrain();
+  const T = Date.now();
+  // Three clusters, one per denylisted domain — each tier-1, n=5, 9 days old,
+  // fresh: every one clears every promotion gate on the numbers.
+  const corpora = {
+    health: [
+      'the new medication dose is 20mg every morning',
+      'therapist moved the session to thursdays',
+      'blood pressure was high again at the checkup',
+      'the specialist wants another biopsy before deciding',
+      'sleep is wrecked, the insomnia is back every night',
+    ],
+    grief: [
+      'the funeral is on saturday at ten',
+      'mom passed away two years ago this week',
+      'grief hits hardest in the evenings lately',
+      'picked up the death certificate copies today',
+      'the memorial service playlist still needs songs',
+    ],
+    finance: [
+      'the credit card balance went up again this month',
+      'still trying to afford the january rent',
+      'the loan officer wants two more pay stubs',
+      'payday is the 15th and the bills land on the 12th',
+      'the overdraft fee hit twice this week',
+    ],
+  };
+  let axis = 40;
+  for (const [domain, notes] of Object.entries(corpora)) {
+    for (let i = 0; i < notes.length; i++) {
+      const fn = `${domain}-${i}.md`;
+      await brain.setMemory(fn, notes[i], 'test', 'instance', nearVec(axis, axis + 1 + i));
+      await backdate(fn, T - (4 - i) * 2.25 * DAY);
+    }
+    axis += 10;
+  }
+  const r = await brain.keeperTick({ mind: { now: iso(T) } });
+  assert.equal(r.mind.upserted, 3, 'three clusters, three tracked patterns');
+  assert.equal(r.mind.promoted, 0, 'zero promoted knowledge in denylisted domains');
+  assert.equal(r.mind.guarded, 3, 'all three held by the domain floor');
+
+  // The floor is PERMANENT: zeroed gates and plausible bypass flags change nothing.
+  const r2 = await brain.mindTick({
+    now: iso(T + 60000), promoteConf: 0, promoteN: 0, promoteAgeH: 0,
+    guard: false, denylist: [], crisisLexicon: [],
+  });
+  assert.equal(r2.promoted, 0, 'no dial reaches the floor');
+  assert.equal(r2.guarded, 3);
+  assert.equal((await brain._internal.query(
+    `SELECT count(*)::int AS n FROM memories WHERE synthesized_via = $1`, [mind.MIND_VIA])).rows[0].n, 0,
+    'zero knowledge rows across all three domains');
+
+  // Each refusal narrated once, naming its domain — then quiet.
+  const guards = await brain.getCaptures({ source: 'mind', type: 'guard' });
+  assert.equal(guards.length, 3);
+  const reasons = guards.map((g) => g.data.guard).sort();
+  assert.deepEqual(reasons, ['domain:finance', 'domain:grief', 'domain:health']);
+  await brain.close();
+});
+
+test('#17: crisis content never shelves, never patterns — and a hand-built crisis shelf still cannot promote', async () => {
+  await freshBrain();
+  const T = Date.now();
+  const dark = [
+    'i keep thinking about ending my life',
+    'wrote about wanting to hurt myself again tonight',
+    'the suicidal thoughts were loud all day',
+    'searched for overdose amounts, scared myself',
+    'i do not want to be alive this week',
+  ];
+  for (let i = 0; i < dark.length; i++) {
+    const fn = `dark-${i}.md`;
+    await brain.setMemory(fn, dark[i], 'test', 'instance', nearVec(70, 71 + i));
+    await backdate(fn, T - (4 - i) * 2.25 * DAY);
+  }
+  const r = await brain.keeperTick({ mind: { now: iso(T) } });
+  assert.equal(r.shelvesWritten, 0, 'crisis content never blends into a derived row — the shelving override');
+  assert.equal(r.mind.upserted, 0, 'no shelf, no pattern, no ladder');
+  assert.equal((await brain._internal.query(
+    'SELECT count(*)::int AS n FROM memories WHERE synthesized_via IS NOT NULL')).rows[0].n, 0,
+    'zero derived rows of any kind');
+  // The raw memories themselves are untouched — recallable, never held from
+  // the keyholder's own explicit access.
+  const raw = await brain.getMemory('dark-0.md');
+  assert.ok(raw && raw.content.includes('ending my life'), 'the keyholder keeps their own words');
+  // ...but they can never travel into an injected context block.
+  assert.equal(brain.injectDisposition({ content: raw.content, trust_tier: raw.trust_tier }), 'hold');
+
+  // Belt and braces: even a shelf hand-built around crisis content (bypassing
+  // the keeper) never promotes, and the hold is SILENT — no guard capture
+  // narrates a person's darkest sentence back at them.
+  await seedShelf('shelf/dark.md', ['sd-0.md', 'sd-1.md', 'sd-2.md', 'sd-3.md', 'sd-4.md'], 'ending my life', T);
+  const r2 = await brain.mindTick({ now: iso(T) });
+  assert.equal(r2.promoted, 0, 'a crisis pattern never hardens');
+  assert.ok(r2.guarded >= 1, 'held by the crisis floor');
+  assert.equal((await brain.getCaptures({ source: 'mind' })).length, 0,
+    'NO mind capture of any stage — a crisis hold is tracked, never narrated');
+  await brain.close();
+});
+
 test('mindTick(null) and keeperTick({mind:null}) both opt out cleanly — no crash at any entry point', async () => {
   await freshBrain();
   const T = Date.now();

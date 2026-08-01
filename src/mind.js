@@ -16,6 +16,9 @@
  * template text through their own narrators; if there is no narrator, the
  * ladder still climbs.
  *
+ * (INV, same as the Keeper: no model, no require beyond what index.js hands
+ * in — kernel-sibling pure modules (./guard) excepted.)
+ *
  * WHAT A TICK DOES
  *   1. loads the pattern ledger (state keys `mind:pattern:<id>`);
  *   2. reads every live Keeper shelf as a pattern CANDIDATE — n counts the
@@ -31,7 +34,14 @@
  *        forming  + conf >= 0.8 && n >= 5 && age >= 24h  -> PROMOTE: a durable
  *                   pinned knowledge memory (tier-2-synthesized, producer
  *                   'mind/promotion-v1', receipt history in the row itself)
- *                   + a `knowledge` capture;
+ *                   + a `knowledge` capture — UNLESS the Guard holds it:
+ *                   a pattern whose evidence is about a person who is not
+ *                   the keyholder (elifant#16), majority-touches a denylisted
+ *                   domain (health/grief/finance), or contains any crisis-
+ *                   lexicon match (elifant#17) NEVER promotes, at any
+ *                   confidence/n/age, under any per-tick option. The refusal
+ *                   is visible once (a `guard` capture), then quiet — except
+ *                   a crisis hold, which is never narrated at all;
  *        hardened + conf < 0.4                           -> REVISE (visible,
  *                   once per softening) + a `revision` capture;
  *        hardened + conf < 0.2                           -> RETIRE (visible;
@@ -80,6 +90,8 @@
  * rather than the live filename; deferred, not attempted here.
  */
 'use strict';
+
+const { promotionGuard } = require('./guard');
 
 // Tunables (elifant#5's stated gates; override per tick via mindTick(opts)) —
 // except minPatternN and maxRefs, which _candidates() reads from DEFAULTS
@@ -232,7 +244,7 @@ function createMind(ctx) {
       for (const m of String(s.content || '').matchAll(/^- (\S+)(?: |$)/gm)) members.push(m[1]);
       if (!members.length) continue;
       const live = await query(
-        `SELECT filename, updated_at FROM memories WHERE filename = ANY($1::text[]) AND ${SOURCE_WHERE}`,
+        `SELECT filename, updated_at, content FROM memories WHERE filename = ANY($1::text[]) AND ${SOURCE_WHERE}`,
         [members]
       );
       const rows = live.rows;
@@ -255,9 +267,25 @@ function createMind(ctx) {
           ? `${rows.length} memories about ${label} over ${days} day${days === 1 ? '' : 's'}`
           : `${rows.length} memories saying similar things over ${days} day${days === 1 ? '' : 's'}`,
         vec: s.vec ? String(s.vec).replace(/^\[|\]$/g, '').split(',').map(Number) : null,
+        // The Guard's verdict over the LIVE evidence (elifant#16) — recomputed
+        // every tick from the member rows themselves, so an edit that changes
+        // what the cluster is about changes the verdict with it.
+        guard: promotionGuard(rows.map((r) => r.content)),
       });
     }
     return out;
+  }
+
+  // Guard verdict for a pattern with no fresh candidate this tick (its shelf
+  // dissolved, or the ledger row predates the Guard): re-derive from whichever
+  // refs are still live keyholder rows. Never assume unguarded.
+  async function _guardFromRefs(p) {
+    const names = (p.signal.refs || []).map((r) => r.filename);
+    if (!names.length) return null;
+    const r = await query(
+      `SELECT content FROM memories WHERE filename = ANY($1::text[]) AND ${SOURCE_WHERE}`, [names]
+    );
+    return promotionGuard(r.rows.map((row) => row.content));
   }
 
   // How many of a pattern's recorded refs are still live keyholder rows? The
@@ -381,7 +409,7 @@ function createMind(ctx) {
     const cfg = Object.assign({}, DEFAULTS, opts);
     const nowIso = opts.now || ts();
     const nowMs = Date.parse(nowIso);
-    const receipt = { at: nowIso, upserted: 0, promoted: 0, revised: 0, retired: 0, revived: 0, culled: 0, forming: 0, hardened: 0, patterns: 0 };
+    const receipt = { at: nowIso, upserted: 0, promoted: 0, revised: 0, retired: 0, revived: 0, culled: 0, guarded: 0, forming: 0, hardened: 0, patterns: 0 };
 
     const patterns = await _ledger();
     const cands = await _candidates();
@@ -399,13 +427,18 @@ function createMind(ctx) {
         ex.born = Math.min(ex.born || c.born, c.born);
         ex.last = c.last;
         ex.themeLabel = c.themeLabel;
+        ex.guard = c.guard;
         if (ex.status === 'retired' && fresh) {
           ex.status = 'forming';
           ex.softenedAt = null;
           ex.confidence = confidence({ n: c.n, last: c.last }, nowMs, cfg);
           receipt.revived++;
-          await _emit('pattern', _event(ex, 'pattern',
-            `this is forming again: ${ex.themeLabel} — ${ex.signal.evidenceSummary}`, nowIso));
+          // Crisis-guarded evidence is tracked but never narrated (elifant#17)
+          // — echoing it into a feed is its own harm.
+          if (ex.guard !== 'crisis') {
+            await _emit('pattern', _event(ex, 'pattern',
+              `this is forming again: ${ex.themeLabel} — ${ex.signal.evidenceSummary}`, nowIso));
+          }
         }
       } else {
         const p = {
@@ -414,11 +447,19 @@ function createMind(ctx) {
           signal: { n: c.n, born: c.born, last: c.last, refs: c.refs, evidenceSummary: c.evidenceSummary },
           confidence: confidence({ n: c.n, last: c.last }, nowMs, cfg),
           status: 'forming', born: c.born, last: c.last, softenedAt: null, knowledge: null,
+          guard: c.guard, guardAnnounced: null,
         };
         patterns.set(p.id, p);
         receipt.upserted++;
-        await _emit('pattern', _event(p, 'pattern',
-          `a pattern is forming around ${p.themeLabel} — ${p.signal.evidenceSummary}`, nowIso));
+        // Crisis-guarded evidence is tracked (auditable in the ledger and the
+        // `guarded` count) but never narrated (elifant#17): the normal path
+        // never gets here — the Keeper's shelving override means no crisis
+        // shelf exists — but a hand-built or imported shelf must not have its
+        // darkest line echoed back as a cheery "a pattern is forming" capture.
+        if (p.guard !== 'crisis') {
+          await _emit('pattern', _event(p, 'pattern',
+            `a pattern is forming around ${p.themeLabel} — ${p.signal.evidenceSummary}`, nowIso));
+        }
       }
     }
 
@@ -435,8 +476,31 @@ function createMind(ctx) {
     // 3. transitions + persist.
     for (const p of patterns.values()) {
       if (promotable(p, nowMs, cfg)) {
-        await _promote(p, nowIso, vecById.get(p.id) || null);
-        receipt.promoted++;
+        // The Guard (elifant#16/#17) — the permanent WHAT-ABOUT floor under
+        // the ladder. Deliberately NOT cfg-driven: no per-tick option, shell
+        // setting, or keyholder dial reaches it (#14's "non-negotiable
+        // regardless of dials"). A pattern whose shelf was live this tick
+        // carries a fresh verdict from _candidates(); a dissolved-shelf or
+        // pre-guard ledger row re-derives from its live refs.
+        const guard = p.guard !== undefined ? p.guard : await _guardFromRefs(p);
+        p.guard = guard;
+        if (guard) {
+          receipt.guarded++;
+          // The refusal is visible ONCE per reason (K-CARBON-4: no silent
+          // ladder decisions), then quiet — a floor, not a nag. A 'crisis'
+          // hold is the exception: never narrated back (elifant#17).
+          if (p.guardAnnounced !== guard && guard !== 'crisis') {
+            const why = guard === 'third-party'
+              ? "it's about someone who isn't you, so it stays observations — never a verdict"
+              : `it touches ${guard.replace(/^domain:/, '')}, which never hardens into knowledge`;
+            await _emit('guard', _event(p, 'guard',
+              `this keeps coming up — ${p.themeLabel} — but ${why}`, nowIso, { guard }));
+            p.guardAnnounced = guard;
+          }
+        } else {
+          await _promote(p, nowIso, vecById.get(p.id) || null);
+          receipt.promoted++;
+        }
       } else if (p.status === 'hardened') {
         if (p.confidence < cfg.retireConf) {
           await _retire(p, nowIso);

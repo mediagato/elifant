@@ -540,6 +540,24 @@ export function isRelevant(hit: { distance?: number } | null | undefined, tier?:
 /** Filter a hit list to those relevant at the given tier (default `strict`), order preserved. */
 export function filterRelevant<T extends { distance?: number }>(hits: T[] | null | undefined, tier?: RelevanceTier): T[];
 
+/**
+ * How a memory may travel into an AI-facing context block (elifant#16/#17):
+ *   - 'hold': never inject — crisis-lexicon content at any tier (#17), or a
+ *     synthesized (tier-2) row about a third party (#16);
+ *   - 'mark-third-party': inject ONLY wrapped/marked as the keyholder's own
+ *     past words about someone who is not them — never established fact;
+ *   - 'plain': no constraint from this guard (tier-3 wrapping / tier-4 holding
+ *     stay with the surfaces).
+ */
+export type InjectDisposition = 'plain' | 'mark-third-party' | 'hold';
+
+/**
+ * The one canonical inject-policy verdict for a memory row/search hit
+ * (RELEVANCE_FLOORS-style: shells read this instead of re-deriving policy).
+ * Pure and deterministic; reads no config — a permanent floor, not a dial.
+ */
+export function injectDisposition(hit: { content?: string | null; trust_tier?: string | null }): InjectDisposition;
+
 /** The Nose (embedder) identity recorded in a brain. */
 export interface EmbedMeta {
   model: string;
@@ -936,16 +954,22 @@ export interface MindTickReceipt {
   revived: number;
   /** Fizzled forming patterns culled from the ledger (quiet — never narrated). */
   culled: number;
+  /** Otherwise-promotable patterns refused by the permanent content floor
+   *  (elifant#16 third-party guard; elifant#17 domain denylist + crisis).
+   *  A third-party/domain refusal is narrated once via a `guard` capture,
+   *  then quiet; a crisis hold is never narrated at all. */
+  guarded: number;
   forming: number;
   hardened: number;
   patterns: number;
 }
 
 /** One transition on the ladder, as carried in a {source:'mind'} capture's
- *  data. Stage vocabulary: 'pattern' | 'knowledge' | 'revision' | 'retirement'. */
+ *  data. Stage vocabulary: 'pattern' | 'knowledge' | 'revision' | 'retirement'
+ *  | 'guard' (a visible promotion refusal — elifant#16). */
 export interface MindEvent {
   t: string;
-  stage: 'pattern' | 'knowledge' | 'revision' | 'retirement';
+  stage: 'pattern' | 'knowledge' | 'revision' | 'retirement' | 'guard';
   patternId: string;
   kind: string;
   theme: string;
@@ -959,6 +983,8 @@ export interface MindEvent {
   /** The durable knowledge row (knowledge/revision/retirement stages). */
   knowledge?: string;
   retired?: boolean;
+  /** The refusal reason on a 'guard' capture (e.g. 'third-party'). */
+  guard?: string;
 }
 
 export interface MindStatus {

@@ -9,6 +9,9 @@
  * what it noticed, deterministically.
  *
  * WHAT A TICK DOES
+ *   0. plans its write volume (prune deletes + edge writes) and runs the
+ *      snapshot-before-bulk guard (kernel-ethic #11) BEFORE the first write —
+ *      a bulk pass always has a way back (elifant#12);
  *   1. prunes edges whose endpoints died (tombstoned / archived rows);
  *   2. drains a bounded batch of the NEIGHBOUR QUEUE — memories whose
  *      `neighbours_at` is NULL — computing each row's nearest neighbours over
@@ -35,7 +38,16 @@
  * WHAT IT WILL NEVER DO
  *   - touch a model. The noticing is arithmetic and counting; every word of a
  *     thought is assembled from ledger facts. (INV: no require of anything
- *     beyond what index.js hands in.)
+ *     beyond what index.js hands in — kernel-sibling pure modules (./guard)
+ *     excepted; still zero externals, zero models.)
+ *   - hide who a shelf is about: a cluster about a person who is not the
+ *     keyholder still shelves (a shelf is a receipted OBSERVATION) but its
+ *     content carries the third-party mark, so the Mind never hardens it into
+ *     a verdict and inject surfaces never re-voice it (elifant#16, guard.js).
+ *   - shelve crisis-lexicon content, EVER: a memory that matches the crisis
+ *     lexicon never blends into any derived row (elifant#17's shelving
+ *     override, guard.js) — it stays a plain, recallable memory and the
+ *     librarian says nothing about it.
  *   - modify a source row's content, tier, or causal history. Sources gain
  *     only `neighbours_at` (derived bookkeeping, unstamped — the same class
  *     of write as setMemoryEmbedding). Shelves are NEW rows; nothing is ever
@@ -59,6 +71,8 @@
  */
 'use strict';
 
+const { thirdPartyCluster, crisisMatch, THIRD_PARTY_MARK } = require('./guard');
+
 // Tunables. Distances are pgvector cosine distances (smaller = more similar).
 // EDGE_KEEP reuses the kernel's loose RECALL floor (the graph remembers weak
 // links so future passes can reason about them), but SHELF binding is its own,
@@ -78,7 +92,6 @@ const MIN_SHELF = 3;              // pairs are near-dup territory (elifant#6), n
 const QUEUE_BATCH = 50;           // bounded work per tick
 const FIRST_LIGHT_MIN_CORPUS = 8; // below this, everything is new territory — stay quiet
 const BULK_SNAPSHOT_ROWS = 100;   // kernel-ethic #11: snapshot before >100-row passes
-const SNAPSHOT_THROTTLE_MS = 24 * 60 * 60 * 1000;
 const SHELVING_VIA = 'keeper/shelving-v1';
 
 const STOPWORDS = new Set(('a an and are as at be but by for from has have i if in into is it its me my not of on or ' +
@@ -150,13 +163,17 @@ function meanVector(vectors) {
 
 // Shelf content — the receipt IS the content. One writer, one format; the
 // member lines are the durable membership record the next tick diffs against.
-function renderShelf(members /* [{filename, day}] */, thread) {
+// A third-party cluster's shelf says so in its own content (elifant#16): the
+// mark is visible to the keyholder, parseable by the Mind and every inject
+// surface, and it travels with the row through YOINK/SUMMON.
+function renderShelf(members /* [{filename, day}] */, thread, { thirdParty = false } = {}) {
   const head = `# on this shelf: ${members.length} memories`;
   const threadLine = thread.length ? `\ncommon thread: ${thread.join(', ')}\n` : '';
+  const markLine = thirdParty ? `${THIRD_PARTY_MARK}\n` : '';
   const lines = members.map((m) => `- ${m.filename} (${m.day})`).join('\n');
   const foot = '_shelved by the keeper. every line above re-derives from the memories it names; ' +
     'the sources are untouched and this shelf can be archived without losing any of them._';
-  return `${head}\n${threadLine}\n${lines}\n\n${foot}\n`;
+  return `${head}\n${threadLine}${markLine}\n${lines}\n\n${foot}\n`;
 }
 
 function parseMembers(content) {
@@ -253,13 +270,19 @@ function createKeeper(ctx) {
     );
   }
 
-  // Snapshot-before-bulk (kernel-ethic #11), throttled so a busy day costs one
-  // snapshot, not one per tick. Also fires on the first pass ever: the Keeper
-  // introduces a new class of writer, and integrity comes before cleverness.
+  // Snapshot-before-bulk (kernel-ethic #11). A genuinely bulk pass — more
+  // planned writes+deletes than BULK_SNAPSHOT_ROWS — ALWAYS snapshots first:
+  // the ethic's MUST has no throttle clause. (elifant#12: the first cut here
+  // checked a 24h throttle BEFORE the size check, so any snapshot in the last
+  // day waived the guard for a pass of ANY size — a 403-row pass an hour after
+  // a snapshot ran with no safety net at all.) A small pass skips only when a
+  // guard snapshot is already on record; the first pass ever snapshots
+  // regardless of size — the Keeper introduces a new class of writer, and
+  // integrity comes before cleverness. Snapshot volume stays bounded: bulk
+  // passes only happen while a real backlog drains, and retention
+  // (recent/daily/weekly tiers + hard cap) reaps the churn.
   async function _maybeSnapshot(plannedRows) {
     const last = await _meta('keeper_last_snapshot');
-    const due = !last || (Date.parse(ts()) - Date.parse(last)) > SNAPSHOT_THROTTLE_MS;
-    if (!due) return false;
     if (last && plannedRows <= BULK_SNAPSHOT_ROWS) return false;
     await snapshot('keeper pass (pre-write guard)', { trigger: 'keeper' });
     await _setMeta('keeper_last_snapshot', ts());
@@ -288,6 +311,20 @@ function createKeeper(ctx) {
         SELECT 1 FROM memories m WHERE m.filename = e.b_filename AND ${sourceWhere('m')}
       )`);
     return r.affectedRows || 0;
+  }
+
+  // How many edges would _pruneDeadEdges delete right now? Same predicate as
+  // the DELETE, read first so the snapshot guard can count the prune against
+  // the tick's planned write volume BEFORE anything is removed (elifant#12:
+  // the prune used to run ahead of the guard — unbounded, unguarded).
+  async function _countDeadEdges() {
+    const r = await query(`
+      SELECT count(*)::int AS n FROM memory_edges e WHERE NOT EXISTS (
+        SELECT 1 FROM memories m WHERE m.filename = e.a_filename AND ${sourceWhere('m')}
+      ) OR NOT EXISTS (
+        SELECT 1 FROM memories m WHERE m.filename = e.b_filename AND ${sourceWhere('m')}
+      )`);
+    return r.rows[0].n;
   }
 
   // Compute + persist one memory's neighbours. Returns its first-light verdict.
@@ -356,12 +393,19 @@ function createKeeper(ctx) {
     const now = ts();
     const receipt = { at: now, processed: 0, firstLights: 0, shelvesWritten: 0, shelvesArchived: 0, thoughts: 0, prunedEdges: 0, snapshotTaken: false };
 
-    receipt.prunedEdges = await _pruneDeadEdges();
-
+    // Plan the tick's write volume and run the snapshot guard BEFORE the first
+    // write (elifant#12). Two holes lived here: the prune ran ahead of the
+    // guard (unbounded deletes, unguarded), and an empty queue skipped the
+    // guard entirely even though pruning/shelving/archiving still write in the
+    // same tick. plannedRows = the prune's deletes (exact count, same
+    // predicate as the DELETE) + the queue's edge writes (upper bound: K per
+    // row) + a token for the shelf rewrites. The Mind's promotion pass rides
+    // this same guard (its write volume is O(shelves) — see mind.js header).
     const queue = await _neighbourQueue(batch);
-    if (queue.length) {
-      receipt.snapshotTaken = await _maybeSnapshot(queue.length * NEIGHBOUR_K + MIN_SHELF);
-    }
+    const deadEdges = await _countDeadEdges();
+    receipt.snapshotTaken = await _maybeSnapshot(deadEdges + queue.length * NEIGHBOUR_K + MIN_SHELF);
+
+    receipt.prunedEdges = await _pruneDeadEdges();
 
     const corpus = await _corpusCount();
     for (const row of queue) {
@@ -398,9 +442,20 @@ function createKeeper(ctx) {
     let corpusRows = null;
 
     for (let ci = 0; ci < clusters.length; ci++) {
-      const cluster = clusters[ci];
-      const details = await _memberDetails(cluster);
-      if (details.length < MIN_SHELF) continue;
+      const rawCluster = clusters[ci];
+      const allDetails = await _memberDetails(rawCluster);
+      // elifant#17: crisis-lexicon content NEVER blends into a derived row —
+      // the shelving override. Filtered before the size gate, so a cluster
+      // carried by crisis content simply never shelves; if the filter drops a
+      // previously-claimed shelf below the minimum, release the claim so the
+      // end-of-tick sweep archives it instead of leaving its old content live.
+      const details = allDetails.filter((d) => !crisisMatch(d.content));
+      const cluster = details.map((d) => d.filename);
+      if (details.length < MIN_SHELF) {
+        const claimed = clusterMatched.get(ci);
+        if (claimed) shelfTaken.delete(claimed);
+        continue;
+      }
       if (corpusRows == null) {
         corpusRows = (await query(
           `SELECT filename, content FROM memories WHERE embedding IS NOT NULL AND ${SOURCE_WHERE}
@@ -408,9 +463,15 @@ function createKeeper(ctx) {
       }
       const inCluster = new Set(cluster);
       const outside = corpusRows.filter((r) => !inCluster.has(r.filename)).map((r) => r.content);
-      const thread = commonThread(details.map((d) => d.content), outside);
+      const memberContents = details.map((d) => d.content);
+      const thread = commonThread(memberContents, outside);
+      // elifant#16: a cluster about a person who is not the keyholder still
+      // shelves — a shelf is a receipted observation — but the shelf SAYS SO,
+      // machine-readably, so the Mind never promotes it and inject surfaces
+      // never re-voice it. Detection is guard.js's cluster-level pass.
+      const thirdParty = thirdPartyCluster(memberContents);
       const members = details.map((d) => ({ filename: d.filename, day: String(d.updated_at).slice(0, 10) }));
-      const content = renderShelf(members, thread);
+      const content = renderShelf(members, thread, { thirdParty });
 
       let target = clusterMatched.get(ci);
       let existing = target ? shelfByName.get(target) : null;

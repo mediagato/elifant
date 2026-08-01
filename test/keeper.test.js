@@ -192,7 +192,7 @@ test('idempotent: a second tick writes nothing and says nothing', async () => {
   assert.equal(again.processed, 0);
   assert.equal(again.shelvesWritten, 0);
   assert.equal(again.thoughts, 0, 'honest silence — nothing changed, nothing said');
-  assert.equal(again.snapshotTaken, false, 'snapshot throttled');
+  assert.equal(again.snapshotTaken, false, 'small pass with a guard snapshot on record — no re-snapshot');
 
   const shelfAfter = (await brain._internal.query('SELECT content, version_vector FROM memories WHERE synthesized_via IS NOT NULL')).rows[0];
   assert.deepEqual(shelfAfter, shelfBefore, 'identical membership -> byte-identical shelf, no causal bump');
@@ -331,6 +331,107 @@ test('shelves are not re-shelved (no shelves-of-shelves)', async () => {
   const receipt = await brain.keeperTick();
   assert.equal(receipt.shelvesWritten, 0);
   assert.equal((await brain._internal.query('SELECT count(*)::int AS n FROM memories WHERE synthesized_via IS NOT NULL')).rows[0].n, 1);
+  await brain.close();
+});
+
+// ── elifant#12: snapshot-before-bulk guard ordering ─────────────────────────
+//
+// The original guard checked the 24h throttle BEFORE the bulk-size check, so a
+// bulk pass within a day of ANY snapshot ran with no safety net regardless of
+// size; the edge prune ran before the guard entirely; and an empty queue
+// skipped the guard even though the same tick still writes. The tests below
+// exercise the real throttle-vs-bulk interaction (the old 'snapshot throttled'
+// assertion rode a tick with processed:0, where _maybeSnapshot was never even
+// called) — each was verified to FAIL against the pre-fix keeper.js.
+
+test('#12: a bulk pass snapshots even when a snapshot is on recent record — size beats throttle', async () => {
+  await freshBrain();
+  // Pass 1: tiny — takes the first-ever guard snapshot, putting a snapshot
+  // minutes old on record.
+  await brain.setMemory('seed-0.md', 'first light seed note', 'test', 'instance', normalize(axisVec(120)));
+  const r1 = await brain.keeperTick({ mind: false });
+  assert.equal(r1.snapshotTaken, true, 'first pass ever snapshots');
+
+  // Pass 2: genuinely bulk — 14 queued rows plan 14*8+3 = 115 writes, over the
+  // 100-row kernel-ethic #11 threshold — moments after that snapshot. The old
+  // guard read the throttle first and skipped.
+  for (let i = 0; i < 14; i++) {
+    await brain.setMemory(`bulk-${i}.md`, `bulk backlog note ${i}`, 'test', 'instance', normalize(axisVec(130 + i)));
+  }
+  const r2 = await brain.keeperTick({ mind: false });
+  assert.equal(r2.processed, 14);
+  assert.equal(r2.snapshotTaken, true, 'a bulk pass MUST snapshot first — no throttle waives kernel-ethic #11');
+  const snaps = await brain.listSnapshots({ trigger: 'keeper' });
+  assert.equal(snaps.length, 2, 'both guard snapshots are on the ledger');
+  await brain.close();
+});
+
+test('#12: an unbounded edge prune is guarded even when the neighbour queue is empty', async () => {
+  await freshBrain();
+  // A drained brain with a guard snapshot on record.
+  await brain.setMemory('p-0.md', 'prune guard seed note', 'test', 'instance', normalize(axisVec(100)));
+  await brain.keeperTick({ mind: false });
+
+  // 120 edges (> BULK_SNAPSHOT_ROWS) whose endpoints are about to die.
+  // Inserted directly — the DELETE volume is what matters, not graph realism.
+  const files = [];
+  for (let i = 0; i < 16; i++) files.push(`dead-${i}.md`);
+  for (const f of files) await brain.setMemory(f, `edge endpoint ${f}`, 'test', 'instance', normalize(axisVec(200)));
+  const now = new Date().toISOString();
+  for (let i = 0; i < files.length; i++) {
+    for (let j = i + 1; j < files.length; j++) {
+      await brain._internal.query(
+        'INSERT INTO memory_edges (a_filename, b_filename, distance, computed_at) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING',
+        [files[i], files[j], 0.05, now]
+      );
+    }
+  }
+  for (const f of files) await brain.deleteMemory(f);
+
+  const r = await brain.keeperTick({ mind: false });
+  assert.equal(r.processed, 0, 'nothing queued — the old guard would never have run at all');
+  assert.equal(r.prunedEdges, 120, 'the prune itself still happens');
+  assert.equal(r.snapshotTaken, true, '>100 planned deletes is a bulk pass — the guard covers the prune');
+  await brain.close();
+});
+
+test('#12: a small pass with a snapshot on record skips — decided by a guard that actually ran', async () => {
+  await freshBrain();
+  await seedCluster();
+  await brain.keeperTick({ mind: false }); // first-ever guard snapshot
+  await brain.setMemory('garden-late.md', 'one more garden note about the beds', 'test', 'instance', nearVec(0, 6));
+  const r = await brain.keeperTick({ mind: false });
+  assert.equal(r.processed, 1, 'a REAL pass (processed > 0), not the processed:0 default the old test rode');
+  assert.equal(r.snapshotTaken, false, '1 queued row plans 11 writes — small pass, snapshot on record, skip');
+  assert.equal((await brain.listSnapshots({ trigger: 'keeper' })).length, 1);
+  await brain.close();
+});
+
+test('#12 acceptance: the guard snapshot is a real way back — rollback restores the pre-pass store', async () => {
+  await freshBrain();
+  for (let i = 0; i < 14; i++) {
+    await brain.setMemory(`roll-${i}.md`, `garden variety note ${i} about the garden`, 'test', 'instance', nearVec(0, i + 1));
+  }
+  const r = await brain.keeperTick({ mind: false });
+  assert.equal(r.snapshotTaken, true, 'bulk pass — guard snapshot taken before any write');
+  assert.equal(r.processed, 14);
+  assert.ok(r.shelvesWritten >= 1, 'the pass really wrote (edges + a shelf + watermarks)');
+
+  // Roll back to the guard snapshot: the store must return to its pre-pass shape.
+  const snap = (await brain.listSnapshots({ trigger: 'keeper' }))[0];
+  await brain.rollback(snap.snapshot_id, 'replace', { confirm: true });
+  const st = await brain.keeperStatus();
+  assert.equal(st.queue, 14, 'watermarks rolled back — the whole queue is owed again');
+  assert.equal(st.edges, 0, 'edge writes rolled back');
+  assert.equal(st.shelves, 0, 'shelf writes rolled back');
+
+  // And the pass simply runs again — nothing lost, nothing doubled.
+  const again = await brain.keeperTick({ mind: false });
+  assert.equal(again.processed, 14);
+  assert.equal((await brain.keeperStatus()).queue, 0);
+  assert.equal((await brain._internal.query(
+    "SELECT count(*)::int AS n FROM memories WHERE synthesized_via IS NOT NULL AND archived = false")).rows[0].n, 1,
+    'one shelf again — the redo converges to the same library');
   await brain.close();
 });
 

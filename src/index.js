@@ -3287,6 +3287,14 @@ async function keeperStatus() { _ensure(); return _keeper.status(); }
 /** Run one Mind pass standalone (opts.now overrides the clock — test hook). */
 async function mindTick(opts) { _ensure(); return _mind.tick(opts); }
 
+// ── the Guard (elifant#16) ────────────────────────────────────────────────
+// Permanent content floors under the promotion ladder (src/guard.js — pure,
+// deterministic, reads no config). injectDisposition is the ONE canonical
+// answer for how a memory may travel into an AI-facing context block
+// ('plain' | 'mark-third-party' | 'hold') — RELEVANCE_FLOORS-style, so every
+// shell reads the same verdict instead of re-deriving policy.
+const _guardModule = require('./guard');
+
 /** The Mind's liveness: day N, forming/hardened/retired counts, last receipt. */
 async function mindStatus() { _ensure(); return _mind.status(); }
 
@@ -3311,6 +3319,9 @@ module.exports = {
   RELEVANCE_FLOORS,
   isRelevant,
   filterRelevant,
+  // elifant#16 — inject guard: one canonical answer for how a memory may travel
+  // into an AI-facing context block ('plain' | 'mark-third-party' | 'hold')
+  injectDisposition: _guardModule.injectDisposition,
   deleteMemory,
   pruneTombstones,
   getAllMemories,
