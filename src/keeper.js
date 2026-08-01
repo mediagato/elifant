@@ -9,6 +9,9 @@
  * what it noticed, deterministically.
  *
  * WHAT A TICK DOES
+ *   0. plans its write volume (prune deletes + edge writes) and runs the
+ *      snapshot-before-bulk guard (kernel-ethic #11) BEFORE the first write —
+ *      a bulk pass always has a way back (elifant#12);
  *   1. prunes edges whose endpoints died (tombstoned / archived rows);
  *   2. drains a bounded batch of the NEIGHBOUR QUEUE — memories whose
  *      `neighbours_at` is NULL — computing each row's nearest neighbours over
@@ -78,7 +81,6 @@ const MIN_SHELF = 3;              // pairs are near-dup territory (elifant#6), n
 const QUEUE_BATCH = 50;           // bounded work per tick
 const FIRST_LIGHT_MIN_CORPUS = 8; // below this, everything is new territory — stay quiet
 const BULK_SNAPSHOT_ROWS = 100;   // kernel-ethic #11: snapshot before >100-row passes
-const SNAPSHOT_THROTTLE_MS = 24 * 60 * 60 * 1000;
 const SHELVING_VIA = 'keeper/shelving-v1';
 
 const STOPWORDS = new Set(('a an and are as at be but by for from has have i if in into is it its me my not of on or ' +
@@ -253,13 +255,19 @@ function createKeeper(ctx) {
     );
   }
 
-  // Snapshot-before-bulk (kernel-ethic #11), throttled so a busy day costs one
-  // snapshot, not one per tick. Also fires on the first pass ever: the Keeper
-  // introduces a new class of writer, and integrity comes before cleverness.
+  // Snapshot-before-bulk (kernel-ethic #11). A genuinely bulk pass — more
+  // planned writes+deletes than BULK_SNAPSHOT_ROWS — ALWAYS snapshots first:
+  // the ethic's MUST has no throttle clause. (elifant#12: the first cut here
+  // checked a 24h throttle BEFORE the size check, so any snapshot in the last
+  // day waived the guard for a pass of ANY size — a 403-row pass an hour after
+  // a snapshot ran with no safety net at all.) A small pass skips only when a
+  // guard snapshot is already on record; the first pass ever snapshots
+  // regardless of size — the Keeper introduces a new class of writer, and
+  // integrity comes before cleverness. Snapshot volume stays bounded: bulk
+  // passes only happen while a real backlog drains, and retention
+  // (recent/daily/weekly tiers + hard cap) reaps the churn.
   async function _maybeSnapshot(plannedRows) {
     const last = await _meta('keeper_last_snapshot');
-    const due = !last || (Date.parse(ts()) - Date.parse(last)) > SNAPSHOT_THROTTLE_MS;
-    if (!due) return false;
     if (last && plannedRows <= BULK_SNAPSHOT_ROWS) return false;
     await snapshot('keeper pass (pre-write guard)', { trigger: 'keeper' });
     await _setMeta('keeper_last_snapshot', ts());
@@ -288,6 +296,20 @@ function createKeeper(ctx) {
         SELECT 1 FROM memories m WHERE m.filename = e.b_filename AND ${sourceWhere('m')}
       )`);
     return r.affectedRows || 0;
+  }
+
+  // How many edges would _pruneDeadEdges delete right now? Same predicate as
+  // the DELETE, read first so the snapshot guard can count the prune against
+  // the tick's planned write volume BEFORE anything is removed (elifant#12:
+  // the prune used to run ahead of the guard — unbounded, unguarded).
+  async function _countDeadEdges() {
+    const r = await query(`
+      SELECT count(*)::int AS n FROM memory_edges e WHERE NOT EXISTS (
+        SELECT 1 FROM memories m WHERE m.filename = e.a_filename AND ${sourceWhere('m')}
+      ) OR NOT EXISTS (
+        SELECT 1 FROM memories m WHERE m.filename = e.b_filename AND ${sourceWhere('m')}
+      )`);
+    return r.rows[0].n;
   }
 
   // Compute + persist one memory's neighbours. Returns its first-light verdict.
@@ -356,12 +378,19 @@ function createKeeper(ctx) {
     const now = ts();
     const receipt = { at: now, processed: 0, firstLights: 0, shelvesWritten: 0, shelvesArchived: 0, thoughts: 0, prunedEdges: 0, snapshotTaken: false };
 
-    receipt.prunedEdges = await _pruneDeadEdges();
-
+    // Plan the tick's write volume and run the snapshot guard BEFORE the first
+    // write (elifant#12). Two holes lived here: the prune ran ahead of the
+    // guard (unbounded deletes, unguarded), and an empty queue skipped the
+    // guard entirely even though pruning/shelving/archiving still write in the
+    // same tick. plannedRows = the prune's deletes (exact count, same
+    // predicate as the DELETE) + the queue's edge writes (upper bound: K per
+    // row) + a token for the shelf rewrites. The Mind's promotion pass rides
+    // this same guard (its write volume is O(shelves) — see mind.js header).
     const queue = await _neighbourQueue(batch);
-    if (queue.length) {
-      receipt.snapshotTaken = await _maybeSnapshot(queue.length * NEIGHBOUR_K + MIN_SHELF);
-    }
+    const deadEdges = await _countDeadEdges();
+    receipt.snapshotTaken = await _maybeSnapshot(deadEdges + queue.length * NEIGHBOUR_K + MIN_SHELF);
+
+    receipt.prunedEdges = await _pruneDeadEdges();
 
     const corpus = await _corpusCount();
     for (const row of queue) {
