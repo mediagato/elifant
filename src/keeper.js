@@ -44,6 +44,10 @@
  *     keyholder still shelves (a shelf is a receipted OBSERVATION) but its
  *     content carries the third-party mark, so the Mind never hardens it into
  *     a verdict and inject surfaces never re-voice it (elifant#16, guard.js).
+ *   - shelve crisis-lexicon content, EVER: a memory that matches the crisis
+ *     lexicon never blends into any derived row (elifant#17's shelving
+ *     override, guard.js) — it stays a plain, recallable memory and the
+ *     librarian says nothing about it.
  *   - modify a source row's content, tier, or causal history. Sources gain
  *     only `neighbours_at` (derived bookkeeping, unstamped — the same class
  *     of write as setMemoryEmbedding). Shelves are NEW rows; nothing is ever
@@ -67,7 +71,7 @@
  */
 'use strict';
 
-const { thirdPartyCluster, THIRD_PARTY_MARK } = require('./guard');
+const { thirdPartyCluster, crisisMatch, THIRD_PARTY_MARK } = require('./guard');
 
 // Tunables. Distances are pgvector cosine distances (smaller = more similar).
 // EDGE_KEEP reuses the kernel's loose RECALL floor (the graph remembers weak
@@ -438,9 +442,20 @@ function createKeeper(ctx) {
     let corpusRows = null;
 
     for (let ci = 0; ci < clusters.length; ci++) {
-      const cluster = clusters[ci];
-      const details = await _memberDetails(cluster);
-      if (details.length < MIN_SHELF) continue;
+      const rawCluster = clusters[ci];
+      const allDetails = await _memberDetails(rawCluster);
+      // elifant#17: crisis-lexicon content NEVER blends into a derived row —
+      // the shelving override. Filtered before the size gate, so a cluster
+      // carried by crisis content simply never shelves; if the filter drops a
+      // previously-claimed shelf below the minimum, release the claim so the
+      // end-of-tick sweep archives it instead of leaving its old content live.
+      const details = allDetails.filter((d) => !crisisMatch(d.content));
+      const cluster = details.map((d) => d.filename);
+      if (details.length < MIN_SHELF) {
+        const claimed = clusterMatched.get(ci);
+        if (claimed) shelfTaken.delete(claimed);
+        continue;
+      }
       if (corpusRows == null) {
         corpusRows = (await query(
           `SELECT filename, content FROM memories WHERE embedding IS NOT NULL AND ${SOURCE_WHERE}

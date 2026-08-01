@@ -558,6 +558,109 @@ test('#16: a keyholder\'s own first-person pattern still promotes — the guard 
   await brain.close();
 });
 
+// ── elifant#17: crisis lexicon + permanent domain denylist ──────────────────
+
+test('#17 acceptance: health/grief/finance corpora that clear every gate produce ZERO knowledge', async () => {
+  await freshBrain();
+  const T = Date.now();
+  // Three clusters, one per denylisted domain — each tier-1, n=5, 9 days old,
+  // fresh: every one clears every promotion gate on the numbers.
+  const corpora = {
+    health: [
+      'the new medication dose is 20mg every morning',
+      'therapist moved the session to thursdays',
+      'blood pressure was high again at the checkup',
+      'the specialist wants another biopsy before deciding',
+      'sleep is wrecked, the insomnia is back every night',
+    ],
+    grief: [
+      'the funeral is on saturday at ten',
+      'mom passed away two years ago this week',
+      'grief hits hardest in the evenings lately',
+      'picked up the death certificate copies today',
+      'the memorial service playlist still needs songs',
+    ],
+    finance: [
+      'the credit card balance went up again this month',
+      'still trying to afford the january rent',
+      'the loan officer wants two more pay stubs',
+      'payday is the 15th and the bills land on the 12th',
+      'the overdraft fee hit twice this week',
+    ],
+  };
+  let axis = 40;
+  for (const [domain, notes] of Object.entries(corpora)) {
+    for (let i = 0; i < notes.length; i++) {
+      const fn = `${domain}-${i}.md`;
+      await brain.setMemory(fn, notes[i], 'test', 'instance', nearVec(axis, axis + 1 + i));
+      await backdate(fn, T - (4 - i) * 2.25 * DAY);
+    }
+    axis += 10;
+  }
+  const r = await brain.keeperTick({ mind: { now: iso(T) } });
+  assert.equal(r.mind.upserted, 3, 'three clusters, three tracked patterns');
+  assert.equal(r.mind.promoted, 0, 'zero promoted knowledge in denylisted domains');
+  assert.equal(r.mind.guarded, 3, 'all three held by the domain floor');
+
+  // The floor is PERMANENT: zeroed gates and plausible bypass flags change nothing.
+  const r2 = await brain.mindTick({
+    now: iso(T + 60000), promoteConf: 0, promoteN: 0, promoteAgeH: 0,
+    guard: false, denylist: [], crisisLexicon: [],
+  });
+  assert.equal(r2.promoted, 0, 'no dial reaches the floor');
+  assert.equal(r2.guarded, 3);
+  assert.equal((await brain._internal.query(
+    `SELECT count(*)::int AS n FROM memories WHERE synthesized_via = $1`, [mind.MIND_VIA])).rows[0].n, 0,
+    'zero knowledge rows across all three domains');
+
+  // Each refusal narrated once, naming its domain — then quiet.
+  const guards = await brain.getCaptures({ source: 'mind', type: 'guard' });
+  assert.equal(guards.length, 3);
+  const reasons = guards.map((g) => g.data.guard).sort();
+  assert.deepEqual(reasons, ['domain:finance', 'domain:grief', 'domain:health']);
+  await brain.close();
+});
+
+test('#17: crisis content never shelves, never patterns — and a hand-built crisis shelf still cannot promote', async () => {
+  await freshBrain();
+  const T = Date.now();
+  const dark = [
+    'i keep thinking about ending my life',
+    'wrote about wanting to hurt myself again tonight',
+    'the suicidal thoughts were loud all day',
+    'searched for overdose amounts, scared myself',
+    'i do not want to be alive this week',
+  ];
+  for (let i = 0; i < dark.length; i++) {
+    const fn = `dark-${i}.md`;
+    await brain.setMemory(fn, dark[i], 'test', 'instance', nearVec(70, 71 + i));
+    await backdate(fn, T - (4 - i) * 2.25 * DAY);
+  }
+  const r = await brain.keeperTick({ mind: { now: iso(T) } });
+  assert.equal(r.shelvesWritten, 0, 'crisis content never blends into a derived row — the shelving override');
+  assert.equal(r.mind.upserted, 0, 'no shelf, no pattern, no ladder');
+  assert.equal((await brain._internal.query(
+    'SELECT count(*)::int AS n FROM memories WHERE synthesized_via IS NOT NULL')).rows[0].n, 0,
+    'zero derived rows of any kind');
+  // The raw memories themselves are untouched — recallable, never held from
+  // the keyholder's own explicit access.
+  const raw = await brain.getMemory('dark-0.md');
+  assert.ok(raw && raw.content.includes('ending my life'), 'the keyholder keeps their own words');
+  // ...but they can never travel into an injected context block.
+  assert.equal(brain.injectDisposition({ content: raw.content, trust_tier: raw.trust_tier }), 'hold');
+
+  // Belt and braces: even a shelf hand-built around crisis content (bypassing
+  // the keeper) never promotes, and the hold is SILENT — no guard capture
+  // narrates a person's darkest sentence back at them.
+  await seedShelf('shelf/dark.md', ['sd-0.md', 'sd-1.md', 'sd-2.md', 'sd-3.md', 'sd-4.md'], 'ending my life', T);
+  const r2 = await brain.mindTick({ now: iso(T) });
+  assert.equal(r2.promoted, 0, 'a crisis pattern never hardens');
+  assert.ok(r2.guarded >= 1, 'held by the crisis floor');
+  assert.equal((await brain.getCaptures({ source: 'mind' })).length, 0,
+    'NO mind capture of any stage — a crisis hold is tracked, never narrated');
+  await brain.close();
+});
+
 test('mindTick(null) and keeperTick({mind:null}) both opt out cleanly — no crash at any entry point', async () => {
   await freshBrain();
   const T = Date.now();

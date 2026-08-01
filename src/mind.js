@@ -36,9 +36,12 @@
  *                   'mind/promotion-v1', receipt history in the row itself)
  *                   + a `knowledge` capture — UNLESS the Guard holds it:
  *                   a pattern whose evidence is about a person who is not
- *                   the keyholder (elifant#16; guard.js) NEVER promotes, at
- *                   any confidence/n/age, under any per-tick option. The
- *                   refusal is visible once (a `guard` capture), then quiet;
+ *                   the keyholder (elifant#16), majority-touches a denylisted
+ *                   domain (health/grief/finance), or contains any crisis-
+ *                   lexicon match (elifant#17) NEVER promotes, at any
+ *                   confidence/n/age, under any per-tick option. The refusal
+ *                   is visible once (a `guard` capture), then quiet — except
+ *                   a crisis hold, which is never narrated at all;
  *        hardened + conf < 0.4                           -> REVISE (visible,
  *                   once per softening) + a `revision` capture;
  *        hardened + conf < 0.2                           -> RETIRE (visible;
@@ -430,8 +433,12 @@ function createMind(ctx) {
           ex.softenedAt = null;
           ex.confidence = confidence({ n: c.n, last: c.last }, nowMs, cfg);
           receipt.revived++;
-          await _emit('pattern', _event(ex, 'pattern',
-            `this is forming again: ${ex.themeLabel} — ${ex.signal.evidenceSummary}`, nowIso));
+          // Crisis-guarded evidence is tracked but never narrated (elifant#17)
+          // — echoing it into a feed is its own harm.
+          if (ex.guard !== 'crisis') {
+            await _emit('pattern', _event(ex, 'pattern',
+              `this is forming again: ${ex.themeLabel} — ${ex.signal.evidenceSummary}`, nowIso));
+          }
         }
       } else {
         const p = {
@@ -444,8 +451,15 @@ function createMind(ctx) {
         };
         patterns.set(p.id, p);
         receipt.upserted++;
-        await _emit('pattern', _event(p, 'pattern',
-          `a pattern is forming around ${p.themeLabel} — ${p.signal.evidenceSummary}`, nowIso));
+        // Crisis-guarded evidence is tracked (auditable in the ledger and the
+        // `guarded` count) but never narrated (elifant#17): the normal path
+        // never gets here — the Keeper's shelving override means no crisis
+        // shelf exists — but a hand-built or imported shelf must not have its
+        // darkest line echoed back as a cheery "a pattern is forming" capture.
+        if (p.guard !== 'crisis') {
+          await _emit('pattern', _event(p, 'pattern',
+            `a pattern is forming around ${p.themeLabel} — ${p.signal.evidenceSummary}`, nowIso));
+        }
       }
     }
 
@@ -462,8 +476,8 @@ function createMind(ctx) {
     // 3. transitions + persist.
     for (const p of patterns.values()) {
       if (promotable(p, nowMs, cfg)) {
-        // The Guard (elifant#16) — the permanent WHAT-ABOUT floor under the
-        // ladder. Deliberately NOT cfg-driven: no per-tick option, shell
+        // The Guard (elifant#16/#17) — the permanent WHAT-ABOUT floor under
+        // the ladder. Deliberately NOT cfg-driven: no per-tick option, shell
         // setting, or keyholder dial reaches it (#14's "non-negotiable
         // regardless of dials"). A pattern whose shelf was live this tick
         // carries a fresh verdict from _candidates(); a dissolved-shelf or

@@ -541,8 +541,9 @@ export function isRelevant(hit: { distance?: number } | null | undefined, tier?:
 export function filterRelevant<T extends { distance?: number }>(hits: T[] | null | undefined, tier?: RelevanceTier): T[];
 
 /**
- * How a memory may travel into an AI-facing context block (elifant#16):
- *   - 'hold': never inject — a synthesized (tier-2) row about a third party;
+ * How a memory may travel into an AI-facing context block (elifant#16/#17):
+ *   - 'hold': never inject — crisis-lexicon content at any tier (#17), or a
+ *     synthesized (tier-2) row about a third party (#16);
  *   - 'mark-third-party': inject ONLY wrapped/marked as the keyholder's own
  *     past words about someone who is not them — never established fact;
  *   - 'plain': no constraint from this guard (tier-3 wrapping / tier-4 holding
@@ -954,8 +955,9 @@ export interface MindTickReceipt {
   /** Fizzled forming patterns culled from the ledger (quiet — never narrated). */
   culled: number;
   /** Otherwise-promotable patterns refused by the permanent content floor
-   *  (elifant#16 third-party guard). Each refusal is narrated once via a
-   *  `guard` capture, then quiet. */
+   *  (elifant#16 third-party guard; elifant#17 domain denylist + crisis).
+   *  A third-party/domain refusal is narrated once via a `guard` capture,
+   *  then quiet; a crisis hold is never narrated at all. */
   guarded: number;
   forming: number;
   hardened: number;

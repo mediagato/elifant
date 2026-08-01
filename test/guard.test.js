@@ -132,6 +132,70 @@ test('injectDisposition: clean content is unconstrained', () => {
   assert.equal(guard.injectDisposition({}), 'plain');
 });
 
+// ── elifant#17: domain denylist + crisis lexicon ────────────────────────────
+
+test('domainMatch: health / grief / finance are caught whole-word; adjacent words are not', () => {
+  assert.equal(guard.domainMatch('the new medication dose is 20mg'), 'health');
+  assert.equal(guard.domainMatch('blood pressure was high at the checkup'), 'health');
+  assert.equal(guard.domainMatch('the funeral is on saturday'), 'grief');
+  assert.equal(guard.domainMatch('mom passed away two years ago'), 'grief');
+  assert.equal(guard.domainMatch('the credit card balance went up again'), 'finance');
+  assert.equal(guard.domainMatch('still trying to afford the january rent'), 'finance');
+  assert.equal(guard.domainMatch('the garden tomatoes are ripening'), null);
+  assert.equal(guard.domainMatch('work note about the quarterly report'), null, 'ordinary work talk is not finance');
+  assert.equal(guard.domainMatch('the debtor documentation chapter'), null, 'word boundaries: debt != debtor');
+  assert.equal(guard.domainMatch('a pain to configure, the build broke again'), null,
+    'generic pain/broke are deliberately not in the lexicons');
+});
+
+test('crisisMatch: phrases match across apostrophe forms and case; near-misses stay clean', () => {
+  assert.equal(guard.crisisMatch('I keep thinking about ending my life'), true);
+  assert.equal(guard.crisisMatch("i don’t want to be alive this week"), true, 'curly apostrophe normalizes');
+  assert.equal(guard.crisisMatch('searched for overdose amounts'), true);
+  assert.equal(guard.crisisMatch('the suicidal thoughts were loud today'), true);
+  assert.equal(guard.crisisMatch('this deadline is killing me'), false, 'idiom, not crisis');
+  assert.equal(guard.crisisMatch("can't go on vacation until june"), false);
+  assert.equal(guard.crisisMatch(''), false);
+});
+
+test('promotionGuard: crisis beats domain beats third-party; majority rule holds for domains', () => {
+  assert.equal(guard.promotionGuard([
+    'the therapist upped my medication',
+    'i keep thinking about ending my life',
+    'slept badly again',
+  ]), 'crisis', 'ANY crisis member takes the whole cluster — no majority needed');
+  assert.equal(guard.promotionGuard([
+    'the therapist moved my session',
+    'new medication dose started today',
+    'the doctor wants bloodwork',
+    'watered the garden',
+    'refilled the bird feeder',
+  ]), 'domain:health', '3 of 5 health clears the majority');
+  assert.equal(guard.promotionGuard([
+    'planted flowers after chemo on tuesday',
+    'the garden tomatoes are ripening',
+    'turned the compost pile',
+    'garden fence post is rotting',
+    'ordered spring seeds',
+  ]), null, 'one chemo mention does not strip the garden of its ladder');
+  assert.equal(guard.promotionGuard([
+    'she moved my appointment with the doctor',
+    'her office called about the prescription',
+    'the doctor ordered more tests for me',
+  ]), 'domain:health', 'when both fire, the domain floor names the reason');
+});
+
+test('injectDisposition: crisis content is held at every tier — never injected', () => {
+  assert.equal(guard.injectDisposition({ content: 'i keep thinking about ending my life', trust_tier: 'tier-1-keyholder-direct' }), 'hold');
+  assert.equal(guard.injectDisposition({ content: 'notes mention self-harm again', trust_tier: 'tier-2-synthesized' }), 'hold');
+  assert.equal(guard.injectDisposition({ content: 'wrote about wanting to hurt myself' }), 'hold');
+});
+
+test('injectDisposition: denylisted-DOMAIN content still injects plainly — the floor is about promotion', () => {
+  assert.equal(guard.injectDisposition({ content: 'the new medication dose is 20mg', trust_tier: 'tier-1-keyholder-direct' }), 'plain',
+    "hiding the keyholder's own health note from their own conversation is a different (wrong) product");
+});
+
 test('THIRD_PARTY_MARK is the exact line the keeper renders and the mind/surfaces parse', () => {
   assert.match(guard.THIRD_PARTY_MARK, /^about: a third party/);
   const keeper = require('../src/keeper.js');
