@@ -475,6 +475,89 @@ test('revision and retirement carry the knowledge row\'s embedding forward, neve
   await brain.close();
 });
 
+// ── elifant#16: the third-party inference guard ─────────────────────────────
+
+test('#16 acceptance: a grievance corpus shelves as observations and promotes ZERO verdicts', async () => {
+  await freshBrain();
+  const T = Date.now();
+  // Five keyholder-authored vents about a coworker — tier-1, backdated 9 days,
+  // n=5, fresh: this corpus clears EVERY promotion gate. Before the guard it
+  // hardened into pinned knowledge exactly like a garden.
+  const gripes = [
+    'Dave was late to standup again and the whole morning slipped',
+    'Dave shipped the broken build again, he never runs the tests',
+    'so tired of covering for Dave, he is impossible to plan around',
+    'Dave talked over me for the entire retro meeting',
+    'another Dave morning, he left the build red and went home',
+  ];
+  for (let i = 0; i < gripes.length; i++) {
+    const fn = `gripe-${i}.md`;
+    await brain.setMemory(fn, gripes[i], 'test', 'instance', nearVec(30, 31 + i));
+    await backdate(fn, T - (4 - i) * 2.25 * DAY);
+  }
+
+  const r = await brain.keeperTick({ mind: { now: iso(T) } });
+  // Observations still shelve — structure is allowed, verdicts are not.
+  assert.equal(r.shelvesWritten, 1, 'the grievance cluster still shelves (an observation, receipted)');
+  assert.equal(r.mind.upserted, 1, 'the pattern is seen and tracked');
+  assert.equal(r.mind.promoted, 0, 'zero promoted verdicts about a third party');
+  assert.equal(r.mind.guarded, 1, 'the guard is what held it — not the thresholds');
+
+  // The shelf carries the third-party mark, machine-readably, in its content.
+  const shelf = (await brain._internal.query(
+    "SELECT content FROM memories WHERE synthesized_via = 'keeper/shelving-v1'")).rows[0];
+  assert.match(shelf.content, /^about: a third party/m, 'the shelf says who it is about');
+  assert.equal(brain.injectDisposition({ content: shelf.content, trust_tier: 'tier-2-synthesized' }), 'hold',
+    'the marked shelf can never travel into an injected context block');
+
+  // The floor is PERMANENT: gates zeroed out AND a plausible "guard off" flag
+  // must change nothing (nothing reads cfg in the guard, by construction).
+  const r2 = await brain.mindTick({ now: iso(T + 60000), promoteConf: 0, promoteN: 0, promoteAgeH: 0, guard: false });
+  assert.equal(r2.promoted, 0, 'no dial reaches the floor');
+  assert.equal(r2.guarded, 1);
+  const know = (await brain._internal.query(
+    `SELECT 1 FROM memories WHERE synthesized_via = $1`, [mind.MIND_VIA])).rows;
+  assert.equal(know.length, 0, 'zero knowledge rows, ever');
+
+  // The refusal is visible ONCE (K-CARBON-4: no silent ladder decisions), then quiet.
+  const guards = await brain.getCaptures({ source: 'mind', type: 'guard' });
+  assert.equal(guards.length, 1, 'one visible guard receipt, not a nag');
+  assert.match(guards[0].data.text, /someone who isn't you/);
+  assert.equal(guards[0].data.guard, 'third-party');
+  await brain.mindTick({ now: iso(T + HOUR) });
+  assert.equal((await brain.getCaptures({ source: 'mind', type: 'guard' })).length, 1, 'announced once');
+
+  // Recall for the keyholder's own use is untouched: the raw memories are
+  // live, unarchived, and readable by name — the guard gates INJECTION and
+  // PROMOTION, never the keyholder's access to their own words.
+  const raw = await brain.getMemory('gripe-2.md');
+  assert.ok(raw && /covering for Dave/.test(raw.content), 'the keyholder keeps their own words');
+  await brain.close();
+});
+
+test('#16: a keyholder\'s own first-person pattern still promotes — the guard reads subjects, not sentiment', async () => {
+  await freshBrain();
+  const T = Date.now();
+  // Self-directed and even self-critical — but about the KEYHOLDER, so the
+  // ladder must work exactly as before (the control for the guard).
+  const notes = [
+    'i was late to standup again this morning, third time',
+    'i keep skipping the standup prep and it shows',
+    'late again today, i need a standing alarm for standup',
+    'i promised the team i would fix my standup timing',
+    'made it to standup on time once this week, i have to do better',
+  ];
+  for (let i = 0; i < notes.length; i++) {
+    const fn = `self-${i}.md`;
+    await brain.setMemory(fn, notes[i], 'test', 'instance', nearVec(80, 81 + i));
+    await backdate(fn, T - (4 - i) * 2.25 * DAY);
+  }
+  const r = await brain.keeperTick({ mind: { now: iso(T) } });
+  assert.equal(r.mind.guarded, 0, 'no third-party signal — the guard stays out of the way');
+  assert.equal(r.mind.promoted, 1, 'the keyholder\'s own pattern climbs exactly as before');
+  await brain.close();
+});
+
 test('mindTick(null) and keeperTick({mind:null}) both opt out cleanly — no crash at any entry point', async () => {
   await freshBrain();
   const T = Date.now();

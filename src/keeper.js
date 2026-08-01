@@ -38,7 +38,12 @@
  * WHAT IT WILL NEVER DO
  *   - touch a model. The noticing is arithmetic and counting; every word of a
  *     thought is assembled from ledger facts. (INV: no require of anything
- *     beyond what index.js hands in.)
+ *     beyond what index.js hands in — kernel-sibling pure modules (./guard)
+ *     excepted; still zero externals, zero models.)
+ *   - hide who a shelf is about: a cluster about a person who is not the
+ *     keyholder still shelves (a shelf is a receipted OBSERVATION) but its
+ *     content carries the third-party mark, so the Mind never hardens it into
+ *     a verdict and inject surfaces never re-voice it (elifant#16, guard.js).
  *   - modify a source row's content, tier, or causal history. Sources gain
  *     only `neighbours_at` (derived bookkeeping, unstamped — the same class
  *     of write as setMemoryEmbedding). Shelves are NEW rows; nothing is ever
@@ -61,6 +66,8 @@
  * tag, per its own contract.
  */
 'use strict';
+
+const { thirdPartyCluster, THIRD_PARTY_MARK } = require('./guard');
 
 // Tunables. Distances are pgvector cosine distances (smaller = more similar).
 // EDGE_KEEP reuses the kernel's loose RECALL floor (the graph remembers weak
@@ -152,13 +159,17 @@ function meanVector(vectors) {
 
 // Shelf content — the receipt IS the content. One writer, one format; the
 // member lines are the durable membership record the next tick diffs against.
-function renderShelf(members /* [{filename, day}] */, thread) {
+// A third-party cluster's shelf says so in its own content (elifant#16): the
+// mark is visible to the keyholder, parseable by the Mind and every inject
+// surface, and it travels with the row through YOINK/SUMMON.
+function renderShelf(members /* [{filename, day}] */, thread, { thirdParty = false } = {}) {
   const head = `# on this shelf: ${members.length} memories`;
   const threadLine = thread.length ? `\ncommon thread: ${thread.join(', ')}\n` : '';
+  const markLine = thirdParty ? `${THIRD_PARTY_MARK}\n` : '';
   const lines = members.map((m) => `- ${m.filename} (${m.day})`).join('\n');
   const foot = '_shelved by the keeper. every line above re-derives from the memories it names; ' +
     'the sources are untouched and this shelf can be archived without losing any of them._';
-  return `${head}\n${threadLine}\n${lines}\n\n${foot}\n`;
+  return `${head}\n${threadLine}${markLine}\n${lines}\n\n${foot}\n`;
 }
 
 function parseMembers(content) {
@@ -437,9 +448,15 @@ function createKeeper(ctx) {
       }
       const inCluster = new Set(cluster);
       const outside = corpusRows.filter((r) => !inCluster.has(r.filename)).map((r) => r.content);
-      const thread = commonThread(details.map((d) => d.content), outside);
+      const memberContents = details.map((d) => d.content);
+      const thread = commonThread(memberContents, outside);
+      // elifant#16: a cluster about a person who is not the keyholder still
+      // shelves — a shelf is a receipted observation — but the shelf SAYS SO,
+      // machine-readably, so the Mind never promotes it and inject surfaces
+      // never re-voice it. Detection is guard.js's cluster-level pass.
+      const thirdParty = thirdPartyCluster(memberContents);
       const members = details.map((d) => ({ filename: d.filename, day: String(d.updated_at).slice(0, 10) }));
-      const content = renderShelf(members, thread);
+      const content = renderShelf(members, thread, { thirdParty });
 
       let target = clusterMatched.get(ci);
       let existing = target ? shelfByName.get(target) : null;
