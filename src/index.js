@@ -824,6 +824,56 @@ async function setMemoryArchive(filename, archived) {
   );
 }
 
+// elifant#6 follow-up — the keyholder's own resolution of a near-dup Bell ask:
+// "yes, these two say the same thing." Writes ONE new tier-2-synthesized row
+// naming both members (synthesized_via CONFIRMED_DUP_VIA, distinct from the
+// Keeper's own auto-detection tag) so the Mind's evidence-weight override
+// (src/mind.js's CONFIRMED_VIA branch) can treat a direct vouch as complete
+// evidence instead of waiting on statistical recurrence. Sources are NEVER
+// touched (K-CARBON-4) — both originals stay fully recoverable regardless of
+// whatever happens to this row afterward.
+//
+// This is a general "declare these two the same fact" primitive, not coupled
+// to any shell's Bell/needs-decision convention — the kernel doesn't know
+// what asked the question, only that the keyholder answered it.
+const CONFIRMED_DUP_VIA = 'keeper/confirmed-dup-v1'; // kept in sync by hand with mind.js's CONFIRMED_VIA
+async function confirmDuplicate(aFilename, bFilename) {
+  _ensure();
+  if (!aFilename || !bFilename || typeof aFilename !== 'string' || typeof bFilename !== 'string' || aFilename === bFilename) {
+    throw new Error('confirmDuplicate: two distinct filenames (string) required');
+  }
+  const rows = (await _db.query(
+    `SELECT filename, content, updated_at, embedding::text AS vec FROM memories
+     WHERE filename = ANY($1::text[]) AND deleted_at IS NULL AND archived = false
+       AND synthesized_via IS NULL AND trust_tier = $2`,
+    [[aFilename, bFilename], TRUST_TIER.KEYHOLDER_DIRECT]
+  )).rows;
+  const byName = new Map(rows.map((r) => [r.filename, r]));
+  const a = byName.get(aFilename);
+  const b = byName.get(bFilename);
+  if (!a || !b) {
+    throw new Error('confirmDuplicate: both memories must be live, tier-1 (keyholder-direct) rows');
+  }
+  // elifant#17: the same shelving override applies here — crisis-lexicon
+  // content is refused outright, never even written as an observation.
+  if (_guardModule.crisisMatch(a.content) || _guardModule.crisisMatch(b.content)) {
+    throw new Error('confirmDuplicate: refused — crisis-lexicon content never becomes a derived row');
+  }
+  const thirdParty = _guardModule.thirdPartyCluster([a.content, b.content]);
+  const members = [a, b].map((r) => ({ filename: r.filename, day: String(r.updated_at).slice(0, 10) }));
+  const content = _keeperModule.renderConfirmedDup(members, { thirdParty });
+  let vec = null;
+  if (a.vec && b.vec) {
+    vec = _keeperModule.meanVector([_keeperModule.parseVec(a.vec), _keeperModule.parseVec(b.vec)]);
+  }
+  const target = _keeperModule.confirmedDupSlug(aFilename, bFilename);
+  await _setMemoryDerived(target, content, {
+    updatedBy: 'keyholder-confirmed', layer: 'instance', embedding: vec,
+    trustTier: TRUST_TIER.SYNTHESIZED, synthesizedVia: CONFIRMED_DUP_VIA,
+  });
+  return { filename: target };
+}
+
 // ── Hybrid reranking helpers (additive; only engaged when queryText is given) ──
 // The Nose produces a Scent (embedding); cosine over Scents is the base signal.
 // When a consumer also passes the raw query TEXT, searchMemories fuses three
@@ -3328,6 +3378,8 @@ module.exports = {
   // v0.6.0 — memory curation (pin + archive)
   setMemoryPin,
   setMemoryArchive,
+  // elifant#6 follow-up — a keyholder's own "yes these are the same fact"
+  confirmDuplicate,
   // v0.5.0-dev — captures (event stream / projection sink)
   addCapture,
   getCaptures,

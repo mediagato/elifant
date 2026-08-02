@@ -594,6 +594,17 @@ export function setMemoryPin(filename: string, pinned: boolean): Promise<void>;
 export function setMemoryArchive(filename: string, archived: boolean): Promise<void>;
 
 /**
+ * elifant#6 follow-up — the keyholder's own "yes, these two say the same
+ * fact" (typically wired to a shell's near-dup Bell resolution). Writes ONE
+ * new tier-2-synthesized row naming both members; sources are never touched.
+ * Feeds the Mind's promotion ladder at full evidence weight (a direct vouch
+ * doesn't need to wait for statistical recurrence) — the Guard (#16/#17) and
+ * the age floor still apply unconditionally.
+ * @throws if either filename is missing, not a live tier-1 row, or crisis-lexicon content
+ */
+export function confirmDuplicate(aFilename: string, bFilename: string): Promise<{ filename: string }>;
+
+/**
  * Soft-delete a memory by filename: a tombstone (deleted_at + version-vector bump)
  * so the delete propagates on sync instead of being resurrected. Filtered from every
  * read. No-op if absent or already a tombstone.

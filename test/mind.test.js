@@ -672,3 +672,112 @@ test('mindTick(null) and keeperTick({mind:null}) both opt out cleanly — no cra
   assert.equal(r2.mind, null, 'still opts out cleanly through the keeperTick wrapper too');
   await brain.close();
 });
+
+// ── elifant#6 follow-up: confirmDuplicate() — a keyholder's vouch counts as
+// full promotion evidence, not raw member count ────────────────────────────
+
+test('a keyholder-confirmed pair promotes at n=2 — an auto-shelf pair never could', async () => {
+  await freshBrain();
+  const T = Date.now();
+  await brain.setMemory('rent-a.md', 'rent goes up to 1850 starting next month', 'test', 'instance', nearVec(150, 1));
+  await brain.setMemory('rent-b.md', 'starting next month rent is 1850', 'test', 'instance', nearVec(150, 2));
+  await backdate('rent-a.md', T - 9 * DAY);
+  await backdate('rent-b.md', T - 2 * DAY); // born = the OLDER of the two, same rule as a shelf
+
+  const { filename } = await brain.confirmDuplicate('rent-a.md', 'rent-b.md');
+  assert.ok(filename.startsWith('confirmed/'), filename);
+
+  const r = await brain.mindTick({ now: iso(T) });
+  assert.equal(r.upserted, 1);
+  assert.equal(r.promoted, 1, 'a direct vouch clears promoteN even though n=2 < 5');
+
+  const know = (await brain._internal.query(
+    `SELECT content, trust_tier, pinned FROM memories WHERE synthesized_via = $1`, [mind.MIND_VIA]
+  )).rows;
+  assert.equal(know.length, 1);
+  assert.equal(know[0].pinned, true);
+  assert.match(know[0].content, /you confirmed/);
+
+  // Sources: still exactly two, still untouched, still tier-1.
+  const sources = (await brain._internal.query(
+    "SELECT filename, synthesized_via, trust_tier FROM memories WHERE filename IN ('rent-a.md','rent-b.md')"
+  )).rows;
+  assert.equal(sources.length, 2);
+  assert.ok(sources.every((s) => s.synthesized_via === null && s.trust_tier === 'tier-1-keyholder-direct'));
+  await brain.close();
+});
+
+test('confirmDuplicate: fresh (same-day) memories still fail the 24h age floor — no snap-decision shortcut', async () => {
+  await freshBrain();
+  const T = Date.now();
+  await brain.setMemory('fresh-a.md', 'the wifi password is on the fridge', 'test', 'instance', nearVec(151, 1));
+  await brain.setMemory('fresh-b.md', 'the fridge has the wifi password on it', 'test', 'instance', nearVec(151, 2));
+  // No backdate — both are ~now, so age is ~0h regardless of the confirmation.
+  await brain.confirmDuplicate('fresh-a.md', 'fresh-b.md');
+  const r = await brain.mindTick({ now: iso(T) });
+  assert.equal(r.promoted, 0, 'the vouch skips the recurrence requirement, not the cooling-off period');
+  assert.equal(r.upserted, 1, 'it is still tracked, just forming');
+  await brain.close();
+});
+
+test('confirmDuplicate: refuses crisis-lexicon content outright — never even an observation', async () => {
+  await freshBrain();
+  await brain.setMemory('dark-a.md', 'been thinking about suicide again', 'test', 'instance', nearVec(152, 1));
+  await brain.setMemory('dark-b.md', 'still thinking about suicide', 'test', 'instance', nearVec(152, 2));
+  await assert.rejects(
+    () => brain.confirmDuplicate('dark-a.md', 'dark-b.md'),
+    /crisis-lexicon/
+  );
+  assert.equal((await brain._internal.query(
+    "SELECT count(*)::int AS n FROM memories WHERE synthesized_via IS NOT NULL")).rows[0].n, 0,
+    'no derived row was written');
+  await brain.close();
+});
+
+test('confirmDuplicate: refuses a filename that is not a live tier-1 row', async () => {
+  await freshBrain();
+  await brain.setMemory('solo.md', 'a lone memory', 'test', 'instance', nearVec(153, 1));
+  await assert.rejects(() => brain.confirmDuplicate('solo.md', 'nonexistent.md'), /live, tier-1/);
+  await brain.deleteMemory('solo.md');
+  await brain.setMemory('solo2.md', 'another lone memory', 'test', 'instance', nearVec(153, 2));
+  await assert.rejects(() => brain.confirmDuplicate('solo.md', 'solo2.md'), /live, tier-1/,
+    'a tombstoned filename is not eligible either');
+  await brain.close();
+});
+
+test('#16/#17 still apply to a confirmed pair: your vouch does not bypass the Guard, only the recurrence gate', async () => {
+  await freshBrain();
+  const T = Date.now();
+  await brain.setMemory('debt-a.md', 'still paying off the credit card debt', 'test', 'instance', nearVec(154, 1));
+  await brain.setMemory('debt-b.md', 'the credit card debt is still not paid off', 'test', 'instance', nearVec(154, 2));
+  await backdate('debt-a.md', T - 9 * DAY);
+  await backdate('debt-b.md', T - 2 * DAY);
+  await brain.confirmDuplicate('debt-a.md', 'debt-b.md');
+
+  const r = await brain.mindTick({ now: iso(T) });
+  assert.equal(r.promoted, 0, 'finance-domain content never hardens, confirmed or not');
+  assert.ok(r.guarded >= 1);
+  await brain.close();
+});
+
+test('a confirmed pattern decays honestly when one confirmed member is deleted', async () => {
+  await freshBrain();
+  const T = Date.now();
+  await brain.setMemory('note-a.md', 'the garage code is 4471', 'test', 'instance', nearVec(155, 1));
+  await brain.setMemory('note-b.md', 'garage code: 4471', 'test', 'instance', nearVec(155, 2));
+  await backdate('note-a.md', T - 9 * DAY);
+  await backdate('note-b.md', T - 2 * DAY);
+  await brain.confirmDuplicate('note-a.md', 'note-b.md');
+  const r1 = await brain.mindTick({ now: iso(T) });
+  assert.equal(r1.promoted, 1);
+
+  // One of the two confirmed sources is deleted — the boosted n=5 must not
+  // survive on a producer row that no longer has 2 live members to boost.
+  // n is pinned at the real count (1) from here on, so confidence can only
+  // fall through recency decay — wait long enough past note-b's own
+  // updated_at for that alone to clear the retirement floor.
+  await brain.deleteMemory('note-a.md');
+  const r2 = await brain.mindTick({ now: iso(T + 10 * DAY) });
+  assert.equal(r2.retired, 1, 'live evidence dropped to 1 (< CONFIRMED_MIN_N) — real n, not the boosted one, decides');
+  await brain.close();
+});

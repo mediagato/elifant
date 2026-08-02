@@ -68,9 +68,12 @@
  * through the one confidence number, in both the staleness and the
  * evidence-loss direction.
  *
- * SEAM RESERVED (elifant#6): near-duplicate families are pairs — below
- * MIN_SHELF, deliberately not shelves. When #6 lands, a dup cluster can feed
- * the same candidate interface; nothing here needs to change shape.
+ * elifant#6 SHIPPED (keeper.js) via a DIFFERENT path than this seam reserved:
+ * near-dup pairs become a needs-decision Bell ask, not a Mind candidate — a
+ * pair climbing toward pinned knowledge on its own is a bigger call than
+ * either #6 or #7's acceptance criterion asked for. The seam below is still
+ * open if that call is ever made deliberately: nothing here needs to change
+ * shape to accept it.
  * SEAM RESERVED (detector B, fast-follow): capture-theme recurrence — hosts
  * emitting addCapture({data:{theme}}) — feeds the same interface too; that is
  * how Allen-on-kernel keeps Minecraft semantics host-side forever.
@@ -115,6 +118,14 @@ const STATE_PREFIX = 'mind:pattern:';
 const EPOCH_KEY = 'mind:epoch';
 const KNOWLEDGE_PREFIX = 'mind/knowledge/';
 const SHELVING_VIA = 'keeper/shelving-v1'; // the evidence source (keeper.js)
+// elifant#6 follow-up — a keyholder's own "yes these are the same fact"
+// (index.js's confirmDuplicate). Same string literal owned there; kept in
+// sync by hand exactly like SHELVING_VIA above already is.
+const CONFIRMED_VIA = 'keeper/confirmed-dup-v1';
+// A confirmed pair is, by construction, exactly two members forever (nothing
+// ever grows it) — DEFAULTS.minPatternN (3) would silently exclude every
+// confirmed-dup candidate from ever reaching the ladder at all.
+const CONFIRMED_MIN_N = 2;
 
 // ── pure helpers (exported for the test suite) ──────────────────────────────
 
@@ -230,16 +241,19 @@ function createMind(ctx) {
 
   async function _save(p) { await setState(STATE_PREFIX + p.id, JSON.stringify(p), 'mind'); }
 
-  // Every live Keeper shelf is a pattern candidate. n / born / last derive
-  // from the LIVE member rows, not the shelf text — deletions count against
-  // the pattern the moment they happen.
+  // Every live Keeper shelf, AND every keyholder-confirmed duplicate pair
+  // (elifant#6 follow-up), is a pattern candidate. n / born / last derive
+  // from the LIVE member rows, not the row's own text — deletions count
+  // against the pattern the moment they happen.
   async function _candidates() {
-    const shelves = await query(
-      `SELECT filename, content, embedding::text AS vec FROM memories
-       WHERE synthesized_via = $1 AND deleted_at IS NULL AND archived = false`, [SHELVING_VIA]
+    const producers = await query(
+      `SELECT filename, content, synthesized_via, embedding::text AS vec FROM memories
+       WHERE synthesized_via = ANY($1::text[]) AND deleted_at IS NULL AND archived = false`,
+      [[SHELVING_VIA, CONFIRMED_VIA]]
     );
     const out = [];
-    for (const s of shelves.rows) {
+    for (const s of producers.rows) {
+      const confirmed = s.synthesized_via === CONFIRMED_VIA;
       const members = [];
       for (const m of String(s.content || '').matchAll(/^- (\S+)(?: |$)/gm)) members.push(m[1]);
       if (!members.length) continue;
@@ -248,28 +262,42 @@ function createMind(ctx) {
         [members]
       );
       const rows = live.rows;
-      if (rows.length < DEFAULTS.minPatternN) continue; // dissolving — the keeper will archive it
+      // A confirmed pair only ever has 2 declared members — DEFAULTS.minPatternN
+      // (3) is a shelf-shaped floor and would drop it every single tick.
+      if (rows.length < (confirmed ? CONFIRMED_MIN_N : DEFAULTS.minPatternN)) continue; // dissolving
       const times = rows.map((r) => Date.parse(r.updated_at)).filter(Number.isFinite);
       const born = Math.min(...times);
       const last = Math.max(...times);
       const thread = threadOf(s.content);
       const label = thread.length ? thread.join(', ') : 'similar things';
       const days = Math.max(1, Math.round((last - born) / 86400000));
+      // A keyholder's own confirmation IS complete evidence — it doesn't need
+      // to wait for statistical recurrence the way an auto-detected shelf
+      // does, so it presents at full evidence weight (targetN) rather than
+      // its raw (always-2) member count. The boost only fires while this
+      // producer row is still live with enough members to be a candidate at
+      // all; the moment it drops below CONFIRMED_MIN_N (one side deleted),
+      // this branch is skipped and the decay path below recomputes the real,
+      // smaller n from _liveRefCount — same self-correction a shelf gets.
+      const n = confirmed ? Math.max(rows.length, DEFAULTS.targetN) : rows.length;
       out.push({
-        id: 'shelf:' + s.filename,
-        kind: 'shelf-recurrence',
+        id: (confirmed ? 'confirmed:' : 'shelf:') + s.filename,
+        kind: confirmed ? 'confirmed-dup' : 'shelf-recurrence',
         theme: s.filename,
         themeLabel: label,
-        n: rows.length,
-        born, last,
+        n, born, last,
         refs: rows.slice(0, DEFAULTS.maxRefs).map((r) => ({ filename: r.filename, day: String(r.updated_at).slice(0, 10) })),
-        evidenceSummary: thread.length
-          ? `${rows.length} memories about ${label} over ${days} day${days === 1 ? '' : 's'}`
-          : `${rows.length} memories saying similar things over ${days} day${days === 1 ? '' : 's'}`,
+        evidenceSummary: confirmed
+          ? `you confirmed ${thread.length ? label : 'these say the same thing'} — ${rows.length} memories`
+          : (thread.length
+            ? `${rows.length} memories about ${label} over ${days} day${days === 1 ? '' : 's'}`
+            : `${rows.length} memories saying similar things over ${days} day${days === 1 ? '' : 's'}`),
         vec: s.vec ? String(s.vec).replace(/^\[|\]$/g, '').split(',').map(Number) : null,
         // The Guard's verdict over the LIVE evidence (elifant#16) — recomputed
         // every tick from the member rows themselves, so an edit that changes
-        // what the cluster is about changes the verdict with it.
+        // what the cluster is about changes the verdict with it. Applies to a
+        // confirmed pair exactly as it does to a shelf — your own vouch does
+        // not bypass the safety floor, only the recurrence requirement.
         guard: promotionGuard(rows.map((r) => r.content)),
       });
     }
