@@ -24,7 +24,16 @@
  *   4. emits THOUGHTS as captures {source:'thought'} — the feed the bowl's
  *      ticker has polled since the day it shipped — each carrying a reasoning
  *      receipt {lens, considered, released} that re-derives from the ledger.
+ *   5. reconciles PAIRS — strict-floor components that never grew past two
+ *      members, exactly what MIN_SHELF excludes from shelving (elifant#6/#7).
+ *      Split by lexical polarity into near-dup ("say the same thing") or
+ *      contradiction ("disagree"), each becomes a needs-decision capture
+ *      {source:'keeper', type:'needs-decision'} — the Bell's producer. Asked
+ *      once per pair per content-state (a keeper_pairs ledger tracks
+ *      {kind, sig}); NEVER a silent merge and NEVER an auto-resolved
+ *      contradiction — the keyholder decides, sources untouched either way.
  *
+
  * THE QUEUE IS THE WATERMARK (elifant#1's durability requirement). Progress
  * is per-row: a memory leaves the queue only when its own edges are written
  * (`neighbours_at` set), so a mid-tick kill redoes at most the row in flight
@@ -93,6 +102,7 @@ const QUEUE_BATCH = 50;           // bounded work per tick
 const FIRST_LIGHT_MIN_CORPUS = 8; // below this, everything is new territory — stay quiet
 const BULK_SNAPSHOT_ROWS = 100;   // kernel-ethic #11: snapshot before >100-row passes
 const SHELVING_VIA = 'keeper/shelving-v1';
+const PAIR_LEDGER_KEY = 'keeper_pairs'; // brain_meta key: last-asked {kind, sig} per pair (elifant#6/#7)
 
 const STOPWORDS = new Set(('a an and are as at be but by for from has have i if in into is it its me my not of on or ' +
   'our so that the their them they this to was we were what when which who will with you your just really very ' +
@@ -187,6 +197,73 @@ function shelfSlug(filename) {
     .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60) + '.md';
 }
 
+// A keyholder's own resolution of a near-dup Bell ask (elifant#6 follow-up):
+// "yes, these two say the same thing." Same receipt-IS-the-content shape as
+// renderShelf (parseMembers reads either), but the footer is honest that this
+// came from a direct vouch, not statistical recurrence — the provenance
+// distinction the Mind's evidence-weight override (see mind.js) depends on
+// being visible, not just internally tagged.
+function renderConfirmedDup(members /* [{filename, day}] */, { thirdParty = false } = {}) {
+  const head = `# confirmed the same fact: ${members.length} memories`;
+  const markLine = thirdParty ? `${THIRD_PARTY_MARK}\n` : '';
+  const lines = members.map((m) => `- ${m.filename} (${m.day})`).join('\n');
+  const foot = '_confirmed by you. every line above re-derives from the memories it names; ' +
+    'the sources are untouched and this record can be archived without losing any of them._';
+  return `${head}\n${markLine}\n${lines}\n\n${foot}\n`;
+}
+
+function confirmedDupSlug(a, b) {
+  return 'confirmed/' + [a, b].map((f) => String(f).replace(/\.md$/i, '').toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')).join('--').slice(0, 80) + '.md';
+}
+
+// The stable, order-independent identity for a pair (elifant#6/#7) — same two
+// filenames always land on the same key regardless of which one the edge
+// graph happened to list first, so the ledger below recognizes a recurring
+// pair as the same question, not a new one each tick.
+function pairKey(a, b) {
+  return 'pair:' + [a, b].sort().join('|');
+}
+
+// Negation/contrast cues, matched on normalized (lowercased, curly-quotes-
+// folded) text. Deliberately lexical, like every other detector above the
+// retrieval line (no model) — this is the ONE signal that separates "these
+// two say the same thing" (elifant#6) from "these two disagree" (elifant#7)
+// once a pair is already known to share a subject (the embedding floor
+// established that part). KNOWN MISS: a double negation ("I don't like tea"
+// -> "I don't like tea anymore, I love it now") reads as symmetric — both
+// sides negate — and falls to the near-dup path instead of contradiction.
+// That fails toward the weaker, more conservative question, never toward a
+// silent verdict: the pair still reaches the keyholder either way.
+const NEGATION_RE = /\b(not|never|no longer|nobody|nothing|nowhere|instead|actually|correction|mistaken|incorrectly?|wrong|false)\b|n't\b/;
+function hasNegation(text) {
+  return NEGATION_RE.test(String(text || '').toLowerCase().replace(/[’‘]/g, "'"));
+}
+
+// Same-subject pairs (bound by the shelf-tight embedding floor) split into
+// two kinds by polarity alone: one side negates/contrasts and the other
+// doesn't -> they disagree (elifant#7); otherwise they're just two phrasings
+// of one fact (elifant#6). Pure and order-independent.
+function classifyPair(a, b) {
+  return hasNegation(a) !== hasNegation(b) ? 'contradiction' : 'near-dup';
+}
+
+// A short, single-line receipt excerpt — long enough to recognize the memory,
+// short enough that a Bell prompt built from two of these stays a sentence.
+function _excerpt(text, n = 100) {
+  const s = String(text || '').replace(/\s+/g, ' ').trim();
+  return s.length <= n ? s : s.slice(0, n - 1) + '…';
+}
+
+// The Bell prompt text for a pair — describes both sides with receipts and
+// offers a choice; never scolds, never tells the keyholder they were wrong
+// (elifant#7's copy constraint, applied to elifant#6 too for consistency).
+function pairPrompt(kind, aFile, aExcerpt, bFile, bExcerpt) {
+  return kind === 'contradiction'
+    ? `two of your memories disagree — "${aExcerpt}" (${aFile}) and "${bExcerpt}" (${bFile}). which one is current?`
+    : `two of your memories say close to the same thing — "${aExcerpt}" (${aFile}) and "${bExcerpt}" (${bFile}). keep both, or fold them into one?`;
+}
+
 // Union-find over strict-floor edges.
 function components(edges /* [{a, b}] */) {
   const parent = new Map();
@@ -268,6 +345,17 @@ function createKeeper(ctx) {
       'INSERT INTO brain_meta (key, value) VALUES ($1, $2) ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value',
       [key, value]
     );
+  }
+
+  // The pair ledger (elifant#6/#7) — last-asked {kind, sig} per pair, keyed by
+  // pairKey(a,b). Rebuilt from scratch every tick from the LIVE pairs (same
+  // idempotent-by-recomputation idiom as shelving): a pair not seen this tick
+  // simply isn't carried into the next ledger, so a dissolved-then-reformed
+  // pair is asked about fresh rather than silently remembered forever.
+  async function _pairLedger() {
+    const raw = await _meta(PAIR_LEDGER_KEY);
+    if (!raw) return {};
+    try { const v = JSON.parse(raw); return (v && typeof v === 'object') ? v : {}; } catch { return {}; }
   }
 
   // Snapshot-before-bulk (kernel-ethic #11). A genuinely bulk pass — more
@@ -386,12 +474,16 @@ function createKeeper(ctx) {
 
   /**
    * One bounded pass. Returns a receipt {processed, edges, firstLights,
-   * shelvesWritten, shelvesArchived, thoughts, snapshotTaken, at} — every
-   * number in it re-derives from the rows this tick wrote.
+   * shelvesWritten, shelvesArchived, thoughts, contradictions, nearDups,
+   * prunedEdges, snapshotTaken, at} — every number in it re-derives from the
+   * rows this tick wrote.
    */
   async function tick({ batch = QUEUE_BATCH } = {}) {
     const now = ts();
-    const receipt = { at: now, processed: 0, firstLights: 0, shelvesWritten: 0, shelvesArchived: 0, thoughts: 0, prunedEdges: 0, snapshotTaken: false };
+    const receipt = {
+      at: now, processed: 0, firstLights: 0, shelvesWritten: 0, shelvesArchived: 0,
+      thoughts: 0, contradictions: 0, nearDups: 0, prunedEdges: 0, snapshotTaken: false,
+    };
 
     // Plan the tick's write volume and run the snapshot guard BEFORE the first
     // write (elifant#12). Two holes lived here: the prune ran ahead of the
@@ -430,7 +522,11 @@ function createKeeper(ctx) {
     // Shelving — recomputed from the whole (small) edge graph each tick, so it
     // is idempotent by construction: identical membership renders identical
     // content, and _stampWrite makes an identical re-save a causal no-op.
-    const clusters = components(await _strictEdges()).filter((c) => c.length >= MIN_SHELF);
+    // allComponents also feeds the pair pass below (elifant#6/#7): a strict
+    // edge that never grows past two members is exactly the case MIN_SHELF
+    // was designed to exclude from shelving, not to drop on the floor.
+    const allComponents = components(await _strictEdges());
+    const clusters = allComponents.filter((c) => c.length >= MIN_SHELF);
     const shelves = await _liveShelves();
     const { clusterMatched, shelfTaken } = matchClusters(clusters, shelves);
     const shelfByName = new Map(shelves.map((s) => [s.filename, s]));
@@ -526,6 +622,53 @@ function createKeeper(ctx) {
       }
     }
 
+    // Pairs — near-dup merge proposals (elifant#6) and contradiction asks
+    // (elifant#7). Never a silent merge, never an auto-resolved contradiction:
+    // both become a needs-decision capture, the Bell's producer, so the
+    // keyholder decides. Sources are never touched (K-CARBON-4) — the pair
+    // pass only ever reads and asks. Deliberately NOT fed into the Mind's
+    // _candidates() interface (mind.js's reserved seam stays unused): that
+    // would mean a pair of similar notes could climb toward pinned knowledge
+    // on its own, which is a bigger call than either issue's acceptance
+    // criterion asks for.
+    const pairClusters = allComponents.filter((c) => c.length === 2);
+    const priorPairLedger = await _pairLedger();
+    const nextPairLedger = {};
+    for (const [a, b] of pairClusters) {
+      const details = await _memberDetails([a, b]);
+      if (details.length < 2) continue; // one side vanished mid-tick
+      // elifant#17: crisis-lexicon content never surfaces, not even as a
+      // question — the shelving override applies here exactly as it does to
+      // shelves. The pair is simply skipped (and drops out of the ledger,
+      // via nextPairLedger never gaining this key).
+      if (details.some((d) => crisisMatch(d.content))) continue;
+      const key = pairKey(a, b);
+      const kind = classifyPair(details[0].content, details[1].content);
+      const sig = details.map((d) => String(d.updated_at)).join('|');
+      nextPairLedger[key] = { kind, sig };
+      const prior = priorPairLedger[key];
+      if (prior && prior.sig === sig && prior.kind === kind) continue; // unchanged — no re-ask
+      const excerptA = _excerpt(details[0].content);
+      const excerptB = _excerpt(details[1].content);
+      await addCapture({
+        source: 'keeper',
+        type: 'needs-decision',
+        data: {
+          key, who: 'the keeper', kind,
+          prompt: pairPrompt(kind, a, excerptA, b, excerptB),
+          a: { filename: a, excerpt: excerptA },
+          b: { filename: b, excerpt: excerptB },
+        },
+      });
+      receipt[kind === 'contradiction' ? 'contradictions' : 'nearDups']++;
+    }
+    // Rebuilt fresh each tick (not merged with priorPairLedger), so a pair
+    // that no longer exists — grew into a shelf, dissolved, or one side was
+    // edited/deleted — simply isn't carried forward. If the same two
+    // memories re-converge later it is asked about fresh, which is honest:
+    // whatever changed in between is itself worth a new question.
+    await _setMeta(PAIR_LEDGER_KEY, JSON.stringify(nextPairLedger));
+
     await _setMeta('keeper_last_tick', JSON.stringify(receipt));
     return receipt;
   }
@@ -555,6 +698,16 @@ module.exports = {
   shelfSlug,
   components,
   matchClusters,
+  parseVec: _parseVec,
+  // elifant#6/#7 — near-dup/contradiction pair detection, pure and order-independent
+  pairKey,
+  hasNegation,
+  classifyPair,
+  pairPrompt,
+  // elifant#6 follow-up — resolved-merge confirmation (index.js's confirmDuplicate)
+  renderConfirmedDup,
+  confirmedDupSlug,
   SHELVING_VIA,
+  PAIR_LEDGER_KEY,
   FLOORS: { NEIGHBOUR_K, EDGE_KEEP_FLOOR, SHELF_EDGE_FLOOR, MIN_SHELF, FIRST_LIGHT_MIN_CORPUS },
 };

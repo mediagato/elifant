@@ -895,6 +895,10 @@ export interface KeeperTickReceipt {
   shelvesArchived: number;
   /** Total thought captures emitted (shelf + first-light). */
   thoughts: number;
+  /** Contradiction needs-decision captures emitted this tick (elifant#7). */
+  contradictions: number;
+  /** Near-dup merge-proposal needs-decision captures emitted this tick (elifant#6). */
+  nearDups: number;
   prunedEdges: number;
   /** True when the pre-write snapshot guard fired (kernel-ethic #11). */
   snapshotTaken: boolean;

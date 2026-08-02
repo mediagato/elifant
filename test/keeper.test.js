@@ -450,3 +450,147 @@ test('durability: a kill between rows loses no work and redoes none already done
   assert.equal((await brain.keeperStatus()).queue, 0);
   await brain.close();
 });
+
+// ── elifant#6/#7: pairs — near-dup merge proposals + contradiction asks ─────
+//
+// components() finds strict-floor pairs that never grow past two members —
+// exactly what MIN_SHELF excludes from shelving. Each surviving pair becomes
+// a needs-decision capture (the Bell's producer), classified by lexical
+// polarity: symmetric (both or neither side negates) -> near-dup, asymmetric
+// -> contradiction. Never a silent merge, never an auto-resolved
+// contradiction — the keyholder decides, sources untouched either way.
+
+test('pairKey: order-independent, stable identity for a pair', () => {
+  assert.equal(keeper.pairKey('a.md', 'b.md'), keeper.pairKey('b.md', 'a.md'));
+  assert.equal(keeper.pairKey('a.md', 'b.md'), 'pair:a.md|b.md');
+});
+
+test('hasNegation / classifyPair: symmetric is near-dup, asymmetric is contradiction', () => {
+  assert.equal(keeper.hasNegation('the meeting is at 3pm'), false);
+  assert.equal(keeper.hasNegation("the meeting isn't at 3pm anymore"), true);
+  assert.equal(keeper.hasNegation('the meeting is not at 3pm'), true);
+
+  assert.equal(keeper.classifyPair('rent is 1850 starting next month', 'starting next month rent is 1850'), 'near-dup');
+  assert.equal(keeper.classifyPair('the meeting is at 3pm', "the meeting isn't at 3pm, it moved to 4pm"), 'contradiction');
+  // KNOWN MISS, documented: both sides negate -> reads as symmetric/near-dup,
+  // not contradiction. Conservative direction (still reaches the keyholder).
+  assert.equal(keeper.classifyPair("I don't drink coffee", "I don't drink coffee anymore, I switched to tea"), 'near-dup');
+});
+
+test('pairPrompt: describes both sides with receipts, never scolds', () => {
+  const p = keeper.pairPrompt('contradiction', 'a.md', 'X is true', 'b.md', 'X is false');
+  assert.match(p, /a\.md/);
+  assert.match(p, /b\.md/);
+  assert.match(p, /X is true/);
+  assert.match(p, /X is false/);
+  assert.ok(!/wrong|mistake|shouldn't/i.test(p), 'never tells the keyholder they were wrong');
+});
+
+test('elifant#6: a near-dup pair proposes a merge via the Bell — never shelved, sources untouched', async () => {
+  await freshBrain();
+  await brain.setMemory('pay-a.md', 'rent goes up to 1850 starting next month', 'test', 'instance', nearVec(200, 1));
+  await brain.setMemory('pay-b.md', 'starting next month rent is 1850', 'test', 'instance', nearVec(200, 2));
+
+  const receipt = await brain.keeperTick({ mind: false });
+  assert.equal(receipt.shelvesWritten, 0, 'two members never reach the shelf minimum');
+  assert.equal(receipt.nearDups, 1);
+  assert.equal(receipt.contradictions, 0);
+
+  const nd = await brain.getCaptures({ type: 'needs-decision' });
+  assert.equal(nd.length, 1);
+  assert.equal(nd[0].source, 'keeper');
+  assert.equal(nd[0].data.kind, 'near-dup');
+  assert.deepEqual([nd[0].data.a.filename, nd[0].data.b.filename].sort(), ['pay-a.md', 'pay-b.md']);
+  assert.match(nd[0].data.prompt, /pay-a\.md/);
+  assert.match(nd[0].data.prompt, /pay-b\.md/);
+
+  // both originals recoverable — elifant#6's acceptance criterion, satisfied
+  // by construction (K-CARBON-4: the pair pass only ever reads and asks).
+  const rows = (await brain._internal.query(
+    "SELECT filename, synthesized_via, content FROM memories WHERE filename IN ('pay-a.md','pay-b.md') ORDER BY filename"
+  )).rows;
+  assert.equal(rows.length, 2);
+  assert.ok(rows.every((r) => r.synthesized_via === null), 'never silently merged');
+  assert.equal(rows[0].content, 'rent goes up to 1850 starting next month');
+  assert.equal(rows[1].content, 'starting next month rent is 1850');
+  await brain.close();
+});
+
+test('elifant#7: a contradiction pair rings the Bell with both sources cited', async () => {
+  await freshBrain();
+  await brain.setMemory('concert-a.md', 'the concert starts at 8pm', 'test', 'instance', nearVec(210, 1));
+  await brain.setMemory('concert-b.md', 'the concert does not start at 8pm, it moved to 9pm', 'test', 'instance', nearVec(210, 2));
+
+  const receipt = await brain.keeperTick({ mind: false });
+  assert.equal(receipt.contradictions, 1);
+  assert.equal(receipt.nearDups, 0);
+
+  const nd = await brain.getCaptures({ type: 'needs-decision' });
+  assert.equal(nd.length, 1);
+  assert.equal(nd[0].data.kind, 'contradiction');
+  assert.deepEqual([nd[0].data.a.filename, nd[0].data.b.filename].sort(), ['concert-a.md', 'concert-b.md']);
+  assert.match(nd[0].data.prompt, /concert-a\.md/);
+  assert.match(nd[0].data.prompt, /concert-b\.md/);
+  await brain.close();
+});
+
+test('elifant#17: a crisis-lexicon pair never surfaces — not even as a question', async () => {
+  await freshBrain();
+  await brain.setMemory('dark-a.md', 'been thinking about suicide again lately', 'test', 'instance', nearVec(220, 1));
+  await brain.setMemory('dark-b.md', 'still thinking about suicide, same as before', 'test', 'instance', nearVec(220, 2));
+
+  const receipt = await brain.keeperTick({ mind: false });
+  assert.equal(receipt.contradictions, 0);
+  assert.equal(receipt.nearDups, 0);
+  assert.equal((await brain.getCaptures({ type: 'needs-decision' })).length, 0,
+    'the shelving override applies to pairs exactly as it does to shelves');
+  await brain.close();
+});
+
+test('idempotent: an unchanged pair is asked about once, not every tick', async () => {
+  await freshBrain();
+  await brain.setMemory('dup-a.md', 'the wifi password is on the fridge', 'test', 'instance', nearVec(230, 1));
+  await brain.setMemory('dup-b.md', 'the fridge has the wifi password on it', 'test', 'instance', nearVec(230, 2));
+
+  const r1 = await brain.keeperTick({ mind: false });
+  assert.equal(r1.nearDups, 1);
+  const r2 = await brain.keeperTick({ mind: false });
+  assert.equal(r2.nearDups, 0, 'unchanged pair, unchanged verdict — honest silence');
+  assert.equal((await brain.getCaptures({ type: 'needs-decision' })).length, 1);
+  await brain.close();
+});
+
+test('a content edit re-asks: whatever changed in between is itself worth a new question', async () => {
+  await freshBrain();
+  await brain.setMemory('edit-a.md', 'the wifi password is on the fridge', 'test', 'instance', nearVec(240, 1));
+  await brain.setMemory('edit-b.md', 'the fridge has the wifi password on it', 'test', 'instance', nearVec(240, 2));
+  const r1 = await brain.keeperTick({ mind: false });
+  assert.equal(r1.nearDups, 1);
+
+  // Content changes, vector re-supplied to stay in the same tight pair —
+  // now it's a genuine disagreement, not a rephrasing.
+  await brain.setMemory('edit-b.md', 'the fridge password is wrong, it was changed last week', 'test', 'instance', nearVec(240, 2));
+  const r2 = await brain.keeperTick({ mind: false });
+  assert.equal(r2.contradictions, 1, 'the changed content re-triggers a fresh ask, reclassified');
+
+  const nd = await brain.getCaptures({ type: 'needs-decision' });
+  assert.equal(nd.length, 2, 'both the original ask and the re-ask are on the ledger');
+  assert.equal(nd[0].data.kind, 'contradiction', 'newest first');
+  await brain.close();
+});
+
+test('a pair that grows into a shelf drops out of the pair ledger (no lingering duplicate ask)', async () => {
+  await freshBrain();
+  await brain.setMemory('grow-a.md', 'the garden needs weeding this weekend', 'test', 'instance', nearVec(250, 1));
+  await brain.setMemory('grow-b.md', 'weeding the garden this weekend', 'test', 'instance', nearVec(250, 2));
+  const r1 = await brain.keeperTick({ mind: false });
+  assert.equal(r1.nearDups, 1, 'two members -> a pair, not a shelf');
+
+  await brain.setMemory('grow-c.md', 'garden weeding weekend plan', 'test', 'instance', nearVec(250, 3));
+  const r2 = await brain.keeperTick({ mind: false });
+  assert.equal(r2.shelvesWritten, 1, 'three members -> now a real shelf');
+  assert.equal(r2.nearDups, 0, 'the trio is a shelf now, not re-asked as a pair');
+  assert.equal((await brain.getCaptures({ type: 'needs-decision' })).length, 1,
+    'the original pair ask stands; no new one is added once it graduates to a shelf');
+  await brain.close();
+});
