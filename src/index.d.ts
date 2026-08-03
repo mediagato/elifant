@@ -684,6 +684,177 @@ export function getCaptures(opts?: GetCapturesOptions): Promise<CaptureRow[]>;
  */
 export function deleteCaptures(opts: DeleteCapturesOptions): Promise<number>;
 
+// ── Steering: the manner slot (elifant#11) ────────────────────────────────
+//
+// steering rows change how the brain BEHAVES (review_lessons, below, change
+// what it KNOWS). So the write surface is split in two and there is no third
+// door: `proposeSteering` takes no `enabled` argument and can only write a
+// disabled entry; `grantSteering` is the only function that writes
+// enabled=true and it cannot be called without `grantedBy`. An enabled entry
+// with no recorded grant is unrepresentable through this API, and — for any
+// row whose origin has been declared — unrepresentable in SQL as well.
+
+/** Where a steering entry came from. A proposal must name one of these. */
+export type SteeringOrigin = 'shell-seeded' | 'keyholder' | 'learned';
+
+/** When a steering entry applies. */
+export type SteeringMode = 'always' | 'matched' | 'manual';
+
+/** The three origins as a frozen constant, so callers need not hardcode strings. */
+export const STEERING_ORIGIN: Readonly<{
+  SHELL_SEEDED: 'shell-seeded';
+  KEYHOLDER: 'keyholder';
+  LEARNED: 'learned';
+}>;
+
+/** A steering entry as read back. */
+export interface SteeringRow {
+  id: string;
+  name: string;
+  content: string;
+  mode: SteeringMode;
+  match_pattern: string | null;
+  priority: number;
+  /** True only when a grant is recorded — see granted_by/granted_at. */
+  enabled: boolean;
+  layer: Layer;
+  /** null on rows that pre-date provenance, were spore-seeded, or arrived from
+   *  another bowl. Never invented. */
+  origin: SteeringOrigin | null;
+  /** Who turned this on. null = not granted. */
+  granted_by: string | null;
+  /** When it was turned on. null = not granted. */
+  granted_at: string | null;
+  /** The proposal/evidence this rule came from, when it had one. */
+  proposal_id: string | null;
+  trust_tier: string;
+  created_at: string;
+  updated_at: string;
+  /** Set when a rollback resurrected this row (resurrect-and-FLAG). */
+  restored_from: string | null;
+}
+
+export interface ListSteeringOptions {
+  /** Omit for ALL entries; true = active rules only; false = proposals only. */
+  enabled?: boolean;
+  mode?: SteeringMode;
+  layer?: Layer;
+  origin?: SteeringOrigin;
+}
+
+/**
+ * A steering PROPOSAL. Note the absence of an `enabled` field: it is not an
+ * option this type forgot, it is the point of the type.
+ */
+export interface SteeringProposal {
+  id: string;
+  name: string;
+  content: string;
+  mode?: SteeringMode;
+  matchPattern?: string | null;
+  priority?: number;
+  layer?: Layer;
+  /** REQUIRED — an unmarked manner rule is a silent promotion. */
+  origin: SteeringOrigin;
+  proposalId?: string | null;
+}
+
+/** One steering entry by id, or null. Tombstoned entries read as absent. */
+export function getSteering(id: string): Promise<SteeringRow | null>;
+
+/** Steering entries, highest priority first then id. Tombstones excluded. */
+export function getAllSteering(opts?: ListSteeringOptions): Promise<SteeringRow[]>;
+
+/**
+ * Write a steering entry as a proposal — ALWAYS disabled. Cannot produce an
+ * active rule; that is grantSteering's sole job.
+ *
+ * Re-proposing with any behavioural field changed (content / mode /
+ * match_pattern / priority) revokes an existing grant, because the grant
+ * covered the old text — reported as `revoked_grant`, never silent. An
+ * identical re-propose keeps the grant, so an idempotent boot-time re-seed
+ * does not switch the keyholder's rules off.
+ *
+ * @throws if id/name/content are missing, or `origin` is not a SteeringOrigin
+ */
+export function proposeSteering(entry: SteeringProposal): Promise<{
+  id: string;
+  enabled: boolean;
+  revoked_grant: boolean;
+}>;
+
+/**
+ * Turn a steering entry on. The ONLY writer of enabled=true in the kernel,
+ * and it requires `grantedBy`: enabled, granted_by and granted_at are written
+ * by one UPDATE, so the row is never observably enabled-without-a-grant.
+ * @throws if grantedBy is missing/blank, or the entry does not exist
+ */
+export function grantSteering(
+  id: string,
+  grant: { grantedBy: string; proposalId?: string | null; note?: string | null },
+): Promise<{ id: string; enabled: true; granted_by: string; granted_at: string }>;
+
+/**
+ * Turn a steering entry off and clear its grant. Idempotent — a missing,
+ * tombstoned or already-ungranted entry reports `changed:false`. `revokedBy`
+ * is recorded when given but never required: nothing should stand between a
+ * keyholder and switching a behaviour off.
+ */
+export function revokeSteering(
+  id: string,
+  opts?: { revokedBy?: string | null; note?: string | null },
+): Promise<{ id: string; enabled: false; changed: boolean }>;
+
+/**
+ * Soft-delete a steering entry (tombstone + version-vector bump), so the
+ * delete propagates on sync instead of being resurrected. Clears the grant on
+ * the way down. No-op if absent or already tombstoned.
+ */
+export function deleteSteering(id: string): Promise<void>;
+
+// ── Review lessons: the learned-heuristics slot (elifant#11) ──────────────
+
+/** A learned rule derived from prior tasks. */
+export interface ReviewLessonRow {
+  id: number;
+  task_type: string;
+  rule: string;
+  source_item_id: number | null;
+  layer: Layer;
+  created_at: string;
+  restored_from: string | null;
+}
+
+export interface ReviewLessonInput {
+  /** camelCase on the way IN, snake_case on the way OUT (the column name). */
+  taskType: string;
+  rule: string;
+  sourceItemId?: number | null;
+  layer?: Layer;
+}
+
+export interface ListReviewLessonsOptions {
+  taskType?: string | null;
+  /** Default 1000, capped at 10000 (bounded reads only). */
+  limit?: number;
+}
+
+/**
+ * Append a learned lesson, dedup'd on (task_type, rule) — the same key the
+ * snapshot forward-merge dedups by. A repeat returns the existing row with
+ * `deduped:true`. No grant is required: this records what she KNOWS, and
+ * knowing is not behaving. To make a lesson change behaviour, take it through
+ * proposeSteering + grantSteering.
+ */
+export function addReviewLesson(lesson: ReviewLessonInput): Promise<{ id: number; deduped?: true }>;
+
+/** Learned lessons, newest first. Filter by taskType for one kind of work. */
+export function getReviewLessons(opts?: ListReviewLessonsOptions): Promise<ReviewLessonRow[]>;
+
+/** Delete one lesson by id (a hard delete — this table is outside the
+ *  version-vector machinery). True if a row was removed. */
+export function deleteReviewLesson(id: number): Promise<boolean>;
+
 // ── Spore seed ────────────────────────────────────────────────────────────
 
 /**
