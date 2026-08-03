@@ -25,12 +25,15 @@
  *      shelf's LIVE tier-1 members, born/last come from their real updated_at
  *      timestamps (so a genuinely old cluster is old at birth and can promote
  *      on tick one — genesis is not a special mode);
- *   3. upserts candidates into the ledger; a first sighting emits a `pattern`
+ *   3. resolves each candidate to the pattern it CONTINUES — its own producer
+ *      row, one it has been carried on before, or (elifant#18) an orphaned
+ *      pattern it can be shown to be the reformation of;
+ *   4. upserts candidates into the ledger; a first sighting emits a `pattern`
  *      capture (the forming band);
- *   4. recomputes confidence for EVERY pattern — including ones whose shelf
+ *   5. recomputes confidence for EVERY pattern — including ones whose shelf
  *      dissolved: their n recomputes from still-live refs, so deletion and
  *      edit-away are contradiction, mechanically, not just staleness;
- *   5. transitions:
+ *   6. transitions:
  *        forming  + conf >= 0.8 && n >= 5 && (age >= 24h
  *                   || n >= promoteHighN, the rolling-window escape hatch of
  *                   elifant#20, Infinity unless a host opts in) -> PROMOTE: a durable
@@ -80,19 +83,49 @@
  * emitting addCapture({data:{theme}}) — feeds the same interface too; that is
  * how Allen-on-kernel keeps Minecraft semantics host-side forever.
  *
- * KNOWN GAP: pattern identity is the LIVE shelf's filename (`'shelf:' +
- * filename`). A shelf that shrinks and grows without ever fully dissolving
- * keeps its filename (keeper.js's matchClusters continuity), so revival works
- * — see the "fresh evidence revives" test. But if the shelf's cluster drops
- * below MIN_SHELF and the Keeper actually ARCHIVES it, `_liveShelves()` stops
- * returning it, so a later reforming of the same subject gets a brand-new
- * shelf filename (shelfSlug's collision loop won't reuse an archived-but-not-
- * deleted name) — a new, unrelated pattern id. The old retired pattern can
- * never revive; its knowledge memory's history sits orphaned instead of
- * gaining a "promoted again" line. Not a crash, not silent data loss (the old
- * knowledge memory is still there, still readable) — just broken continuity
- * for one specific round-trip. Fix would be identity keyed on theme/content
- * rather than the live filename; deferred, not attempted here.
+ * IDENTITY SURVIVES ARCHIVE-AND-REFORM (elifant#18 — was the KNOWN GAP here).
+ * A pattern's ledger id is the producer row it was first seen on ('shelf:' /
+ * 'confirmed:' + filename), and that id is stable for as long as the shelf is:
+ * keeper.js's matchClusters keeps a shelf's filename while its cluster grows
+ * and shrinks, so ordinary revival always worked (the "fresh evidence revives"
+ * test). It was NOT stable across a full dissolve. Once a cluster drops below
+ * MIN_SHELF the Keeper ARCHIVES the shelf, `_candidates()` stops returning it,
+ * and a later reforming of the same subject lands on a brand-new filename
+ * (shelfSlug's collision loop refuses an archived-but-not-deleted name) — which
+ * used to be a brand-new, disconnected pattern. The old one could never revive,
+ * and its knowledge memory's history sat orphaned instead of gaining a
+ * "promoted again" line. #9 (decay-to-archive) will cause strictly MORE shelf
+ * dissolution than happens today, so the gap was going to fire more often, not
+ * less.
+ *
+ * Identity is therefore RESOLVED now, not merely read. A candidate whose
+ * producer row nobody in the ledger recognizes may ADOPT an orphaned pattern —
+ * keeping that pattern's id, threadKey, knowledge row and history — and records
+ * the new producer row in `aliases`, so the next tick recognizes it directly.
+ * Old ledger rows need no migration: they carry no `aliases` and simply resolve
+ * by id, exactly as before, until the day one of them is adopted onto.
+ *
+ * WHAT DECIDES "the same pattern" — and why it is NOT the theme alone. The
+ * issue proposed keying identity on a theme/content signature. Alone that is
+ * wrong twice over. Shelves routinely have no thread at all (keeper's
+ * commonThread returns [] on a weak cluster and the copy degrades honestly to
+ * "similar things"), so every threadless shelf would collapse into one
+ * identity; and two genuinely different clusters can share a thread — the
+ * "two distinct shelves whose slugs collide" regression seeds exactly that.
+ * Deeper: merging two clusters because their lexical threads match is an
+ * INFERENCE, and acting on it appends "promoted again" to a knowledge row that
+ * describes different evidence. K-CARBON-4 forbids the kernel asserting what it
+ * only inferred, and the `## history` block is an assertion.
+ *
+ * So the primary key is the EVIDENCE: does the reforming cluster still contain
+ * the memories this pattern stands on? That is a fact, not a guess, and the
+ * threshold is keeper.js matchClusters' own overlap rule — the same test that
+ * carries a shelf's filename across ticks, applied across the archive boundary
+ * matchClusters cannot see. Theme signature survives only as a FALLBACK for the
+ * one case evidence cannot answer (every original member is gone and the
+ * subject reformed on new memories), and only when the pairing is unambiguous
+ * on both sides: exactly one orphan and exactly one unrecognized candidate
+ * carrying that signature. See adoptionClaims().
  */
 'use strict';
 
@@ -139,6 +172,14 @@ const CONFIRMED_VIA = 'keeper/confirmed-dup-v1';
 // ever grows it) — DEFAULTS.minPatternN (3) would silently exclude every
 // confirmed-dup candidate from ever reaching the ladder at all.
 const CONFIRMED_MIN_N = 2;
+// The label the Keeper's copy degrades to when commonThread found no subject
+// worth naming. It is deliberately NOT an identity (see themeSignature).
+const NO_THREAD_LABEL = 'similar things';
+// A pattern's id is its FIRST producer row; `aliases` records every later one
+// it has been adopted onto (elifant#18). Bounded like refs: an alias only
+// matters while that producer row could return as a live candidate, and an
+// archived shelf superseded twenty reformations ago will not.
+const MAX_ALIASES = 20;
 
 // ── pure helpers (exported for the test suite) ──────────────────────────────
 
@@ -163,6 +204,83 @@ function titleCase(s) { return String(s || '').replace(/\b\w/g, (c) => c.toUpper
 function threadOf(shelfContent) {
   const m = String(shelfContent || '').match(/^common thread: (.+)$/m);
   return m ? m[1].split(',').map((t) => t.trim()).filter(Boolean) : [];
+}
+
+// The subject signature of a candidate or a ledger row (elifant#18): the
+// Keeper's `common thread` tokens, order-independent. Read off themeLabel
+// because that is the one field BOTH sides already carry, and it is derived
+// from the thread deterministically (thread.join(', '), or NO_THREAD_LABEL).
+// An unnamed subject signs as '' and matches nothing, ever: a cluster the
+// Keeper could not name is not thereby the same cluster as every other one it
+// could not name.
+function themeSignature(themeLabel) {
+  const s = String(themeLabel || '').trim();
+  if (!s || s === NO_THREAD_LABEL) return '';
+  return s.split(',').map((t) => t.trim().toLowerCase()).filter(Boolean).sort().join(',');
+}
+
+/**
+ * Which unrecognized candidates continue which orphaned patterns (elifant#18)?
+ * Pure, deterministic, and strictly one-to-one. Takes shapes rather than ledger
+ * rows so the rule is unit-testable on its own:
+ *   candidates [{id, kind, members: [filename], threadSig}]
+ *   orphans    [{id, kind, liveRefs: [filename], threadSig}]
+ * Returns Map(candidate id -> pattern id) for the claims that win.
+ *
+ * Two tiers, EVIDENCE always beating subject:
+ *   tier 2 — the candidate contains enough of the pattern's still-live refs.
+ *            The threshold is keeper.js matchClusters' own rule (at least half
+ *            the smaller side, minimum one), so "this is the same shelf" means
+ *            the same thing on both sides of the archive boundary. Scored by
+ *            overlap, so the best-supported claim wins a contested pattern.
+ *   tier 1 — identical, non-empty thread signature, and ONLY when exactly one
+ *            orphan and exactly one candidate carry it. This is the fallback
+ *            for a subject that reformed on entirely new memories, where there
+ *            is no shared evidence left to reason from. Ambiguity is refused
+ *            rather than guessed: two orphans with one signature is a question
+ *            the kernel cannot answer, and inventing an answer would fabricate
+ *            a knowledge row's history (K-CARBON-4).
+ * Kinds must match either way — a confirmed pair never adopts a shelf, or the
+ * reverse; they are different evidence with different weighting rules.
+ */
+function adoptionClaims(candidates, orphans) {
+  const claims = [];
+  for (const c of candidates) {
+    const members = new Set(c.members || []);
+    if (!members.size) continue;
+    for (const o of orphans) {
+      if (o.kind !== c.kind) continue;
+      const refs = o.liveRefs || [];
+      if (!refs.length) continue;
+      const overlap = refs.filter((f) => members.has(f)).length;
+      const need = Math.max(1, Math.ceil(Math.min(members.size, refs.length) / 2));
+      if (overlap >= need) claims.push({ tier: 2, score: overlap, c: c.id, o: o.id });
+    }
+  }
+  const bySig = new Map();
+  const group = (sig) => {
+    if (!bySig.has(sig)) bySig.set(sig, { c: [], o: [] });
+    return bySig.get(sig);
+  };
+  for (const c of candidates) if (c.threadSig) group(c.threadSig).c.push(c);
+  for (const o of orphans) if (o.threadSig) group(o.threadSig).o.push(o);
+  for (const g of bySig.values()) {
+    if (g.c.length !== 1 || g.o.length !== 1) continue;
+    if (g.c[0].kind !== g.o[0].kind) continue;
+    claims.push({ tier: 1, score: 0, c: g.c[0].id, o: g.o[0].id });
+  }
+  const cmp = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+  claims.sort((a, b) => (b.tier - a.tier) || (b.score - a.score) || cmp(a.c, b.c) || cmp(a.o, b.o));
+  const takenC = new Set();
+  const takenO = new Set();
+  const out = new Map();
+  for (const cl of claims) {
+    if (takenC.has(cl.c) || takenO.has(cl.o)) continue;
+    takenC.add(cl.c);
+    takenO.add(cl.o);
+    out.set(cl.c, cl.o);
+  }
+  return out;
 }
 
 /**
@@ -289,7 +407,7 @@ function createMind(ctx) {
       const born = Math.min(...times);
       const last = Math.max(...times);
       const thread = threadOf(s.content);
-      const label = thread.length ? thread.join(', ') : 'similar things';
+      const label = thread.length ? thread.join(', ') : NO_THREAD_LABEL;
       const days = Math.max(1, Math.round((last - born) / 86400000));
       // A keyholder's own confirmation IS complete evidence — it doesn't need
       // to wait for statistical recurrence the way an auto-detected shelf
@@ -336,16 +454,21 @@ function createMind(ctx) {
     return promotionGuard(r.rows.map((row) => row.content));
   }
 
-  // How many of a pattern's recorded refs are still live keyholder rows? The
-  // decay path for a dissolved shelf: evidence loss IS contradiction.
-  async function _liveRefCount(p) {
+  // WHICH of a pattern's recorded refs are still live keyholder rows. Two
+  // callers, one query: the decay path below only needs the count (evidence
+  // loss IS contradiction), while adoption (elifant#18) needs the names — what
+  // a pattern still stands on is exactly what a reforming cluster has to
+  // contain to be recognized as the same pattern.
+  async function _liveRefNames(p) {
     const names = (p.signal.refs || []).map((r) => r.filename);
-    if (!names.length) return 0;
+    if (!names.length) return [];
     const r = await query(
-      `SELECT count(*)::int AS n FROM memories WHERE filename = ANY($1::text[]) AND ${SOURCE_WHERE}`, [names]
+      `SELECT filename FROM memories WHERE filename = ANY($1::text[]) AND ${SOURCE_WHERE}`, [names]
     );
-    return r.rows[0].n;
+    return r.rows.map((row) => row.filename);
   }
+
+  async function _liveRefCount(p) { return (await _liveRefNames(p)).length; }
 
   function _event(p, stage, text, nowIso, extra) {
     return Object.assign({
@@ -461,14 +584,75 @@ function createMind(ctx) {
 
     const patterns = await _ledger();
     const cands = await _candidates();
-    const candIds = new Set(cands.map((c) => c.id));
     const vecById = new Map(cands.map((c) => [c.id, c.vec]));
+
+    // 0. RESOLVE IDENTITY (elifant#18). Which ledger pattern does each
+    //    candidate producer row continue? A direct hit on the pattern's id, or
+    //    on any producer row it has carried before, answers it for everything
+    //    that never fully dissolved — that is the ordinary case and costs one
+    //    map lookup.
+    const byId = new Map([...patterns.values()].map((p) => [p.id, p]));
+    const byAlias = new Map();
+    for (const p of patterns.values()) for (const a of p.aliases || []) byAlias.set(a, p);
+    const resolved = new Map(); // candidate id -> the ledger pattern it continues
+    const held = new Set();     // ...and the pattern ids already spoken for
+    for (const c of cands) {    // identity first: a pattern's own id outranks
+      const p = byId.get(c.id); // any alias it has picked up since.
+      if (p) { resolved.set(c.id, p); held.add(p.id); }
+    }
+    // An alias only binds while nothing else is carrying that pattern. Both can
+    // be live at once — an archived shelf CAN be un-archived — and one pattern
+    // may only be the continuation of one of them; the other falls through to
+    // the pass below and gets a life of its own rather than being swallowed.
+    for (const c of cands) {
+      if (resolved.has(c.id)) continue;
+      const p = byAlias.get(c.id);
+      if (p && !held.has(p.id)) { resolved.set(c.id, p); held.add(p.id); }
+    }
+    // Anything left is a producer row nobody recognizes — the archive-and-
+    // reform case. Offer those candidates the patterns no live candidate is
+    // carrying this tick (an ORPHAN: its own shelf is archived or gone). A
+    // pattern whose shelf is still live is never on offer, so a cluster that
+    // merely SPLIT can never steal the surviving half's identity.
+    const unrecognized = cands.filter((c) => !resolved.has(c.id));
+    if (unrecognized.length) {
+      const orphans = [...patterns.values()].filter((p) => !held.has(p.id));
+      if (orphans.length) {
+        const orphanShapes = [];
+        for (const p of orphans) {
+          orphanShapes.push({
+            id: p.id, kind: p.kind, liveRefs: await _liveRefNames(p),
+            threadSig: themeSignature(p.themeLabel),
+          });
+        }
+        const adopted = adoptionClaims(
+          unrecognized.map((c) => ({
+            id: c.id, kind: c.kind,
+            members: c.refs.map((r) => r.filename),
+            threadSig: themeSignature(c.themeLabel),
+          })),
+          orphanShapes
+        );
+        for (const [cid, pid] of adopted) {
+          const p = patterns.get(pid);
+          // The pattern keeps its id, its threadKey, its knowledge row and its
+          // history — that IS the continuity, and it means a host threading
+          // events by threadKey never sees the seam. Only the producer list
+          // grows, and it is the ledger row's own durable record that this
+          // pattern has been carried by more than one shelf.
+          p.aliases = [...(p.aliases || []).filter((a) => a !== cid), cid].slice(-MAX_ALIASES);
+          resolved.set(cid, p);
+          held.add(p.id);
+        }
+      }
+    }
 
     // 1. upsert candidates (merge signal; keep the stable born; first sighting
     //    emits the forming-band `pattern` capture; fresh evidence revives the
     //    retired — the ladder goes both ways).
     for (const c of cands) {
-      const ex = patterns.get(c.id);
+      const ex = resolved.get(c.id); // NOT patterns.get(c.id): an adopted
+                                     // pattern's id is its FIRST producer row.
       if (ex) {
         const fresh = c.last > (ex.signal.last || 0);
         ex.signal = { n: c.n, born: Math.min(ex.born || c.born, c.born), last: c.last, refs: c.refs, evidenceSummary: c.evidenceSummary };
@@ -498,6 +682,7 @@ function createMind(ctx) {
           guard: c.guard, guardAnnounced: null,
         };
         patterns.set(p.id, p);
+        resolved.set(c.id, p);
         receipt.upserted++;
         // Crisis-guarded evidence is tracked (auditable in the ledger and the
         // `guarded` count) but never narrated (elifant#17): the normal path
@@ -511,11 +696,21 @@ function createMind(ctx) {
       }
     }
 
+    // Every ledger pattern a live candidate is carrying this tick, keyed by
+    // PATTERN id — which after an adoption is not the candidate's id, so the
+    // two steps below can no longer ask "is my own id a candidate?".
+    const carried = new Set([...resolved.values()].map((p) => p.id));
+    // ...and the fresh shelf embeddings re-keyed the same way, so an adopted
+    // pattern's re-promotion carries the NEW shelf's scent rather than
+    // silently falling back to the old knowledge row's.
+    const vecByPattern = new Map();
+    for (const [cid, p] of resolved) vecByPattern.set(p.id, vecById.get(cid) || null);
+
     // 2. recompute confidence for EVERY pattern. A pattern whose shelf
     //    dissolved recounts its evidence from still-live refs — losing the
     //    memories IS losing the pattern, without waiting for the calendar.
     for (const p of patterns.values()) {
-      if (!candIds.has(p.id)) {
+      if (!carried.has(p.id)) {
         p.signal.n = await _liveRefCount(p);
       }
       p.confidence = confidence({ n: p.signal.n, last: p.signal.last }, nowMs, cfg);
@@ -546,7 +741,7 @@ function createMind(ctx) {
             p.guardAnnounced = guard;
           }
         } else {
-          await _promote(p, nowIso, vecById.get(p.id) || null);
+          await _promote(p, nowIso, vecByPattern.get(p.id) || null);
           receipt.promoted++;
         }
       } else if (p.status === 'hardened') {
@@ -560,7 +755,7 @@ function createMind(ctx) {
         } else if (p.softenedAt && p.confidence >= cfg.reviseConf) {
           p.softenedAt = null; // recovered — a later second decline is visible again
         }
-      } else if (p.status === 'forming' && !candIds.has(p.id) && p.confidence < cfg.retireConf) {
+      } else if (p.status === 'forming' && !carried.has(p.id) && p.confidence < cfg.retireConf) {
         // A fizzle: never hardened, shelf gone, evidence cold. Cull the ledger
         // row quietly (narrating every fizzle would be noise, not honesty —
         // nothing the keyholder was ever told about is disappearing).
@@ -613,6 +808,8 @@ module.exports = {
   promotable,
   threadKey,
   threadOf,
+  themeSignature,
+  adoptionClaims,
   slug,
   renderKnowledge,
   appendHistory,

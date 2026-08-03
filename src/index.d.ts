@@ -994,6 +994,10 @@ export interface MindEvent {
   stage: 'pattern' | 'knowledge' | 'revision' | 'retirement' | 'guard';
   patternId: string;
   kind: string;
+  /** The producer row this pattern was BORN on (a shelf/confirmed filename).
+   *  Stable for the pattern's whole life — a pattern that dissolves and later
+   *  reforms on a new shelf keeps this one (elifant#18), so it is an identity,
+   *  not a pointer to a currently-live row. */
   theme: string;
   themeLabel: string;
   /** Stable public grouping key (hash of theme) — thread events without the raw id. */
