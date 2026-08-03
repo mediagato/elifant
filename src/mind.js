@@ -31,7 +31,9 @@
  *      dissolved: their n recomputes from still-live refs, so deletion and
  *      edit-away are contradiction, mechanically, not just staleness;
  *   5. transitions:
- *        forming  + conf >= 0.8 && n >= 5 && age >= 24h  -> PROMOTE: a durable
+ *        forming  + conf >= 0.8 && n >= 5 && (age >= 24h
+ *                   || n >= promoteHighN, the rolling-window escape hatch of
+ *                   elifant#20, Infinity unless a host opts in) -> PROMOTE: a durable
  *                   pinned knowledge memory (tier-2-synthesized, producer
  *                   'mind/promotion-v1', receipt history in the row itself)
  *                   + a `knowledge` capture — UNLESS the Guard holds it:
@@ -104,6 +106,17 @@ const DEFAULTS = {
   promoteConf: 0.8,   // confidence gate to harden a pattern into knowledge
   promoteN: 5,        // ...and this much live evidence
   promoteAgeH: 24,    // ...and this old (born is real evidence time — no shortcut)
+  // ...UNLESS the evidence is this deep, which is the age gate's only escape
+  // hatch (elifant#20). Infinity by default: the gate is unconditional for
+  // every existing consumer, and only a host that explicitly sets a finite
+  // number opts in. It exists because `born` is derived from the member rows'
+  // own updated_at, so a host whose evidence lives in a ROLLING WINDOW (askari
+  // /mind, built for Allen's deathzone memory, keeps ~24h) has patterns whose
+  // born can never age past the window no matter how much evidence piles up —
+  // a 40-observation pattern would sit in `forming` forever. Depth of evidence
+  // substituting for elapsed time is a real, defensible signal; assuming every
+  // host wants it is not, hence the opt-in default.
+  promoteHighN: Infinity,
   reviseConf: 0.4,    // hardened below this -> visible revision (once per softening)
   retireConf: 0.2,    // hardened below this -> visible retirement
   targetN: 5,         // n at which the evidence factor saturates
@@ -167,12 +180,19 @@ function confidence({ n, last }, nowMs, cfg = DEFAULTS) {
   return Math.round(nFactor * recency * 100) / 100;
 }
 
+// Confidence and evidence are hard gates. Age is a hard gate too, with exactly
+// one escape hatch: n >= promoteHighN (elifant#20, Infinity unless a host opts
+// in — see DEFAULTS). Note the OR sits INSIDE the age clause, never around
+// promoteConf/promoteN: deep evidence buys a pattern out of the calendar, never
+// out of the confidence or recurrence floors, and never out of the Guard (which
+// is checked by the caller and reads no config at all).
 function promotable(p, nowMs, cfg = DEFAULTS) {
   const ageH = (nowMs - (p.born || nowMs)) / 3600000;
+  const n = p.signal.n || 0;
   return p.status === 'forming'
     && p.confidence >= cfg.promoteConf
-    && (p.signal.n || 0) >= cfg.promoteN
-    && ageH >= cfg.promoteAgeH;
+    && n >= cfg.promoteN
+    && (ageH >= cfg.promoteAgeH || n >= cfg.promoteHighN);
 }
 
 // The knowledge row — the receipt IS the content, keeper style. The `## history`

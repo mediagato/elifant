@@ -122,6 +122,33 @@ test('promotable: all three gates required — confidence, n, age', () => {
   assert.equal(mind.promotable({ ...base, status: 'hardened' }, now), false, 'only forming promotes');
 });
 
+test('#20 promotable: promoteHighN is the age gate\'s only escape hatch, and it is off by default', () => {
+  const now = Date.parse('2026-07-31T00:00:00Z');
+  // (c) the default must be a no-op for every existing consumer.
+  assert.equal(mind.DEFAULTS.promoteHighN, Infinity,
+    'off by default — no consumer\'s behavior changes unless it opts in explicitly');
+  const young = { status: 'forming', confidence: 0.9, signal: { n: 40 }, born: now - 1 * HOUR };
+  assert.equal(mind.promotable(young, now), false,
+    'n=40 an hour old still waits: Infinity means no n can ever clear the hatch');
+
+  // (a) opted in, and the evidence reaches it -> age is bought out.
+  assert.equal(mind.promotable(young, now, { ...mind.DEFAULTS, promoteHighN: 12 }), true,
+    'n >= promoteHighN promotes regardless of age');
+  // (b) opted in, evidence short of it -> the 24h gate applies exactly as today.
+  const shallow = { ...young, signal: { n: 11 } };
+  assert.equal(mind.promotable(shallow, now, { ...mind.DEFAULTS, promoteHighN: 12 }), false,
+    'n < promoteHighN still waits out promoteAgeH');
+  assert.equal(mind.promotable({ ...shallow, born: now - 2 * DAY }, now, { ...mind.DEFAULTS, promoteHighN: 12 }), true,
+    '...and clears it the normal way once it is genuinely old');
+
+  // The hatch is scoped to AGE. It never buys out confidence or recurrence.
+  const hi = { ...mind.DEFAULTS, promoteHighN: 12 };
+  assert.equal(mind.promotable({ ...young, confidence: 0.7 }, now, hi), false, 'confidence gate still hard');
+  assert.equal(mind.promotable({ ...young, signal: { n: 4 } }, now, hi), false,
+    'promoteN still hard — n=4 clears neither gate');
+  assert.equal(mind.promotable({ ...young, status: 'hardened' }, now, hi), false, 'only forming promotes');
+});
+
 test('renderKnowledge/appendHistory: history accumulates, never rewrites', () => {
   const c1 = mind.renderKnowledge('garden, compost', '5 memories about garden over 9 days',
     '2026-07-31', ['2026-07-31 promoted (confidence 1, n=5)']);
@@ -242,6 +269,61 @@ test('a pattern below the gates grows across ticks and promotes when it earns it
   // A day later it has earned all three gates.
   const r3 = await brain.mindTick({ now: iso(T + 25 * HOUR) });
   assert.equal(r3.promoted, 1, 'promoted across ticks, once the age gate passes');
+  await brain.close();
+});
+
+test('#20: a rolling-window host can promote on evidence depth alone — but only by opting in', async () => {
+  // askari/mind (Allen) keeps a ~24h rolling window, so a pattern's `born`
+  // — derived from the member rows' own updated_at — can never age past the
+  // window however much evidence stacks up. Without an escape hatch a
+  // 40-observation pattern sits in `forming` forever.
+  await freshBrain();
+  const T = Date.now();
+  for (let i = 0; i < 6; i++) {
+    await brain.setMemory(`window-${i}.md`, `route note ${i} about the north tunnel checkpoint`,
+      'test', 'instance', nearVec(160, 161 + i));
+  }
+  // (c) DEFAULT: promoteHighN is Infinity, so this is exactly today's kernel —
+  // minutes-old evidence waits out the 24h gate no matter how deep it is.
+  const r1 = await brain.keeperTick({ mind: { now: iso(T) } });
+  assert.equal(r1.mind.upserted, 1, 'one shelf, one pattern');
+  assert.equal(r1.mind.promoted, 0, 'default promoteHighN Infinity — the age gate is unconditional');
+
+  // (b) opted in, but the evidence does not reach the hatch: unchanged.
+  const r2 = await brain.mindTick({ now: iso(T + 60000), promoteHighN: 12 });
+  assert.equal(r2.promoted, 0, 'n=6 < promoteHighN 12 — still waits out promoteAgeH exactly as today');
+
+  // (a) opted in and the evidence reaches it: promotes at ~0h old.
+  const r3 = await brain.mindTick({ now: iso(T + 120000), promoteHighN: 6 });
+  assert.equal(r3.promoted, 1, 'n=6 >= promoteHighN — depth of evidence buys out the calendar');
+  const know = (await brain._internal.query(
+    `SELECT content, pinned, trust_tier FROM memories WHERE synthesized_via = $1`, [mind.MIND_VIA])).rows;
+  assert.equal(know.length, 1, 'a real knowledge row, on the normal promotion path');
+  assert.equal(know[0].pinned, true);
+  assert.equal(know[0].trust_tier, 'tier-2-synthesized', 'still never the keyholder vouch path');
+  await brain.close();
+});
+
+test('#20: promoteHighN never reaches the Guard — deep evidence about a third party still promotes nothing', async () => {
+  // The hatch is scoped to ONE gate. Everything the kernel refuses to infer it
+  // still refuses at any n (elifant#16/#17: the floor reads no config at all).
+  await freshBrain();
+  const T = Date.now();
+  const gripes = [
+    'Dave was late to standup again and the whole morning slipped',
+    'Dave shipped the broken build again, he never runs the tests',
+    'so tired of covering for Dave, he is impossible to plan around',
+    'Dave talked over me for the entire retro meeting',
+    'another Dave morning, he left the build red and went home',
+    'Dave skipped the handoff again and nobody could ship',
+  ];
+  for (let i = 0; i < gripes.length; i++) {
+    await brain.setMemory(`hn-gripe-${i}.md`, gripes[i], 'test', 'instance', nearVec(30, 31 + i));
+  }
+  await brain.keeperTick({ mind: false });
+  const r = await brain.mindTick({ now: iso(T), promoteHighN: 1 });
+  assert.equal(r.promoted, 0, 'no promoteHighN value reaches the third-party floor');
+  assert.ok(r.guarded >= 1, 'the guard is what held it');
   await brain.close();
 });
 
