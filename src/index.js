@@ -443,6 +443,38 @@ async function _applySchema(db) {
     `);
   }
 
+  // Migration (elifant#9 — decay: give archival a REASON). Before this, the
+  // `archived` boolean quietly meant three different things: the keyholder
+  // archiving a row by hand (app/api.js, the mrmags host), the Mind retiring
+  // its own knowledge row (mind.js's _retire — already shipped, 0.23.0), and
+  // now decay itself. A boolean cannot carry that distinction, and the
+  // distinction is load-bearing: mind.js's SOURCE_WHERE decides whether an
+  // archived row still counts as EVIDENCE for a pattern, and a decay-archived
+  // row must (it was never retracted — nobody said it was wrong, it just went
+  // quiet) while a keyholder-archived or Mind-retired row must not (exactly
+  // today's behavior). archived_reason is that flag: NULL when not archived,
+  // one of ARCHIVE_REASON's three values when it is.
+  //
+  // Deliberately NOT required on every archive: setMemoryArchive(fn, true) with
+  // no third argument still works exactly as it did before this migration —
+  // reason lands NULL, same grandfather clause as steering's `origin IS NULL`
+  // above (every pre-existing call site — keeper.js's shelf-dissolve archive,
+  // every test that predates this issue — keeps working unmodified, and an
+  // unattributed archive simply isn't decay, so it is excluded from the Mind's
+  // decay-tolerant evidence clause exactly like a keyholder archive would be).
+  // Un-archiving always clears the reason (setMemoryArchive's own code, not
+  // this constraint) — "why archived" cannot survive not being archived.
+  await db.exec(`ALTER TABLE memories ADD COLUMN IF NOT EXISTS archived_reason TEXT;`);
+  const _archiveReasonFloor = await db.query(
+    "SELECT 1 FROM pg_constraint WHERE conname = 'memories_archived_reason_valid'"
+  );
+  if (!_archiveReasonFloor.rows[0]) {
+    await db.exec(`
+      ALTER TABLE memories ADD CONSTRAINT memories_archived_reason_valid
+        CHECK (archived_reason IS NULL OR archived_reason IN ('keyholder', 'mind-retirement', 'decay'));
+    `);
+  }
+
   // Migration (elifant#8 — reinforcement: the recall counter). searchMemories
   // was a pure read: retrieving a memory had no effect on its future
   // retrievability, so a note that kept proving useful was no easier to find on
@@ -556,6 +588,23 @@ const TRUST_TIER = {
   RAW_EXHAUST: 'tier-4-raw-exhaust',
 };
 const TIER_RANK = { 'tier-1-keyholder-direct': 1, 'tier-2-synthesized': 2, 'tier-3-observed-external': 3, 'tier-4-raw-exhaust': 4 };
+
+// ── archived_reason (elifant#9) ────────────────────────────────────────────
+// The THIRD thing that can set `archived = true`, and the reason the boolean
+// alone stopped being enough. 'keyholder' — a human archiving a row by hand
+// (app/api.js on the mrmags host). 'mind-retirement' — the Mind's own _retire()
+// walking a hardened pattern's knowledge row back down the ladder (mind.js,
+// elifant#5). 'decay' — nobody touched anything; the row just went quiet long
+// enough (src/decay.js, this issue). Every OTHER surface in the kernel that
+// filters on `archived = false` (getAllMemories, searchMemories, the Keeper's
+// own SOURCE_WHERE) is unchanged by this — it still means "hidden," full stop,
+// regardless of why. The ONE place the reason is load-bearing is mind.js's
+// SOURCE_WHERE, which must tell "went quiet" apart from "was retracted."
+const ARCHIVE_REASON = {
+  KEYHOLDER: 'keyholder',
+  MIND_RETIREMENT: 'mind-retirement',
+  DECAY: 'decay',
+};
 
 // Resolve the tier to WRITE for an imported row given the import's tier policy.
 // 'preserve' keeps the incoming tier (the "I trust this keyholder" override, and
@@ -904,7 +953,7 @@ async function getAllMemories({ includeArchived = false, onlyArchived = false } 
   }
   const whereSql = `WHERE ${where.join(' AND ')}`;
   const result = await _db.query(`
-    SELECT filename, layer, updated_at, updated_by, pinned, archived, trust_tier, restored_from
+    SELECT filename, layer, updated_at, updated_by, pinned, archived, archived_reason, trust_tier, restored_from
     FROM memories
     ${whereSql}
     ORDER BY pinned DESC, filename
@@ -935,11 +984,24 @@ async function setMemoryPin(filename, pinned) {
 // the default listing and excluded from semantic search at the caller's
 // discretion. The memory itself is preserved. No-op if the memory doesn't
 // exist.
-async function setMemoryArchive(filename, archived) {
+//
+// `reason` (elifant#9) names WHY, from ARCHIVE_REASON — optional and NULL by
+// default, so every call site that pre-dates this issue (keeper.js's own
+// shelf-dissolve archive, every test written before archived_reason existed)
+// keeps working unmodified: an archive with no declared reason simply isn't
+// decay, and reads as evidence loss in mind.js exactly as it always has.
+// Un-archiving always clears the reason regardless of what's passed — "why
+// archived" cannot survive not being archived, so a later re-archive for a
+// DIFFERENT reason can never silently inherit a stale explanation.
+async function setMemoryArchive(filename, archived, reason = null) {
   _ensure();
+  const isArchived = Boolean(archived);
+  if (isArchived && reason != null && !Object.values(ARCHIVE_REASON).includes(reason)) {
+    throw new Error(`setMemoryArchive: unknown archive reason "${reason}" (want ${Object.values(ARCHIVE_REASON).join('|')}, or omit it for an unattributed archive)`);
+  }
   await _db.query(
-    'UPDATE memories SET archived = $1 WHERE filename = $2',
-    [Boolean(archived), filename]
+    'UPDATE memories SET archived = $1, archived_reason = $2 WHERE filename = $3',
+    [isArchived, isArchived ? reason : null, filename]
   );
 }
 
@@ -3853,20 +3915,27 @@ async function _rollbackForwardMerge(receipt, buf) {
       }
     }
     // memories — embedding gated on noseMatch (NULL → re-embed queue)
-    for (const row of (await tmp.query('SELECT filename, content, updated_by, updated_at, layer, anonymizable, embedding::text AS embedding, pinned, archived, trust_tier FROM memories')).rows) {
+    // archived_reason (elifant#9) rides alongside pinned/archived here for the
+    // same fidelity reason: this is a LOCAL full-state snapshot (unlike
+    // exportBrain/importBrain, which deliberately omit pinned/archived
+    // entirely — those are local curation, not portable identity), so a
+    // rollback that restored `archived = true` but dropped WHY would silently
+    // turn a decay-archived row into an unattributed one — which mind.js's
+    // SOURCE_WHERE reads as evidence loss instead of the non-event it was.
+    for (const row of (await tmp.query('SELECT filename, content, updated_by, updated_at, layer, anonymizable, embedding::text AS embedding, pinned, archived, archived_reason, trust_tier FROM memories')).rows) {
       const emb = noseMatch ? row.embedding : null;
       const ex = await tx.query('SELECT updated_at, deleted_at FROM memories WHERE filename = $1', [row.filename]);
       if (ex.rows[0] && !ex.rows[0].deleted_at) { // tombstone counts as absent → resurrect on rollback
         conflicts++;
         if (_liveWins(ex.rows[0].updated_at, row.updated_at)) { skipped++; continue; }
-        await tx.query(`INSERT INTO memories (filename,content,updated_by,updated_at,layer,anonymizable,embedding,pinned,archived,trust_tier) VALUES ($1,$2,$3,$4,$5,$6,$7::vector,$8,$9,$10)
-          ON CONFLICT(filename) DO UPDATE SET content=EXCLUDED.content, updated_by=EXCLUDED.updated_by, updated_at=EXCLUDED.updated_at, layer=EXCLUDED.layer, anonymizable=EXCLUDED.anonymizable, embedding=EXCLUDED.embedding, pinned=EXCLUDED.pinned, archived=EXCLUDED.archived, trust_tier=EXCLUDED.trust_tier`,
-          [row.filename, row.content, row.updated_by, row.updated_at, row.layer, row.anonymizable, emb, row.pinned, row.archived, row.trust_tier]);
+        await tx.query(`INSERT INTO memories (filename,content,updated_by,updated_at,layer,anonymizable,embedding,pinned,archived,archived_reason,trust_tier) VALUES ($1,$2,$3,$4,$5,$6,$7::vector,$8,$9,$10,$11)
+          ON CONFLICT(filename) DO UPDATE SET content=EXCLUDED.content, updated_by=EXCLUDED.updated_by, updated_at=EXCLUDED.updated_at, layer=EXCLUDED.layer, anonymizable=EXCLUDED.anonymizable, embedding=EXCLUDED.embedding, pinned=EXCLUDED.pinned, archived=EXCLUDED.archived, archived_reason=EXCLUDED.archived_reason, trust_tier=EXCLUDED.trust_tier`,
+          [row.filename, row.content, row.updated_by, row.updated_at, row.layer, row.anonymizable, emb, row.pinned, row.archived, row.archived_reason, row.trust_tier]);
         imported.memories++;
       } else {
-        await tx.query(`INSERT INTO memories (filename,content,updated_by,updated_at,layer,anonymizable,embedding,pinned,archived,trust_tier,restored_from) VALUES ($1,$2,$3,$4,$5,$6,$7::vector,$8,$9,$10,$11)
-          ON CONFLICT(filename) DO UPDATE SET content=EXCLUDED.content, updated_by=EXCLUDED.updated_by, updated_at=EXCLUDED.updated_at, layer=EXCLUDED.layer, anonymizable=EXCLUDED.anonymizable, embedding=EXCLUDED.embedding, pinned=EXCLUDED.pinned, archived=EXCLUDED.archived, trust_tier=EXCLUDED.trust_tier, restored_from=EXCLUDED.restored_from, deleted_at=NULL`,
-          [row.filename, row.content, row.updated_by, row.updated_at, row.layer, row.anonymizable, emb, row.pinned, row.archived, row.trust_tier, sid]);
+        await tx.query(`INSERT INTO memories (filename,content,updated_by,updated_at,layer,anonymizable,embedding,pinned,archived,archived_reason,trust_tier,restored_from) VALUES ($1,$2,$3,$4,$5,$6,$7::vector,$8,$9,$10,$11,$12)
+          ON CONFLICT(filename) DO UPDATE SET content=EXCLUDED.content, updated_by=EXCLUDED.updated_by, updated_at=EXCLUDED.updated_at, layer=EXCLUDED.layer, anonymizable=EXCLUDED.anonymizable, embedding=EXCLUDED.embedding, pinned=EXCLUDED.pinned, archived=EXCLUDED.archived, archived_reason=EXCLUDED.archived_reason, trust_tier=EXCLUDED.trust_tier, restored_from=EXCLUDED.restored_from, deleted_at=NULL`,
+          [row.filename, row.content, row.updated_by, row.updated_at, row.layer, row.anonymizable, emb, row.pinned, row.archived, row.archived_reason, row.trust_tier, sid]);
         imported.memories++; resurrected.memories.push(row.filename);
       }
     }
@@ -4235,6 +4304,26 @@ const _mind = _mindModule.createMind({
   deleteState,
   ts: _ts,
   trustTier: TRUST_TIER,
+  archiveReason: ARCHIVE_REASON, // elifant#9 — _retire() tags its archive 'mind-retirement'
+});
+
+// ── Decay (elifant#9) ──────────────────────────────────────────────────────
+// The forgetting curve: untouched, never/rarely-recalled, old keyholder rows
+// drift toward archived on their own — reversibly, visibly, never deleted.
+// All mechanics live in src/decay.js (pure thresholds, model-free); this is
+// the wiring. strengthOf is index.js's OWN private reinforcement curve
+// (elifant#8) handed in by reference so decay's "low-strength" gate can never
+// quietly drift from what searchMemories' fusion actually ranks by.
+const _decayModule = require('./decay');
+const _decay = _decayModule.createDecay({
+  query: (sql, params) => { _ensure(); return _db.query(sql, params); },
+  addCapture,
+  setMemoryArchive,
+  snapshot,
+  ts: _ts,
+  trustTier: TRUST_TIER,
+  archiveReason: ARCHIVE_REASON,
+  strengthOf: _strengthOf,
 });
 
 /**
@@ -4276,6 +4365,13 @@ async function keeperStatus() { _ensure(); return _keeper.status(); }
 
 /** Run one Mind pass standalone (opts.now overrides the clock — test hook). */
 async function mindTick(opts) { _ensure(); return _mind.tick(opts); }
+
+/** Run one Decay pass standalone (elifant#9). Not chained into keeperTick —
+ *  see src/decay.js's header for why. opts.now overrides the clock. */
+async function decayTick(opts) { _ensure(); return _decay.tick(opts); }
+
+/** Decay's own liveness: the last tick's receipt. */
+async function decayStatus() { _ensure(); return _decay.status(); }
 
 // ── the Guard (elifant#16) ────────────────────────────────────────────────
 // Permanent content floors under the promotion ladder (src/guard.js — pure,
@@ -4377,6 +4473,10 @@ module.exports = {
   // v0.23.0 — the Mind (promotion ladder: pattern -> knowledge, visible revision)
   mindTick,
   mindStatus,
+  // elifant#9 — the forgetting curve (decay toward the archive, never delete)
+  decayTick,
+  decayStatus,
+  ARCHIVE_REASON,
   // Internal, test-only — NOT a stable public API. Exposed so the version-vector
   // algebra (the causal-merge continuity primitive) can be unit-tested directly.
   _internal: {

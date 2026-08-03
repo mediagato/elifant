@@ -60,6 +60,9 @@ export interface MemoryListRow {
   updated_by: string | null;
   pinned: boolean;
   archived: boolean;
+  /** WHY archived (elifant#9) — null when not archived, or when archived
+   *  through a call site that pre-dates this column. */
+  archived_reason: ArchiveReason | null;
 }
 
 /** Options for getAllMemories. By default archived memories are excluded. */
@@ -670,8 +673,25 @@ export function getAllMemories(options?: ListMemoriesOptions): Promise<MemoryLis
 /** Toggle the pinned flag on a memory. No-op if the memory doesn't exist. */
 export function setMemoryPin(filename: string, pinned: boolean): Promise<void>;
 
-/** Toggle the archived flag on a memory. No-op if the memory doesn't exist. */
-export function setMemoryArchive(filename: string, archived: boolean): Promise<void>;
+/**
+ * Archival reason (elifant#9) — WHY a row was archived, not just that it was.
+ * 'keyholder' = archived by hand. 'mind-retirement' = the Mind's own _retire()
+ * walking a hardened pattern back down the ladder. 'decay' = src/decay.js's
+ * forgetting curve — untouched, never-recalled, old. This is the ONE place
+ * the distinction is load-bearing: mind.js's evidence predicates treat a
+ * decay-archived row as still-live, and every other reason (including a
+ * legacy/unattributed archive) as evidence loss, exactly as before this issue.
+ */
+export type ArchiveReason = 'keyholder' | 'mind-retirement' | 'decay';
+export const ARCHIVE_REASON: { KEYHOLDER: 'keyholder'; MIND_RETIREMENT: 'mind-retirement'; DECAY: 'decay' };
+
+/**
+ * Toggle the archived flag on a memory. No-op if the memory doesn't exist.
+ * `reason` (elifant#9) is optional and NULL by default — every call site that
+ * pre-dates archived_reason keeps working unmodified. Un-archiving always
+ * clears the reason regardless of what's passed.
+ */
+export function setMemoryArchive(filename: string, archived: boolean, reason?: ArchiveReason | null): Promise<void>;
 
 /**
  * elifant#6 follow-up — the keyholder's own "yes, these two say the same
@@ -1283,3 +1303,63 @@ export function mindTick(opts?: MindTickOptions): Promise<MindTickReceipt>;
 
 /** The Mind's own liveness: day N, ladder counts, last tick receipt. */
 export function mindStatus(): Promise<MindStatus>;
+
+// ── Decay (elifant#9 — the forgetting curve) ───────────────────────────────
+
+/** Threshold overrides for one Decay pass. `now` (ISO 8601) overrides the
+ *  clock — a test hook, same convention as MindTickOptions.now. */
+export interface DecayTickOptions {
+  now?: string;
+  /** A keyholder-direct row untouched (no edit) for at least this long is
+   *  old enough to be considered. Default 60 — double mind.js's own
+   *  horizonDays (30), so decay never front-runs the Mind's own recency
+   *  judgement on a pattern's member rows. */
+  decayAgeDays?: number;
+  /** Earned recall strength (elifant#8's curve) below this is "weak enough"
+   *  to decay, given it is also old enough. Default 0.1. */
+  decayStrengthFloor?: number;
+  /** Bounded writes (archives) per tick. Default 50. */
+  batch?: number;
+  /** Bounded reads (candidates considered, oldest-edited-first) per tick. Default 500. */
+  scanLimit?: number;
+}
+
+/** Receipt returned by one Decay pass. */
+export interface DecayTickReceipt {
+  at: string;
+  /** Old-enough candidates examined this tick (read bound, not write bound). */
+  scanned: number;
+  /** Rows archived (reason 'decay') this tick — each emitted a
+   *  {source:'decay', type:'decayed'} capture. */
+  decayed: number;
+  /** True when the pre-write snapshot guard fired (kernel-ethic #11). */
+  snapshotTaken: boolean;
+}
+
+export interface DecayStatus {
+  lastTick: DecayTickReceipt | null;
+}
+
+/** One decay event, as carried in a {source:'decay', type:'decayed'}
+ *  capture's data. */
+export interface DecayEvent {
+  t: string;
+  filename: string;
+  /** The row's earned recall strength (elifant#8) at the moment it decayed —
+   *  always below decayStrengthFloor. */
+  strength: number;
+  text: string;
+}
+
+/**
+ * Run one Decay pass standalone: archive (reason 'decay') every keyholder-
+ * direct, unpinned, live row that is both old enough (no edit in
+ * decayAgeDays) and weak enough (earned recall strength under
+ * decayStrengthFloor), up to `batch` per tick. Reversible via
+ * setMemoryArchive(filename, false) exactly like any other archive; never
+ * deletes; never touches a pinned or synthesized row. NOT chained into
+ * keeperTick — see src/decay.js's header for why. */
+export function decayTick(opts?: DecayTickOptions): Promise<DecayTickReceipt>;
+
+/** Decay's own liveness: the last tick's receipt. */
+export function decayStatus(): Promise<DecayStatus>;

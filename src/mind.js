@@ -126,6 +126,27 @@
  * subject reformed on new memories), and only when the pairing is unambiguous
  * on both sides: exactly one orphan and exactly one unrecognized candidate
  * carrying that signature. See adoptionClaims().
+ *
+ * DECAY IS NOT CONTRADICTION (elifant#9). src/decay.js archives an untouched,
+ * never/rarely-recalled, old memory on its own — but it was never retracted,
+ * never edited away, nobody said it was wrong, it just stopped being asked
+ * for. Disuse is not disagreement, so it must not read as the evidence-loss
+ * contradiction the header above describes for deletion and edit-away. Every
+ * evidence-liveness read this file does — _candidates()'s member-liveness
+ * check, _guardFromRefs, _liveRefNames/_liveRefCount — runs through the ONE
+ * SOURCE_WHERE below, which now treats a decay-archived row as still-live
+ * evidence while a keyholder-archived or deleted row still counts against a
+ * pattern exactly as it always has. Concretely: a shelf whose members are all
+ * decay-archived (not gone, not keyholder-archived) still recomputes n at its
+ * live-evidence count, so a hardened pattern built on it does not spuriously
+ * revise or retire, and a shelf that later ARCHIVES for real reasons (elifant
+ * #18's continuity) sees only-decayed members as ordinary continuing
+ * evidence, not as a dissolved cluster reforming from nothing. The reverse
+ * direction is symmetric and requires no special code: un-decaying a row is
+ * the same setMemoryArchive(fn, false) every archive already reverses through
+ * (index.js), which clears archived_reason too — so a reformed/revived
+ * pattern whose members get un-decayed sees its evidence recover exactly like
+ * any other write, with nothing decay-specific left behind to clean up.
  */
 'use strict';
 
@@ -349,13 +370,17 @@ function appendHistory(content, label, evidenceSummary, date, line) {
  *   query(sql, params)          raw read/write on the live store
  *   addCapture(cap)             transition emission (source:'mind')
  *   setMemoryDerived(...)       stamped write for tier-2 derived rows (+pinned)
- *   setMemoryArchive(fn, bool)  reversible knowledge retirement
+ *   setMemoryArchive(fn, bool, reason)  reversible knowledge retirement
  *   getState/setState/deleteState  the pattern ledger + epoch
  *   ts()                        kernel timestamp
  *   trustTier                   TRUST_TIER constants
+ *   archiveReason                ARCHIVE_REASON constants (elifant#9) — _retire()
+ *                                tags its own archive 'mind-retirement', distinct
+ *                                from a keyholder archive AND from decay, so
+ *                                SOURCE_WHERE below can tell them apart.
  */
 function createMind(ctx) {
-  const { query, addCapture, setMemoryDerived, setMemoryArchive, getState, setState, deleteState, ts, trustTier } = ctx;
+  const { query, addCapture, setMemoryDerived, setMemoryArchive, getState, setState, deleteState, ts, trustTier, archiveReason } = ctx;
 
   async function _setMeta(key, value) {
     await query(
@@ -368,10 +393,19 @@ function createMind(ctx) {
     return r.rows[0] ? r.rows[0].value : null;
   }
 
-  // Same source-eligibility predicate as the Keeper: live, unarchived, not
-  // derived, the keyholder's own words. Evidence never counts anything else.
-  const SOURCE_WHERE = `deleted_at IS NULL AND archived = false AND synthesized_via IS NULL ` +
-    `AND trust_tier = '${trustTier.KEYHOLDER_DIRECT}'`;
+  // Same source-eligibility predicate as the Keeper: live, not derived, the
+  // keyholder's own words — PLUS one deliberate difference from the Keeper's
+  // own copy (elifant#9): a row archived FOR DECAY still counts. Decay is a
+  // retrieval-tier softening, not a retraction — nobody said the row was
+  // wrong, it just went quiet — so it must not read as evidence loss the way
+  // a keyholder archive or a delete still does. Any other archived row
+  // (reason 'keyholder', 'mind-retirement', or NULL — the grandfather case
+  // for every archive that pre-dates archived_reason, including the Keeper's
+  // own shelf-dissolve archive) is excluded exactly as before this issue
+  // shipped: decay is a NAMED exception, not a general softening of what
+  // "live" means. See the header above and decay.js for the full argument.
+  const SOURCE_WHERE = `deleted_at IS NULL AND (archived = false OR archived_reason = '${archiveReason.DECAY}') ` +
+    `AND synthesized_via IS NULL AND trust_tier = '${trustTier.KEYHOLDER_DIRECT}'`;
 
   async function _ledger() {
     const r = await query(
@@ -562,7 +596,11 @@ function createMind(ctx) {
           updatedBy: 'mind', layer: 'instance', embedding: vec,
           trustTier: trustTier.SYNTHESIZED, synthesizedVia: MIND_VIA, pinned: true,
         });
-      await setMemoryArchive(p.knowledge, true); // reversible, never deleted
+      // reversible, never deleted — tagged 'mind-retirement' (elifant#9) so
+      // this row, unlike a decay-archived one, still reads as evidence loss
+      // if anything ever re-derived a pattern from a knowledge row itself
+      // (nothing does today, but the reason should be honest regardless).
+      await setMemoryArchive(p.knowledge, true, archiveReason.MIND_RETIREMENT);
     }
     p.status = 'retired';
     const text = `letting go of ${p.themeLabel} — the evidence went quiet (confidence ${p.confidence})`;
