@@ -389,6 +389,60 @@ async function _applySchema(db) {
   `);
   await db.exec(`CREATE INDEX IF NOT EXISTS memory_edges_b_idx ON memory_edges (b_filename);`);
 
+  // Migration (elifant#11 — steering provenance + the grant floor; lands after
+  // the 0.24.0 publish, version left for whoever cuts the release).
+  // The steering table is the MANNER slot: rows here change how the brain
+  // behaves, not what it knows. Four columns make "who turned this on" a
+  // first-class fact instead of an afterthought:
+  //   origin       — 'shell-seeded' | 'keyholder' | 'learned'. NULL means the
+  //                  row pre-dates this migration, was spore-seeded, or arrived
+  //                  from another bowl: provenance genuinely unknown, and never
+  //                  invented (K-CARBON-4).
+  //   granted_by   — the identity that turned it on. NULL = not granted.
+  //   granted_at   — when. Together with granted_by: "traced to who and when".
+  //   proposal_id  — the proposal a learned rule came from, so an enabled
+  //                  manner rule can be walked back to the evidence that
+  //                  suggested it.
+  // All idempotent. Deliberately NOT added to the YOINK wire format: a grant is
+  // a LOCAL act by the LOCAL keyholder over LOCAL text, so it does not travel.
+  await db.exec(`ALTER TABLE steering ADD COLUMN IF NOT EXISTS origin TEXT;`);
+  await db.exec(`ALTER TABLE steering ADD COLUMN IF NOT EXISTS granted_by TEXT;`);
+  await db.exec(`ALTER TABLE steering ADD COLUMN IF NOT EXISTS granted_at TEXT;`);
+  await db.exec(`ALTER TABLE steering ADD COLUMN IF NOT EXISTS proposal_id TEXT;`);
+
+  // The grant floor, at the STORAGE layer rather than the API layer — so it
+  // holds against raw SQL, the _internal.query escape hatch, and any future
+  // writer that forgets. An enabled steering row must carry a grant.
+  //
+  // The `origin IS NULL` escape is a DELIBERATE, DOCUMENTED grandfather clause,
+  // not an oversight. Adding the constraint without it would fail outright on
+  // any existing brain (every spore-seeded row is enabled and ungranted), and
+  // would abort YOINK/SUMMON imports of perfectly ordinary peer souls. So the
+  // floor binds exactly the rows whose provenance has been declared — which is
+  // every row the propose/grant API has ever touched — and leaves pre-
+  // provenance rows as they were found. The import paths write origin=NULL
+  // explicitly (see importBrain / _mergeWriteSteering) precisely so a foreign
+  // row can never land in a half-attributed state.
+  //
+  // elifant#15's job is to close the remaining gap: backfill origin on legacy
+  // rows, decide whether a foreign soul's steering may be enabled at all, then
+  // DROP the `origin IS NULL` clause. Until then the honest statement is: an
+  // ungranted enabled steering row is impossible through the public API and
+  // impossible in SQL for any row with declared provenance; a legacy or
+  // imported row can still be enabled by raw SQL.
+  //
+  // No `ADD CONSTRAINT IF NOT EXISTS` exists in Postgres, hence the
+  // pg_constraint lookup — this runs on every init and must be idempotent.
+  const _grantFloor = await db.query(
+    "SELECT 1 FROM pg_constraint WHERE conname = 'steering_enabled_requires_grant'"
+  );
+  if (!_grantFloor.rows[0]) {
+    await db.exec(`
+      ALTER TABLE steering ADD CONSTRAINT steering_enabled_requires_grant
+        CHECK (origin IS NULL OR enabled = false OR (granted_by IS NOT NULL AND granted_at IS NOT NULL));
+    `);
+  }
+
   // v0.7.0 — record the Nose (embedder) identity so a brain knows which model
   // produced its Scents. Seeds the historical MiniLM/384 Nose ONLY if absent,
   // so existing brains stay byte-identical. A future Nose swap bumps these via
@@ -1352,6 +1406,388 @@ async function deleteCaptures({ until, source, type } = {}) {
   return result.affectedRows || 0;
 }
 
+// ── Steering: the manner slot (elifant#11) ────────────────────────────────
+//
+// Both steering and review_lessons have existed in the schema — created,
+// exported, imported, snapshot-merged — with NO accessor on the public
+// surface. A consumer had to reach through _internal.query or raw PGlite, and
+// review_lessons could not even be seeded. This is that API.
+//
+// The two tables are deliberately NOT symmetric, because they hold different
+// kinds of thing:
+//
+//   review_lessons  is WHAT SHE KNOWS — 'auto-generated rules from prior
+//                   tasks', the learned-from-experience heuristics slot. A
+//                   producer may append to it freely; that is what learning
+//                   is. Dedup'd by (task_type, rule), matching the forward-
+//                   merge's own dedup key.
+//
+//   steering        is WHO SHE IS — mode / match_pattern / priority / enabled.
+//                   A row here changes behaviour, so it may NOT be written
+//                   freely. Learning changes what she knows, never who she is.
+//
+// So steering gets a two-door API and there is no third door:
+//
+//   proposeSteering()  can never turn a rule ON. It takes no `enabled`
+//                      argument; the flag it writes is either literal false or
+//                      the flag the row already held under a still-valid grant
+//                      (rule 1 below), so no value a caller can pass produces
+//                      an active rule. Anything may propose — a shell, the
+//                      keyholder, the Mind.
+//   grantSteering()    is the ONLY function in this module that writes
+//                      enabled=true, and it REQUIRES grantedBy. The enable
+//                      and the attribution are set in one UPDATE, so there is
+//                      no window — not even a transient one — where a row is
+//                      enabled without a recorded grant.
+//   revokeSteering()   turns it back off and clears the grant.
+//
+// A boolean setter would have made the un-granted enabled row merely
+// discouraged. Splitting the doors makes it unrepresentable. The storage-layer
+// CHECK constraint (see _applySchema) carries the same rule down past the API
+// so raw SQL cannot express it either, for any row with declared provenance.
+//
+// Three further rules, each of which exists because a manner rule is not data:
+//
+//   1. A grant is bound to the TEXT it was granted over. Re-proposing an entry
+//      with different content/mode/match_pattern/priority clears the grant and
+//      drops it to disabled — otherwise a caller could swap the body out from
+//      under a grant and inherit its authority. An identical re-propose is a
+//      no-op for the grant, so an idempotent shell re-seed at every boot does
+//      not silently switch the keyholder's rules off.
+//   2. A grant is bowl-LOCAL. It is not in the YOINK wire format, and the
+//      import paths clear origin/grant on write: a foreign row's text is not
+//      the text this keyholder granted.
+//   3. Resurrected steering comes back DISABLED (the pre-existing rollback
+//      rule, preserved verbatim below in _rollbackForwardMerge) — and now the
+//      grant is cleared with it, so "disabled" and "ungranted" cannot drift
+//      apart.
+
+/** Where a steering entry came from. Three origins, one vocabulary; a caller
+ *  must name one, because an unmarked manner rule is a silent promotion. */
+const STEERING_ORIGIN = Object.freeze({
+  /** Shipped by the shell/spore that installed this brain. */
+  SHELL_SEEDED: 'shell-seeded',
+  /** Written by the keyholder, directly. */
+  KEYHOLDER: 'keyholder',
+  /** Derived from the brain's own experience — a PROPOSAL until granted. */
+  LEARNED: 'learned',
+});
+const STEERING_ORIGINS = new Set(Object.values(STEERING_ORIGIN));
+
+// The steering `mode` vocabulary (schema default 'always'): apply unconditionally,
+// apply when match_pattern hits, or apply only when a caller asks by name.
+const STEERING_MODES = new Set(['always', 'matched', 'manual']);
+
+// Origin fixes the trust tier — the caller does not get to choose it. A learned
+// rule is tier-2-synthesized even after a keyholder grants it: the grant says
+// "you may act on this", not "a human wrote it" (K-CARBON-4 — the promotion a
+// grant performs is to ENABLED, never to keyholder-direct).
+const STEERING_ORIGIN_TIER = {
+  'shell-seeded': TRUST_TIER.KEYHOLDER_DIRECT,
+  keyholder: TRUST_TIER.KEYHOLDER_DIRECT,
+  learned: TRUST_TIER.SYNTHESIZED,
+};
+
+// Columns every steering read returns. One list so the shapes never drift.
+const STEERING_COLS = 'id, name, content, mode, match_pattern, priority, enabled, layer, origin, granted_by, granted_at, proposal_id, trust_tier, created_at, updated_at, restored_from';
+
+// Grant/revoke receipt into the captures stream, so the ledger of "who turned
+// what on, when" is queryable as events and not only as the current row state.
+// Best-effort, exactly like _surfaceConflict: the durable record is the row's
+// own granted_by/granted_at, so a capture failure must never abort the grant.
+async function _steeringReceipt(type, data) {
+  try {
+    await _db.query("INSERT INTO captures (source, type, ts, data) VALUES ('steering',$1,$2,$3)",
+      [type, _ts(), JSON.stringify(data)]);
+  } catch (e) { _debug(`[brain] steering ${type} receipt failed: ${e.message}`); }
+}
+
+/** One steering entry by id, or null. Tombstoned entries read as absent. */
+async function getSteering(id) {
+  _ensure();
+  const r = await _db.query(`SELECT ${STEERING_COLS} FROM steering WHERE id = $1 AND deleted_at IS NULL`, [id]);
+  return r.rows[0] || null;
+}
+
+/**
+ * List steering entries, highest priority first (then id, so the order is
+ * total and stable). Tombstones are excluded.
+ * @param {object} [opts]
+ * @param {boolean} [opts.enabled] omit for ALL entries; true = only active
+ *   rules (what an inject surface wants); false = only proposals/disabled
+ *   entries (what a review surface wants).
+ * @param {string} [opts.mode]  filter by mode ('always'|'matched'|'manual')
+ * @param {string} [opts.layer] filter by layer ('instance'|'pattern')
+ * @param {string} [opts.origin] filter by origin (see STEERING_ORIGIN)
+ */
+async function getAllSteering({ enabled, mode, layer, origin } = {}) {
+  _ensure();
+  const where = ['deleted_at IS NULL'];
+  const params = [];
+  if (enabled !== undefined && enabled !== null) { params.push(!!enabled); where.push(`enabled = $${params.length}`); }
+  if (mode) { params.push(mode); where.push(`mode = $${params.length}`); }
+  if (layer) { params.push(layer); where.push(`layer = $${params.length}`); }
+  if (origin) { params.push(origin); where.push(`origin = $${params.length}`); }
+  const r = await _db.query(
+    `SELECT ${STEERING_COLS} FROM steering WHERE ${where.join(' AND ')} ORDER BY priority DESC, id ASC`, params);
+  return r.rows;
+}
+
+/**
+ * Write a steering entry as a PROPOSAL — always disabled, never active.
+ *
+ * This function cannot TURN ON a rule. It takes no `enabled` argument; the
+ * flag it writes is either literal false or the flag the row already carried
+ * under a still-valid grant — never a value derived from anything the caller
+ * passed. Enabling is grantSteering()'s job, and grantSteering() requires
+ * attribution.
+ *
+ * Re-proposing an existing entry with any behavioural field changed
+ * (content / mode / match_pattern / priority) REVOKES an existing grant — the
+ * grant covered the old text. An identical re-propose leaves the grant intact
+ * so a shell can re-seed on every boot without disabling the keyholder's rules;
+ * the display `name` is a label, not behaviour, so a rename alone is safe.
+ *
+ * @param {object} entry
+ * @param {string} entry.id            stable key (also the sync/merge key)
+ * @param {string} entry.name          display label (steering.name is NOT NULL)
+ * @param {string} entry.content       the rule text itself
+ * @param {'always'|'matched'|'manual'} [entry.mode='always']
+ * @param {string|null} [entry.matchPattern=null]
+ * @param {number} [entry.priority=0]  higher sorts first
+ * @param {'instance'|'pattern'} [entry.layer='instance']
+ * @param {string} entry.origin        REQUIRED — see STEERING_ORIGIN
+ * @param {string|null} [entry.proposalId=null] the evidence/proposal this came from
+ * @returns {Promise<{id:string, enabled:boolean, revoked_grant:boolean}>}
+ *   `revoked_grant` is true when this call turned an active rule back into a
+ *   proposal — the caller is told, never surprised.
+ */
+async function proposeSteering(entry = {}) {
+  _ensure();
+  const { id, name, content, mode = 'always', matchPattern = null, priority = 0, layer = 'instance', origin, proposalId = null } = entry;
+  if (typeof id !== 'string' || !id) throw new Error('proposeSteering: id (non-empty string) is required');
+  if (typeof name !== 'string' || !name) throw new Error('proposeSteering: name (non-empty string) is required — steering.name is NOT NULL');
+  if (typeof content !== 'string' || !content) throw new Error('proposeSteering: content (non-empty string) is required');
+  if (!STEERING_ORIGINS.has(origin)) {
+    throw new Error(`proposeSteering: origin must be one of ${[...STEERING_ORIGINS].join(' | ')} — a manner rule with no recorded origin is a silent promotion`);
+  }
+  if (!STEERING_MODES.has(mode)) {
+    throw new Error(`proposeSteering: mode must be one of ${[...STEERING_MODES].join(' | ')}`);
+  }
+  if (!Number.isInteger(priority)) throw new Error('proposeSteering: priority must be an integer');
+
+  // Read the current row (including tombstones — overwriting a tombstone is a
+  // resurrection, and a resurrected rule is emphatically not still granted).
+  const ex = (await _db.query(
+    'SELECT content, mode, match_pattern, priority, enabled, granted_by, granted_at, deleted_at FROM steering WHERE id = $1', [id]
+  )).rows[0] || null;
+  const live = ex && !ex.deleted_at;
+  const behaviourChanged = !live
+    || ex.content !== content
+    || ex.mode !== mode
+    || (ex.match_pattern || null) !== (matchPattern || null)
+    || Number(ex.priority || 0) !== Number(priority);
+  // A grant can only be carried forward if there IS one. A pre-provenance row
+  // (spore-seeded, imported, or older than this migration) can be enabled with
+  // no granted_by — and the moment this call stamps an origin on it, the
+  // storage floor binds it, so "enabled and ungranted" stops being a state it
+  // may occupy. Dropping it to a proposal is the only honest move: we do not
+  // know who turned it on, and inventing an answer is the failure this whole
+  // API exists to prevent. It is reported (revoked_grant), never silent.
+  const grantIntact = !!(live && ex.granted_by && ex.granted_at);
+  const keepGrant = live && !behaviourChanged && grantIntact;
+  const enabled = keepGrant ? !!ex.enabled : false;
+  const grantedBy = keepGrant ? ex.granted_by : null;
+  const grantedAt = keepGrant ? ex.granted_at : null;
+
+  const { vv, hash } = await _stampWrite('steering', 'id', id, content);
+  const ts = _ts();
+  await _db.query(`
+    INSERT INTO steering (id, name, content, mode, match_pattern, priority, enabled, layer, origin, granted_by, granted_at, proposal_id, trust_tier, created_at, updated_at, version_vector, content_hash, deleted_at)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$14,$15,$16,NULL)
+    ON CONFLICT(id) DO UPDATE SET
+      name = EXCLUDED.name,
+      content = EXCLUDED.content,
+      mode = EXCLUDED.mode,
+      match_pattern = EXCLUDED.match_pattern,
+      priority = EXCLUDED.priority,
+      enabled = EXCLUDED.enabled,
+      layer = EXCLUDED.layer,
+      origin = EXCLUDED.origin,
+      granted_by = EXCLUDED.granted_by,
+      granted_at = EXCLUDED.granted_at,
+      proposal_id = EXCLUDED.proposal_id,
+      trust_tier = EXCLUDED.trust_tier,
+      updated_at = EXCLUDED.updated_at,
+      version_vector = EXCLUDED.version_vector,
+      content_hash = EXCLUDED.content_hash,
+      deleted_at = NULL
+  `, [id, name, content, mode, matchPattern || null, priority, enabled, layer, origin, grantedBy, grantedAt, proposalId, STEERING_ORIGIN_TIER[origin], ts, vv, hash]);
+
+  const revoked = !!(live && ex.enabled && !keepGrant);
+  if (revoked) {
+    await _steeringReceipt('revoke', {
+      id,
+      reason: behaviourChanged ? 'content changed under an active grant' : 'active rule had no recorded grant to carry forward',
+      prior_granted_by: ex.granted_by || null,
+      prior_granted_at: ex.granted_at || null,
+    });
+  }
+  return { id, enabled, revoked_grant: revoked };
+}
+
+/**
+ * Turn a steering entry ON. The ONLY code path in this module that writes
+ * enabled=true — and it cannot run without `grantedBy`.
+ *
+ * enabled, granted_by and granted_at are written by a SINGLE UPDATE, so the
+ * row is never observably enabled-without-a-grant, not even mid-transaction.
+ * The storage CHECK constraint refuses the pair coming apart afterwards.
+ *
+ * @param {string} id
+ * @param {object} grant
+ * @param {string} grant.grantedBy  REQUIRED — the identity turning it on
+ * @param {string|null} [grant.proposalId] the proposal being granted; when
+ *   omitted the entry keeps whatever proposal_id it was proposed with
+ * @param {string|null} [grant.note] free-text reason, receipted only
+ * @throws if grantedBy is missing/blank, or the entry does not exist
+ */
+async function grantSteering(id, grant = {}) {
+  _ensure();
+  const { grantedBy, proposalId = null, note = null } = grant;
+  if (typeof id !== 'string' || !id) throw new Error('grantSteering: id (non-empty string) is required');
+  if (typeof grantedBy !== 'string' || !grantedBy.trim()) {
+    throw new Error('grantSteering: grantedBy is required — an enabled steering entry with no recorded grant is exactly what this API exists to make impossible');
+  }
+  const ex = (await _db.query('SELECT id, content, enabled, origin, version_vector FROM steering WHERE id = $1 AND deleted_at IS NULL', [id])).rows[0];
+  if (!ex) throw new Error(`grantSteering: no steering entry '${id}' — propose it first (a grant cannot conjure the rule it grants)`);
+
+  const at = _ts();
+  // A grant changes BEHAVIOUR without changing content, so _stampWrite (which
+  // is content-hash-keyed and would decline to bump) is not the right tool: bump
+  // the vector directly so another device sees the enable as a causal event
+  // rather than as an invisible no-op.
+  const vv = _vvStringify(_vvBump(ex.version_vector, await _localDeviceId()));
+  await _db.query(
+    `UPDATE steering SET enabled = true, granted_by = $1, granted_at = $2,
+       proposal_id = COALESCE($3, proposal_id), updated_at = $2, version_vector = $4
+     WHERE id = $5`,
+    [grantedBy, at, proposalId, vv, id]);
+  await _steeringReceipt('grant', { id, granted_by: grantedBy, granted_at: at, origin: ex.origin || null, proposal_id: proposalId, note });
+  return { id, enabled: true, granted_by: grantedBy, granted_at: at };
+}
+
+/**
+ * Turn a steering entry OFF and clear its grant. Idempotent: a missing,
+ * tombstoned, or already-disabled-and-ungranted entry is a no-op reporting
+ * `changed:false`. Revocation is the SAFE direction, so `revokedBy` is
+ * recorded when given but never required — nothing should stand between a
+ * keyholder and switching a behaviour off.
+ */
+async function revokeSteering(id, { revokedBy = null, note = null } = {}) {
+  _ensure();
+  if (typeof id !== 'string' || !id) throw new Error('revokeSteering: id (non-empty string) is required');
+  const ex = (await _db.query('SELECT id, enabled, granted_by, granted_at, version_vector FROM steering WHERE id = $1 AND deleted_at IS NULL', [id])).rows[0];
+  if (!ex) return { id, enabled: false, changed: false };
+  if (!ex.enabled && !ex.granted_by && !ex.granted_at) return { id, enabled: false, changed: false };
+  const vv = _vvStringify(_vvBump(ex.version_vector, await _localDeviceId()));
+  await _db.query(
+    'UPDATE steering SET enabled = false, granted_by = NULL, granted_at = NULL, updated_at = $1, version_vector = $2 WHERE id = $3',
+    [_ts(), vv, id]);
+  await _steeringReceipt('revoke', { id, reason: 'revoked', revoked_by: revokedBy, prior_granted_by: ex.granted_by || null, prior_granted_at: ex.granted_at || null, note });
+  return { id, enabled: false, changed: true };
+}
+
+/**
+ * Soft-delete a steering entry: a tombstone (deleted_at + version-vector bump),
+ * exactly like deleteState/deleteMemory, so the delete propagates on sync
+ * instead of being resurrected by a stale present-row. Filtered from every
+ * read above. No-op if absent or already a tombstone.
+ *
+ * KNOWN GAP (not this issue's): pruneTombstones() reaps memories + state only,
+ * so a steering tombstone is never garbage-collected. Harmless (one dead row)
+ * but asymmetric.
+ */
+async function deleteSteering(id) {
+  _ensure();
+  const ex = await _db.query('SELECT version_vector, deleted_at FROM steering WHERE id = $1', [id]);
+  if (!ex.rows[0] || ex.rows[0].deleted_at) return;
+  const vv = _vvStringify(_vvBump(ex.rows[0].version_vector, await _localDeviceId()));
+  // Clear the grant on the way down: a tombstoned rule must not be resurrectable
+  // straight back into an ENABLED state by any path that only clears deleted_at.
+  await _db.query('UPDATE steering SET deleted_at = $1, version_vector = $2, enabled = false, granted_by = NULL, granted_at = NULL WHERE id = $3',
+    [_ts(), vv, id]);
+}
+
+// ── Review lessons: the learned-heuristics slot (elifant#11) ──────────────
+//
+// 'auto-generated rules from prior tasks' — the schema slot for what she has
+// learned from experience. Unlike steering, this needs no grant: it records
+// what she KNOWS, and knowing is not behaving. A consumer that wants a lesson
+// to change behaviour must take it through proposeSteering + a keyholder
+// grant, which is exactly the line elifant#14 draws.
+
+/**
+ * Append a learned lesson. Dedup'd on (task_type, rule) — the same key the
+ * forward-merge already dedups by, and the reason review_lessons_dedup_idx
+ * exists — so a producer re-deriving the same rule every pass does not grow
+ * the table without bound. Returns the existing row with `deduped:true` in
+ * that case, mirroring addCapture's shape.
+ *
+ * @param {object} lesson
+ * @param {string} lesson.taskType   what kind of task this was learned from
+ * @param {string} lesson.rule       the heuristic itself
+ * @param {number|null} [lesson.sourceItemId] the item it was derived from
+ * @param {'instance'|'pattern'} [lesson.layer='instance']
+ */
+async function addReviewLesson(lesson = {}) {
+  _ensure();
+  const { taskType, rule, sourceItemId = null, layer = 'instance' } = lesson;
+  if (typeof taskType !== 'string' || !taskType) throw new Error('addReviewLesson: taskType (non-empty string) is required');
+  if (typeof rule !== 'string' || !rule) throw new Error('addReviewLesson: rule (non-empty string) is required');
+  if (sourceItemId !== null && sourceItemId !== undefined && !Number.isInteger(sourceItemId)) {
+    throw new Error('addReviewLesson: sourceItemId must be an integer or null (the column is INTEGER)');
+  }
+  const ex = (await _db.query('SELECT id FROM review_lessons WHERE task_type = $1 AND rule = $2 ORDER BY id LIMIT 1', [taskType, rule])).rows[0];
+  if (ex) return { id: Number(ex.id), deduped: true };
+  const r = await _db.query(
+    'INSERT INTO review_lessons (task_type, rule, source_item_id, layer, created_at) VALUES ($1,$2,$3,$4,$5) RETURNING id',
+    [taskType, rule, sourceItemId == null ? null : sourceItemId, layer, _ts()]);
+  return { id: Number(r.rows[0].id) };
+}
+
+/**
+ * Read learned lessons, newest first ("what have I learned lately" is the
+ * question this table gets asked). Filter by taskType to get the heuristics
+ * for one kind of work. `limit` defaults to 1000 and is capped at 10000 —
+ * bounded reads only (armor invariant 1).
+ */
+async function getReviewLessons({ taskType = null, limit = 1000 } = {}) {
+  _ensure();
+  const n = Math.min(Math.max(Number(limit) || 1000, 1), 10000);
+  const params = [];
+  let where = '';
+  if (taskType) { params.push(taskType); where = 'WHERE task_type = $1'; }
+  params.push(n);
+  const r = await _db.query(
+    `SELECT id, task_type, rule, source_item_id, layer, created_at, restored_from
+     FROM review_lessons ${where} ORDER BY created_at DESC, id DESC LIMIT $${params.length}`, params);
+  return r.rows;
+}
+
+/**
+ * Delete one learned lesson by id. A hard delete, not a tombstone: this table
+ * is deliberately outside the version-vector machinery (append-and-dedup by
+ * (task_type, rule), see the 0.19.0 migration note), so there is nothing for a
+ * tombstone to dominate. Returns true if a row was removed.
+ */
+async function deleteReviewLesson(id) {
+  _ensure();
+  if (!Number.isInteger(id)) throw new Error('deleteReviewLesson: id must be an integer');
+  const r = await _db.query('DELETE FROM review_lessons WHERE id = $1 RETURNING id', [id]);
+  return r.rows.length > 0;
+}
+
 // ── Spore seed ────────────────────────────────────────────────────────────
 
 /**
@@ -1387,6 +1823,12 @@ async function seedFromSpore(sporeData) {
   }
 
   if (sporeData.steering) {
+    // Spore rows land enabled with NO origin, exactly as they always have. That
+    // leaves them under the steering_enabled_requires_grant floor's grandfather
+    // clause (see _applySchema) — deliberate: retrofitting a grant here would
+    // mean inventing one, and changing spores to seed DISABLED rows is a
+    // behaviour change for every existing shell. elifant#15 owns that call.
+    // New code should prefer proposeSteering() + grantSteering().
     for (const s of sporeData.steering) {
       await _db.query(`
         INSERT INTO steering (id, name, content, mode, match_pattern, priority, enabled, layer, created_at, updated_at)
@@ -2319,9 +2761,21 @@ async function importBrain(input) {
         if (conflict === 'skip') { skipped++; continue; }
         if (conflict === 'newer-wins' && existing.rows[0].updated_at >= row.updated_at) { skipped++; continue; }
       }
+      // origin/granted_by/granted_at/proposal_id are written NULL, on insert AND
+      // on conflict (elifant#11). A grant is a LOCAL act by the LOCAL keyholder
+      // over LOCAL text: once a foreign row replaces the text, any local grant
+      // described something that no longer exists, so carrying it forward would
+      // be a lie and re-deriving one would be a forgery. Clearing them also
+      // keeps this path out of the steering_enabled_requires_grant floor's way
+      // (that floor binds declared-provenance rows), so a peer's ordinary
+      // enabled steering row imports exactly as it always has.
+      // KNOWN GAP, elifant#15's to close: that means an imported soul CAN land
+      // an enabled steering entry here with no keyholder grant. Deciding whether
+      // a foreign manner rule may be active at all is #15's call, not a silent
+      // change smuggled in with a read API.
       await _db.query(`
-        INSERT INTO steering (id, name, content, mode, match_pattern, priority, enabled, layer, created_at, updated_at, trust_tier, version_vector, content_hash, deleted_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+        INSERT INTO steering (id, name, content, mode, match_pattern, priority, enabled, layer, created_at, updated_at, trust_tier, version_vector, content_hash, deleted_at, origin, granted_by, granted_at, proposal_id)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NULL, NULL, NULL, NULL)
         ON CONFLICT(id) DO UPDATE SET
           name = EXCLUDED.name,
           content = EXCLUDED.content,
@@ -2334,7 +2788,11 @@ async function importBrain(input) {
           trust_tier = EXCLUDED.trust_tier,
           version_vector = EXCLUDED.version_vector,
           content_hash = EXCLUDED.content_hash,
-          deleted_at = EXCLUDED.deleted_at
+          deleted_at = EXCLUDED.deleted_at,
+          origin = NULL,
+          granted_by = NULL,
+          granted_at = NULL,
+          proposal_id = NULL
       `, [row.id, row.name, row.content, row.mode || 'always', row.match_pattern || null, row.priority || 0, row.enabled !== false, row.layer || 'instance', row.created_at || _ts(), row.updated_at || _ts(), _resolveImportTier(row.trust_tier, tierPolicy), row.version_vector || '{}', row.content_hash || _sha256(row.content), row.deleted_at || null]);
       imported.steering++;
     }
@@ -2562,10 +3020,13 @@ async function _mergeWriteMemory(r, { tierPolicy, keyOverride, vv, deleted } = {
     [keyOverride || r.filename, r.content, r.updated_by || 'import', r.updated_at || _ts(), r.layer || 'instance', r.anonymizable !== false, _resolveImportTier(r.trust_tier, tierPolicy),
      vv !== undefined ? vv : (r.version_vector || '{}'), r.content_hash || _sha256(r.content), deleted !== undefined ? deleted : (r.deleted_at || null)]);
 }
+// Same origin/grant-clearing rule as importBrain's one-shot steering path
+// (elifant#11): a merged-in row's text is not the text this keyholder granted,
+// so the local provenance + grant are cleared rather than inherited.
 async function _mergeWriteSteering(r, { tierPolicy, keyOverride, vv, deleted } = {}) {
-  await _db.query(`INSERT INTO steering (id,name,content,mode,match_pattern,priority,enabled,layer,created_at,updated_at,trust_tier,version_vector,content_hash,deleted_at)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-    ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name,content=EXCLUDED.content,mode=EXCLUDED.mode,match_pattern=EXCLUDED.match_pattern,priority=EXCLUDED.priority,enabled=EXCLUDED.enabled,layer=EXCLUDED.layer,updated_at=EXCLUDED.updated_at,trust_tier=EXCLUDED.trust_tier,version_vector=EXCLUDED.version_vector,content_hash=EXCLUDED.content_hash,deleted_at=EXCLUDED.deleted_at`,
+  await _db.query(`INSERT INTO steering (id,name,content,mode,match_pattern,priority,enabled,layer,created_at,updated_at,trust_tier,version_vector,content_hash,deleted_at,origin,granted_by,granted_at,proposal_id)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NULL,NULL,NULL,NULL)
+    ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name,content=EXCLUDED.content,mode=EXCLUDED.mode,match_pattern=EXCLUDED.match_pattern,priority=EXCLUDED.priority,enabled=EXCLUDED.enabled,layer=EXCLUDED.layer,updated_at=EXCLUDED.updated_at,trust_tier=EXCLUDED.trust_tier,version_vector=EXCLUDED.version_vector,content_hash=EXCLUDED.content_hash,deleted_at=EXCLUDED.deleted_at,origin=NULL,granted_by=NULL,granted_at=NULL,proposal_id=NULL`,
     [keyOverride || r.id, r.name, r.content, r.mode || 'always', r.match_pattern || null, r.priority || 0, r.enabled !== false, r.layer || 'instance', r.created_at || _ts(), r.updated_at || _ts(), _resolveImportTier(r.trust_tier, tierPolicy),
      vv !== undefined ? vv : (r.version_vector || '{}'), r.content_hash || _sha256(r.content), deleted !== undefined ? deleted : (r.deleted_at || null)]);
 }
@@ -3027,19 +3488,32 @@ async function _rollbackForwardMerge(receipt, buf) {
     // steering — RESURRECTED rows come back DISABLED (they steer behavior; the
     // keyholder re-enables deliberately). A snapshot-wins UPDATE keeps the snapshot's
     // enabled flag (it's a content update, not a resurrection).
-    for (const row of (await tmp.query('SELECT id, name, content, mode, match_pattern, priority, enabled, layer, created_at, updated_at, trust_tier FROM steering')).rows) {
+    //
+    // A snapshot is the SAME bowl, so unlike YOINK/SUMMON its grant record is
+    // this keyholder's own and travels with the row (elifant#11). Two branches,
+    // two rules:
+    //   snapshot-wins UPDATE — carry origin + granted_by/granted_at + proposal_id
+    //     verbatim. Carrying `enabled` WITHOUT them would have re-enabled a rule
+    //     while leaving the live row's grant columns describing different text,
+    //     and against the storage floor that is not a subtle inconsistency but a
+    //     constraint violation that aborts the whole merge transaction.
+    //   RESURRECTION — enabled=false AND the grant forced NULL. "Disabled" and
+    //     "ungranted" must not drift apart, or the next grant-aware read would
+    //     see a rule that looks vouched-for and merely switched off.
+    //     origin/proposal_id DO carry: where a rule came from is still true.
+    for (const row of (await tmp.query('SELECT id, name, content, mode, match_pattern, priority, enabled, layer, created_at, updated_at, trust_tier, origin, granted_by, granted_at, proposal_id FROM steering')).rows) {
       const ex = await tx.query('SELECT updated_at, deleted_at FROM steering WHERE id = $1', [row.id]);
       if (ex.rows[0] && !ex.rows[0].deleted_at) { // tombstone counts as absent → resurrect on rollback
         conflicts++;
         if (_liveWins(ex.rows[0].updated_at, row.updated_at)) { skipped++; continue; }
-        await tx.query(`INSERT INTO steering (id,name,content,mode,match_pattern,priority,enabled,layer,created_at,updated_at,trust_tier) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-          ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name, content=EXCLUDED.content, mode=EXCLUDED.mode, match_pattern=EXCLUDED.match_pattern, priority=EXCLUDED.priority, enabled=EXCLUDED.enabled, layer=EXCLUDED.layer, updated_at=EXCLUDED.updated_at, trust_tier=EXCLUDED.trust_tier`,
-          [row.id, row.name, row.content, row.mode, row.match_pattern, row.priority, row.enabled, row.layer, row.created_at, row.updated_at, row.trust_tier]);
+        await tx.query(`INSERT INTO steering (id,name,content,mode,match_pattern,priority,enabled,layer,created_at,updated_at,trust_tier,origin,granted_by,granted_at,proposal_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+          ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name, content=EXCLUDED.content, mode=EXCLUDED.mode, match_pattern=EXCLUDED.match_pattern, priority=EXCLUDED.priority, enabled=EXCLUDED.enabled, layer=EXCLUDED.layer, updated_at=EXCLUDED.updated_at, trust_tier=EXCLUDED.trust_tier, origin=EXCLUDED.origin, granted_by=EXCLUDED.granted_by, granted_at=EXCLUDED.granted_at, proposal_id=EXCLUDED.proposal_id`,
+          [row.id, row.name, row.content, row.mode, row.match_pattern, row.priority, row.enabled, row.layer, row.created_at, row.updated_at, row.trust_tier, row.origin, row.granted_by, row.granted_at, row.proposal_id]);
         imported.steering++;
       } else {
-        await tx.query(`INSERT INTO steering (id,name,content,mode,match_pattern,priority,enabled,layer,created_at,updated_at,trust_tier,restored_from) VALUES ($1,$2,$3,$4,$5,$6,false,$7,$8,$9,$10,$11)
-          ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name, content=EXCLUDED.content, mode=EXCLUDED.mode, match_pattern=EXCLUDED.match_pattern, priority=EXCLUDED.priority, enabled=false, layer=EXCLUDED.layer, updated_at=EXCLUDED.updated_at, trust_tier=EXCLUDED.trust_tier, restored_from=EXCLUDED.restored_from, deleted_at=NULL`,
-          [row.id, row.name, row.content, row.mode, row.match_pattern, row.priority, row.layer, row.created_at, row.updated_at, row.trust_tier, sid]);
+        await tx.query(`INSERT INTO steering (id,name,content,mode,match_pattern,priority,enabled,layer,created_at,updated_at,trust_tier,restored_from,origin,granted_by,granted_at,proposal_id) VALUES ($1,$2,$3,$4,$5,$6,false,$7,$8,$9,$10,$11,$12,NULL,NULL,$13)
+          ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name, content=EXCLUDED.content, mode=EXCLUDED.mode, match_pattern=EXCLUDED.match_pattern, priority=EXCLUDED.priority, enabled=false, layer=EXCLUDED.layer, updated_at=EXCLUDED.updated_at, trust_tier=EXCLUDED.trust_tier, restored_from=EXCLUDED.restored_from, deleted_at=NULL, origin=EXCLUDED.origin, granted_by=NULL, granted_at=NULL, proposal_id=EXCLUDED.proposal_id`,
+          [row.id, row.name, row.content, row.mode, row.match_pattern, row.priority, row.layer, row.created_at, row.updated_at, row.trust_tier, sid, row.origin, row.proposal_id]);
         imported.steering++; resurrected.steering.push(row.id);
       }
     }
@@ -3384,6 +3858,22 @@ module.exports = {
   addCapture,
   getCaptures,
   deleteCaptures,
+  // elifant#11 — steering (the MANNER slot). Two doors and no third: propose
+  // can only write DISABLED, grant is the only writer of enabled=true and
+  // cannot run without attribution. Backed by a storage-layer CHECK so the
+  // rule holds below the API too.
+  STEERING_ORIGIN,
+  getSteering,
+  getAllSteering,
+  proposeSteering,
+  grantSteering,
+  revokeSteering,
+  deleteSteering,
+  // elifant#11 — review_lessons (the LEARNED-HEURISTICS slot). No grant needed:
+  // this is what she knows, not how she behaves.
+  addReviewLesson,
+  getReviewLessons,
+  deleteReviewLesson,
   seedFromSpore,
   isSeeded,
   // v0.2.0 — Elifantic protocol v0 (skeletons; throw NotImplementedError until Tue/Thu)
