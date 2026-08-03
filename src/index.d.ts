@@ -1161,6 +1161,11 @@ export interface KeeperTickReceipt {
   contradictions: number;
   /** Near-dup merge-proposal needs-decision captures emitted this tick (elifant#6). */
   nearDups: number;
+  /** Manner-mismatch needs-decision captures emitted this tick — a pair that
+   *  stayed open, unresolved, and un-acted-upon for MANNER_MISMATCH_MIN_TICKS
+   *  ticks running (elifant#15). Each one proposes (never enables) the
+   *  general 'be more direct' steering rule and asks. */
+  mannerMismatches: number;
   prunedEdges: number;
   /** True when the pre-write snapshot guard fired (kernel-ethic #11). */
   snapshotTaken: boolean;
