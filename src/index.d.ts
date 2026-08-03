@@ -493,7 +493,22 @@ export interface MemorySearchHit {
   rerank_score?: number;
   /** Present only in hybrid mode. */
   pinned?: boolean;
+  /** Present only in hybrid mode (elifant#8): the decayed reinforcement score the strength leg ranked by. 0 = never recalled. */
+  strength?: number;
 }
+
+/**
+ * Who is asking, for recall accounting (elifant#8/#10). `keyholder` and
+ * `inject` are REAL recalls: they advance the per-memory access counters and
+ * append to the recall log. `housekeeping`, `keeper` and `audit` are named
+ * honestly and never counted — the kernel must not reinforce its own
+ * bookkeeping. Omitting it entirely is an unattributed read: also never
+ * counted. An unrecognized value throws.
+ */
+export type RecallOrigin = 'keyholder' | 'inject' | 'housekeeping' | 'keeper' | 'audit';
+
+/** Map of recognized recall origins to whether they count as a real recall. */
+export const RECALL_ORIGINS: Readonly<Record<RecallOrigin, boolean>>;
 
 /**
  * Semantic search over memories.
@@ -504,14 +519,21 @@ export interface MemorySearchHit {
  * by layer and/or filename prefix.
  *
  * Hybrid mode (also pass queryText): re-ranks a wider candidate pool by
- * Reciprocal Rank Fusion of semantic + lexical (BM25) + pin-aware recency before
- * the top-k cut. The raw cosine `distance` is PRESERVED on every row (downstream
- * relevance floors depend on its absolute value); the fused order is exposed as
- * `rerank_score`. Pass rerank:false to force base mode.
+ * Reciprocal Rank Fusion of semantic + lexical (BM25) + pin-aware recency +
+ * pin-aware strength (elifant#8) before the top-k cut. The raw cosine `distance`
+ * is PRESERVED on every row (downstream relevance floors depend on its absolute
+ * value); the fused order is exposed as `rerank_score`. Pass rerank:false to
+ * force base mode.
+ *
+ * Pass `recall` to say who is asking. A real recall (keyholder/inject) advances
+ * the access counters of every hit that cleared the LOOSE relevance floor and
+ * appends one row to the recall log; anything else leaves no trace. Recall
+ * accounting happens in both modes — the strength LEG is hybrid-only, but a
+ * recall is a recall.
  */
 export function searchMemories(options: {
   queryEmbedding: number[];
-  /** Raw query text. When provided, enables hybrid (lexical+recency) reranking. */
+  /** Raw query text. When provided, enables hybrid (lexical+recency+strength) reranking. */
   queryText?: string | null;
   k?: number;
   layer?: Layer | null;
@@ -521,6 +543,10 @@ export function searchMemories(options: {
   rerank?: boolean;
   /** Weight of the pin-aware recency leg in the fusion. Default 0.5 (light tie-breaker). */
   recencyWeight?: number;
+  /** Weight of the pin-aware strength (reinforcement) leg. Default 0.25 — weighted, not dominant. */
+  strengthWeight?: number;
+  /** Who is asking. Omit for an unattributed read (counts nothing). @throws on an unrecognized origin */
+  recall?: RecallOrigin | null;
 }): Promise<MemorySearchHit[]>;
 
 /** A named relevance tier. `strict` (auto/ambient surfaces) favors precision; `loose` (user-initiated exploration) favors recall. */
@@ -539,6 +565,60 @@ export function isRelevant(hit: { distance?: number } | null | undefined, tier?:
 
 /** Filter a hit list to those relevant at the given tier (default `strict`), order preserved. */
 export function filterRelevant<T extends { distance?: number }>(hits: T[] | null | undefined, tier?: RelevanceTier): T[];
+
+// ── Reinforcement + recall history (elifant#8 / elifant#10) ───────────────
+
+/** Per-memory recall accounting. Device-local: never exported in a YOINK. */
+export interface RecallCountRow {
+  filename: string;
+  access_count: number;
+  first_accessed: string;
+  last_accessed: string;
+  /** The decayed score the fusion's strength leg ranks by, recomputed at read time. */
+  strength: number;
+}
+
+/**
+ * Read the recall counters — how often each memory actually proved to be the
+ * answer, and when it last did. Ordered by access_count descending.
+ */
+export function getRecallCounts(opts?: { filenames?: string[] | null; limit?: number }): Promise<RecallCountRow[]>;
+
+/** One retained recall. `query_fp` is a fingerprint of the query terms — the words themselves are never stored. */
+export interface RecallLogRow {
+  id: string;
+  ts: string;
+  origin: RecallOrigin;
+  query_fp: string;
+  /** Rows returned by the search (top-k, whether relevant or not). */
+  hit_count: number;
+  /** Rows that cleared the loose relevance floor and were therefore reinforced. */
+  counted_count: number;
+  /** Smallest cosine distance in the result — how close the best answer was. Null if none. */
+  top_distance: number | null;
+  /** The counted hits, capped at 20 per row: `f` = filename, `d` = cosine distance. */
+  hits: { f: string; d: number | null }[];
+}
+
+/**
+ * Read the recall log, newest first. Device-local; feeds health('recall-shift')
+ * and is the substrate for the Keeper's noticing detectors.
+ */
+export function getRecallLog(opts?: { since?: string | null; until?: string | null; origin?: RecallOrigin | null; limit?: number }): Promise<RecallLogRow[]>;
+
+/**
+ * Prune the recall log deliberately, by time (`olderThan`) and/or by count
+ * (`keep` newest rows). One of the two is required. The log is ALREADY bounded
+ * automatically — see recallLogCeiling — so this is the keyholder's gesture,
+ * not the safety net. Returns rows deleted.
+ */
+export function pruneRecallLog(opts: { olderThan?: string | null; keep?: number | null }): Promise<number>;
+
+/**
+ * The hard ceiling on retained recall-log rows: ELIFANT_RECALL_LOG_MAX (default
+ * 5000, floor 10) plus the amortized-trim slack. The table cannot exceed this.
+ */
+export function recallLogCeiling(): number;
 
 /**
  * How a memory may travel into an AI-facing context block (elifant#16/#17):

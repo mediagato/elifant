@@ -9,3 +9,4 @@ dist/
 # Internal-only docs (type: internal frontmatter) -- never in the public repo.
 PRE-PUBLISH.md
 WATERING-HOLE-DESIGN.md
+.claude/worktrees/
