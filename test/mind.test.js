@@ -1078,3 +1078,120 @@ test('a confirmed pattern decays honestly when one confirmed member is deleted',
   assert.equal(r2.retired, 1, 'live evidence dropped to 1 (< CONFIRMED_MIN_N) — real n, not the boosted one, decides');
   await brain.close();
 });
+
+// ── elifant#9: decay is not contradiction ───────────────────────────────────
+//
+// src/decay.js archives an untouched, never/rarely-recalled, old row on its
+// own — but nobody retracted it. mind.js's SOURCE_WHERE now treats a
+// decay-archived row (archived_reason = 'decay') as still-live evidence,
+// while every other archival reason (a keyholder's own hand, or none at all —
+// the pre-#9 default) still counts as evidence loss exactly as it always has.
+// These tests decay/retract the SAME five-member pattern, so the pair is the
+// control: criterion 1 could only pass by luck if criterion 2 didn't also
+// pass, since a Mind that had simply stopped noticing evidence loss at all
+// would pass criterion 1 for the wrong reason.
+
+test('#9 (1): decaying every member of a hardened pattern must NOT read as contradiction', async () => {
+  await freshBrain();
+  const T = Date.now();
+  await seedFive(T);
+  await brain.keeperTick({ mind: { now: iso(T) } }); // hardens: n=5, 9 days old
+  const before = await brain.mindStatus();
+  assert.equal(before.hardened, 1);
+
+  // Nobody retracted anything — decay.js's own archival, tagged honestly.
+  for (let i = 0; i < 5; i++) {
+    await brain.setMemoryArchive(`garden-${i}.md`, true, brain.ARCHIVE_REASON.DECAY);
+  }
+
+  // One hour later — the SAME gap the real evidence-loss test below uses to
+  // catch a same-tick n:5->0 collapse before any calendar staleness could
+  // explain it. If decay were mis-read as retraction, n would recompute to 0
+  // here and retire immediately, exactly like a genuine delete does.
+  const r = await brain.mindTick({ now: iso(T + HOUR) });
+  assert.equal(r.retired, 0, 'decay must not collapse the pattern\'s evidence count');
+  assert.equal(r.revised, 0, 'nor soften it into a visible revision');
+  assert.equal((await brain.getCaptures({ source: 'mind', type: 'revision' })).length, 0,
+    'no "the evidence has gone quiet" narration — nothing went quiet, it just stopped being asked for');
+  assert.equal((await brain.getCaptures({ source: 'mind', type: 'retirement' })).length, 0);
+  assert.equal((await brain.mindStatus()).hardened, 1, 'still hardened');
+  await brain.close();
+});
+
+test('#9 (2): the control — genuinely retracting the same five members (keyholder-archive, not decay) still fires revision/retirement', async () => {
+  // The same setup as (1), inverted. Without this control, (1) could pass
+  // trivially if some unrelated change had broken evidence-loss detection
+  // entirely rather than correctly special-casing decay.
+  await freshBrain();
+  const T = Date.now();
+  await seedFive(T);
+  await brain.keeperTick({ mind: { now: iso(T) } });
+
+  // A keyholder archiving by hand — reason 'keyholder', explicitly NOT decay.
+  for (let i = 0; i < 5; i++) {
+    await brain.setMemoryArchive(`garden-${i}.md`, true, brain.ARCHIVE_REASON.KEYHOLDER);
+  }
+  const r = await brain.mindTick({ now: iso(T + HOUR) });
+  assert.equal(r.retired, 1, 'a genuine keyholder archive is still evidence loss, one hour later');
+  assert.equal((await brain.getCaptures({ source: 'mind', type: 'retirement' })).length, 1);
+  await brain.close();
+});
+
+test('#9 (3): reversal is real — un-decaying the members restores the pattern\'s evidence, with nothing left orphaned', async () => {
+  await freshBrain();
+  const T = Date.now();
+  await seedFive(T);
+  await brain.keeperTick({ mind: { now: iso(T) } });
+
+  for (let i = 0; i < 5; i++) await brain.setMemoryArchive(`garden-${i}.md`, true, brain.ARCHIVE_REASON.DECAY);
+  await brain.mindTick({ now: iso(T + HOUR) }); // confirmed quiet in test (1) above
+
+  // Un-decay — the same generic primitive every archive reverses through.
+  for (let i = 0; i < 5; i++) await brain.setMemoryArchive(`garden-${i}.md`, false);
+  const rows = (await brain._internal.query(
+    "SELECT archived, archived_reason FROM memories WHERE filename LIKE 'garden-%'"
+  )).rows;
+  assert.ok(rows.every((r) => r.archived === false && r.archived_reason === null),
+    'fully live again, no residue');
+
+  // The pattern is unaffected either way — hardened before, during, and after
+  // the round trip, since the Mind never lost the evidence in the first place.
+  const r = await brain.mindTick({ now: iso(T + 2 * HOUR) });
+  assert.equal(r.retired, 0);
+  assert.equal(r.revised, 0);
+  assert.equal((await brain.mindStatus()).hardened, 1, 'still exactly one hardened pattern, not two');
+  await brain.close();
+});
+
+test('#9: a shelf the KEEPER itself dissolves because every member decayed still reads as continuity to the Mind, not evidence loss', async () => {
+  // The deep version of (1): here the KEEPER's OWN clustering — unmodified,
+  // still strictly archived=false, by design (decay.js's header explains why
+  // that scope is correct) — no longer sees the decayed members as sources at
+  // all, so the shelf genuinely DISSOLVES (the Keeper archives the producer
+  // row, exactly as it would for any other reason a cluster fell apart). This
+  // is precisely the "reforming cluster" case elifant#18 built adoption for —
+  // but here nothing needs to be adopted, because the memories the pattern
+  // stands on were never gone, just decay-archived. _liveRefCount's own
+  // decay-tolerant SOURCE_WHERE must still find them.
+  await freshBrain();
+  const T = Date.now();
+  await seedFive(T);
+  const r1 = await brain.keeperTick({ mind: { now: iso(T) } });
+  assert.equal(r1.mind.promoted, 1);
+
+  for (let i = 0; i < 5; i++) await brain.setMemoryArchive(`garden-${i}.md`, true, brain.ARCHIVE_REASON.DECAY);
+
+  // A real Keeper pass: its own SOURCE_WHERE excludes the now-archived
+  // members, the shelf's cluster empties out, and the Keeper archives it.
+  const r2 = await brain.keeperTick({ mind: false });
+  assert.ok(r2.shelvesArchived >= 1, 'the shelf itself dissolves from the Keeper\'s point of view');
+
+  // The Mind's turn: the pattern is an orphan this tick (no live candidate
+  // carries its id), so it falls to _liveRefCount — which must still count
+  // the decay-archived refs as live evidence, not as evidence loss.
+  const r3 = await brain.mindTick({ now: iso(T + HOUR) });
+  assert.equal(r3.retired, 0, 'evidence recomputes to the SAME 5, not 0 — the shelf dissolving is not the members disappearing');
+  assert.equal(r3.revived, 0, 'nothing needed reviving — it was never retired in the first place');
+  assert.equal((await brain.mindStatus()).hardened, 1, 'ordinary continuity, exactly as if the shelf had never touched decay at all');
+  await brain.close();
+});
