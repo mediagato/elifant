@@ -389,6 +389,39 @@ async function _applySchema(db) {
   `);
   await db.exec(`CREATE INDEX IF NOT EXISTS memory_edges_b_idx ON memory_edges (b_filename);`);
 
+  // Migration (elifant#8 — reinforcement: the recall counter). searchMemories
+  // was a pure read: retrieving a memory had no effect on its future
+  // retrievability, so a note that kept proving useful was no easier to find on
+  // the hundredth recall than on the first. Two storage shapes were possible and
+  // only one of them is right:
+  //
+  //   - the counters live in their OWN narrow table, NOT as columns on
+  //     `memories`. A recall is a READ, and a read that rewrites rows in the fat
+  //     table (content + a 384-dim Scent) manufactures an MVCC dead tuple per
+  //     hit per query — write amplification on exactly the table whose
+  //     materialization ceiling the capture-flood postmortem taught us to
+  //     respect. A ~60-byte row here costs a fraction of that.
+  //   - and they are DEVICE-LOCAL derived bookkeeping, like memory_edges and
+  //     neighbours_at: your attention is yours. memory_access is not in
+  //     ALL_TABLES, so a YOINK never carries it and a SUMMONed soul arrives
+  //     un-reinforced — importing a foreign keyholder's usage history would let
+  //     their habits silently re-order YOUR recall.
+  //
+  // Keyed by filename and deliberately NOT a foreign key: memories are
+  // soft-deleted, and a tombstone must keep its history in case the row is
+  // resurrected. pruneTombstones reaps the orphans once a row is genuinely gone.
+  // KNOWN EDGE: a filename re-used for entirely different content inherits the
+  // old slot's count — the same thing a content edit already does. The count is
+  // about the slot's usefulness; no reader treats it as provenance.
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS memory_access (
+      filename TEXT PRIMARY KEY,
+      access_count INTEGER NOT NULL DEFAULT 0,
+      first_accessed TEXT NOT NULL,
+      last_accessed TEXT NOT NULL
+    );
+  `);
+
   // v0.7.0 — record the Nose (embedder) identity so a brain knows which model
   // produced its Scents. Seeds the historical MiniLM/384 Nose ONLY if absent,
   // so existing brains stay byte-identical. A future Nose swap bumps these via
@@ -936,25 +969,68 @@ function _denseRankMap(ids, valueOf, dir) {
   return rank;
 }
 
-// Reciprocal Rank Fusion of cosine + lexical + (pin-aware) recency. Higher =
-// better. recencyWeight keeps recency a light tie-breaker. Pinned rows are
-// treated as freshest, so the recency leg can only HELP a pinned memory — it
-// never demotes one below an unpinned row of equal relevance.
-function _fuseRerank(rows, queryText, recencyWeight) {
+// ── Reinforcement: the strength leg (elifant#8) ──────────────────────────────
+// A recall is evidence. Not evidence that a memory is TRUE — evidence that it
+// keeps being the one that answers. The fusion gets a fourth leg built from
+// that, and the whole design question is how loud it is allowed to be.
+//
+//   strength = ln(1 + recalls) * 2^(-days_since_last_recall / HALF_LIFE)
+//
+//   - LOG, not linear: the 50th recall must not be worth fifty times the first,
+//     or one hot week permanently deforms the ranking.
+//   - DECAYED, because the issue asks for strength AND recency-of-use, not a
+//     lifetime tally. A note recalled twenty times last spring and never since
+//     should sink back toward the rows that were never recalled at all — it is
+//     no longer what you are working on. The half-life is 30 days: long enough
+//     that a monthly rhythm survives it, short enough that a finished project
+//     stops crowding the top within a season.
+//   - a never-recalled row scores exactly 0, and every never-recalled row scores
+//     the SAME 0, so they share one dense rank and are never ordered against
+//     each other by noise.
+const RECALL_HALF_LIFE_DAYS = 30;
+function _strengthOf(accessCount, lastAccessed) {
+  const n = Number(accessCount) || 0;
+  if (n <= 0) return 0;
+  return Math.log1p(n) * Math.pow(2, -_ageDays(lastAccessed) / RECALL_HALF_LIFE_DAYS);
+}
+
+// Reciprocal Rank Fusion of cosine + lexical + (pin-aware) recency + (pin-aware)
+// strength. Higher = better. recencyWeight keeps recency a light tie-breaker;
+// strengthWeight keeps reinforcement lighter still.
+//
+// WEIGHTED, NOT DOMINANT — with the arithmetic, because "we weighted it" is not
+// a guarantee. Every leg contributes 1/(K0 + rank), so across a pool of n rows a
+// leg's ENTIRE swing (best rank to worst) is w * (1/K0 - 1/(K0+n-1)). At the
+// defaults (K0=60, n=30 candidates, strengthWeight=0.25) that is 0.00136, while
+// climbing r places on the cosine leg is worth 1/K0 - 1/(K0+r). Setting those
+// equal gives r ~ 5.3: an infinitely-recalled row can buy at most about five
+// cosine places in a full pool, and can never arrive at the top from the bottom.
+// Raise strengthWeight and that bound moves — it is a dial with a number
+// attached, which is the only honest kind.
+//
+// Pinned rows take POSITIVE_INFINITY on BOTH discretionary legs. The recency leg
+// has always done this so it can only ever HELP a pin; the strength leg must
+// match, or a loudly-recalled unpinned row could out-score a memory the
+// keyholder vouched for by hand and simply never searched for.
+function _fuseRerank(rows, queryText, recencyWeight, strengthWeight) {
   const K0 = 60;
   const ids = rows.map((r) => r.filename);
-  const distOf = Object.create(null), recOf = Object.create(null);
+  const distOf = Object.create(null), recOf = Object.create(null), strOf = Object.create(null);
   for (const r of rows) {
     distOf[r.filename] = r.distance;
     recOf[r.filename] = r.pinned ? Number.POSITIVE_INFINITY : -_ageDays(r.updated_at);
+    strOf[r.filename] = r.pinned ? Number.POSITIVE_INFINITY : (r.strength || 0);
   }
   const bm = _bm25(queryText, rows.map((r) => ({ id: r.filename, text: r.content })));
   const cosRank = _denseRankMap(ids, (id) => distOf[id], 'asc');
   const lexRank = _denseRankMap(ids, (id) => (bm[id] || 0), 'desc');
   const recRank = _denseRankMap(ids, (id) => recOf[id], 'desc');
+  const strRank = _denseRankMap(ids, (id) => strOf[id], 'desc');
   const score = Object.create(null);
   for (const id of ids) {
-    score[id] = 1 / (K0 + cosRank[id]) + 1 / (K0 + lexRank[id]) + recencyWeight * (1 / (K0 + recRank[id]));
+    score[id] = 1 / (K0 + cosRank[id]) + 1 / (K0 + lexRank[id])
+      + recencyWeight * (1 / (K0 + recRank[id]))
+      + strengthWeight * (1 / (K0 + strRank[id]));
   }
   return score;
 }
@@ -992,6 +1068,54 @@ function filterRelevant(hits, tier = 'strict') {
   return (hits || []).filter((h) => isRelevant(h, tier));
 }
 
+// ── What counts as a recall (elifant#8) ──────────────────────────────────────
+// Counters are only worth something if they count REAL recalls. From the inside
+// the kernel cannot tell a keyholder asking a question from a shell sweeping its
+// own bookkeeping — both arrive as a vector and a k — so the CALLER must say.
+// Fail closed: an unattributed search (the default) counts nothing, which means
+// the feature stays dead until a caller opts in on purpose.
+// That is the correct trade. A counter that quietly counts the wrong thing is
+// worse than no counter, because the ranking then encodes it and nobody can see
+// why.
+//
+// The kernel's OWN consumers are excluded STRUCTURALLY rather than by this flag:
+// the Keeper (src/keeper.js) and the Mind (src/mind.js) never call
+// searchMemories at all — they read `memories` over raw SQL, so no amount of
+// idle-time consolidation can touch a counter. This gate exists for the SHELL
+// side, where a near-dup checker, a "related notes" rail, an export audit or a
+// re-embed sweep all legitimately use the search surface and would otherwise
+// teach the fusion that the kernel's housekeeping is what the keyholder cares
+// about.
+//
+// Recognized origins, and whether each counts:
+//   keyholder    — they searched, deliberately. COUNTS.
+//   inject       — context assembly surfaced it into a live conversation.
+//                  COUNTS. This is the other half of the inject_event loop,
+//                  which already records query + filename + distance per
+//                  injection and until now was read by nothing.
+//   housekeeping — a shell's own bookkeeping sweep. Never counts.
+//   keeper       — idle-time consolidation reaching through the search surface
+//                  (a shell-side Keeper; the kernel's own does not). Never counts.
+//   audit        — a diagnostic / report / health read. Never counts.
+// An UNRECOGNIZED origin throws, exactly as isRelevant throws on an unknown
+// tier: a typo that silently stopped counting would present as a feature that
+// mysteriously does nothing, and that is a bug you find three months later.
+const RECALL_ORIGINS = Object.freeze({
+  keyholder: true,
+  inject: true,
+  housekeeping: false,
+  keeper: false,
+  audit: false,
+});
+
+function _recallCounts(origin) {
+  if (origin == null || origin === false) return false;
+  if (!Object.prototype.hasOwnProperty.call(RECALL_ORIGINS, origin)) {
+    throw new Error(`searchMemories: unknown recall origin "${origin}" (want ${Object.keys(RECALL_ORIGINS).join('|')}, or omit it for an unattributed read that counts nothing)`);
+  }
+  return RECALL_ORIGINS[origin];
+}
+
 // Semantic search over memories.
 //
 // Base mode (queryEmbedding only): top-K rows ordered by cosine distance to the
@@ -1001,17 +1125,28 @@ function filterRelevant(hits, tier = 'strict') {
 //
 // Hybrid mode (also pass queryText): fetches a wider candidate pool, then
 // re-ranks by Reciprocal Rank Fusion of semantic + lexical (BM25) + pin-aware
-// recency before the top-K cut. The raw cosine `distance` is PRESERVED on every
-// row (downstream relevance floors read its absolute value); the fused order is
-// exposed as `rerank_score`. Pass {rerank:false} to force base mode.
+// recency + pin-aware strength (elifant#8) before the top-K cut. The raw cosine
+// `distance` is PRESERVED on every row (downstream relevance floors read its
+// absolute value); the fused order is exposed as `rerank_score`. Pass
+// {rerank:false} to force base mode.
+//
+// {recall} says WHO is asking (see RECALL_ORIGINS). A real recall advances the
+// access counter of every hit that cleared the LOOSE relevance floor; anything
+// else — including the default of saying nothing — leaves no trace at all.
+// Accounting runs in BOTH modes; only the strength LEG is hybrid-only.
 //
 // Returns base mode:  [{ filename, content, layer, updated_at, distance }]
-//         hybrid mode: [{ ..., distance (raw cosine, unchanged), rerank_score, pinned }]
+//         hybrid mode: [{ ..., distance (raw cosine, unchanged), rerank_score, pinned, strength }]
 //   - distance is the raw pgvector cosine distance (0 = identical, 2 = opposite).
 //     Score-as-similarity = 1 - distance/2.
-async function searchMemories({ queryEmbedding, queryText = null, k = 5, layer = null, prefix = null, includeArchived = false, rerank = true, recencyWeight = 0.5 } = {}) {
+//   - strength is the row's EARNED reinforcement score (0 = never recalled), not
+//     the +Infinity a pinned row is given inside the fusion.
+async function searchMemories({ queryEmbedding, queryText = null, k = 5, layer = null, prefix = null, includeArchived = false, rerank = true, recencyWeight = 0.5, strengthWeight = 0.25, recall = null } = {}) {
   _ensure();
   if (!queryEmbedding) throw new Error('searchMemories: queryEmbedding is required');
+  // Validate the origin BEFORE touching the store, so a typo'd origin fails the
+  // same way on an empty brain as on a full one.
+  const counts = _recallCounts(recall);
   const vec = _vectorLiteral(queryEmbedding);
 
   const doRerank = rerank && typeof queryText === 'string' && queryText.trim().length > 0;
@@ -1060,10 +1195,15 @@ async function searchMemories({ queryEmbedding, queryText = null, k = 5, layer =
     distance: Number(r.distance),
   }));
 
+  let out;
   if (!doRerank) {
     // Base mode: pre-0.7.0 shape + the additive trust_tier (slice 2's inject path
-    // reads it; existing callers ignore it). Order/distance unchanged.
-    return rows.map((r) => ({
+    // reads it; existing callers ignore it). Order/distance unchanged. The
+    // strength LEG is hybrid-only (there is no fusion here to add a leg to), but
+    // recall ACCOUNTING still happens below — a recall is a recall regardless of
+    // how the caller asked for it, and only counting hybrid ones would make the
+    // counters a measure of caller style rather than of usefulness.
+    out = rows.map((r) => ({
       filename: r.filename,
       content: r.content,
       layer: r.layer,
@@ -1071,24 +1211,92 @@ async function searchMemories({ queryEmbedding, queryText = null, k = 5, layer =
       trust_tier: r.trust_tier,
       distance: r.distance,
     }));
+  } else {
+    // Reinforcement (elifant#8): pull the recall counters for the candidate pool
+    // in ONE narrow query rather than joining memory_access into the vector scan
+    // — the `ORDER BY embedding <=> ...` plan is the hot path and is left exactly
+    // as it was. Integers and stamps only, so the result stays tiny however fat
+    // the candidate rows are (armor invariant 1: bounded I/O).
+    const acc = await _db.query(
+      'SELECT filename, access_count, last_accessed FROM memory_access WHERE filename = ANY($1::text[])',
+      [rows.map((r) => r.filename)]
+    );
+    const strengthBy = Object.create(null);
+    for (const a of acc.rows) strengthBy[a.filename] = _strengthOf(a.access_count, a.last_accessed);
+    for (const r of rows) r.strength = strengthBy[r.filename] || 0;
+
+    // Hybrid mode: fuse + re-order, PRESERVING the raw cosine distance per row.
+    const score = _fuseRerank(rows, queryText, recencyWeight, strengthWeight);
+    out = rows
+      .map((r) => ({ ...r, rerank_score: score[r.filename] }))
+      .sort((a, b) => (b.rerank_score - a.rerank_score) || ((b.pinned ? 1 : 0) - (a.pinned ? 1 : 0)))
+      .slice(0, k)
+      .map((r) => ({
+        filename: r.filename,
+        content: r.content,
+        layer: r.layer,
+        updated_at: r.updated_at,
+        distance: r.distance,        // raw cosine — UNCHANGED (relevance floors depend on it)
+        rerank_score: r.rerank_score,
+        pinned: r.pinned,
+        trust_tier: r.trust_tier,
+        strength: r.strength,        // the EARNED score, not the pinned +Infinity the fusion used
+      }));
   }
 
-  // Hybrid mode: fuse + re-order, PRESERVING the raw cosine distance per row.
-  const score = _fuseRerank(rows, queryText, recencyWeight);
-  return rows
-    .map((r) => ({ ...r, rerank_score: score[r.filename] }))
-    .sort((a, b) => (b.rerank_score - a.rerank_score) || ((b.pinned ? 1 : 0) - (a.pinned ? 1 : 0)))
-    .slice(0, k)
-    .map((r) => ({
-      filename: r.filename,
-      content: r.content,
-      layer: r.layer,
-      updated_at: r.updated_at,
-      distance: r.distance,        // raw cosine — UNCHANGED (relevance floors depend on it)
-      rerank_score: r.rerank_score,
-      pinned: r.pinned,
-      trust_tier: r.trust_tier,
-    }));
+  if (counts) {
+    // Best-effort: bookkeeping must never turn a successful recall into a failed
+    // one — the keyholder asked a question and the answer is already computed.
+    // Loud in the debug channel. Counters that stop advancing are visible to any
+    // caller through getRecallCounts rather than only to the ranker.
+    try { await _recordRecall(out); }
+    catch (e) { _debug(`[brain] recall bookkeeping failed: ${e.message}`); }
+  }
+  return out;
+}
+
+// ── Recall accounting: the counter write path (elifant#8) ───────────────────
+
+async function _recordRecall(hits) {
+  // Only what actually cleared the LOOSE floor counts as recalled. searchMemories
+  // returns top-k unconditionally and top-k is NOT a relevance judgement: on a
+  // thin brain the k-th hit can be pure noise, and reinforcing it would teach the
+  // fusion that noise is useful — the exact failure that makes access counters
+  // worthless elsewhere. `loose` rather than `strict` because these are hits a
+  // keyholder-initiated or injected read actually surfaced, which is the call
+  // RELEVANCE_FLOORS already makes for exploration surfaces.
+  const counted = hits.filter((h) => isRelevant(h, 'loose'));
+  const ts = _ts();
+  for (const h of counted) {
+    // access_count only. NOT updated_at, NOT version_vector, NOT content_hash —
+    // a read is not an edit. Bumping the row's causal history on recall would
+    // manufacture a sync conflict on every search, and bumping updated_at would
+    // feed the recency leg a second, hidden reinforcement channel.
+    await _db.query(`
+      INSERT INTO memory_access (filename, access_count, first_accessed, last_accessed)
+      VALUES ($1, 1, $2, $2)
+      ON CONFLICT(filename) DO UPDATE SET
+        access_count = memory_access.access_count + 1,
+        last_accessed = EXCLUDED.last_accessed
+    `, [h.filename, ts]);
+  }
+}
+
+/**
+ * Read the recall counters (elifant#8) — how often each memory has actually
+ * proved to be the answer, and when it last did. Ordered most-recalled first.
+ * `strength` is recomputed at read time from the same function the fusion uses,
+ * so a caller sees the number the ranker would see, not a stale stored copy.
+ * Device-local: these never travel in a YOINK.
+ */
+async function getRecallCounts({ filenames = null, limit = 1000 } = {}) {
+  _ensure();
+  const lim = Math.max(1, Math.min(parseInt(limit, 10) || 1000, 10000));
+  const cols = 'filename, access_count, first_accessed, last_accessed';
+  const r = filenames
+    ? await _db.query(`SELECT ${cols} FROM memory_access WHERE filename = ANY($1::text[]) ORDER BY access_count DESC, filename LIMIT $2`, [filenames, lim])
+    : await _db.query(`SELECT ${cols} FROM memory_access ORDER BY access_count DESC, filename LIMIT $1`, [lim]);
+  return r.rows.map((row) => ({ ...row, strength: _strengthOf(row.access_count, row.last_accessed) }));
 }
 
 async function deleteMemory(filename) {
@@ -1130,6 +1338,13 @@ async function pruneTombstones({ olderThan } = {}) {
     const r = await _db.query(`DELETE FROM ${t} WHERE deleted_at IS NOT NULL AND deleted_at <= $1`, [olderThan]);
     reaped += r.affectedRows || 0;
   }
+  // elifant#8 — the access counters are keyed by filename with no foreign key,
+  // because a tombstone must keep its history in case the row is resurrected.
+  // Once the row is genuinely gone the counter is an orphan, and THIS is the one
+  // place a memory is ever hard-deleted. Mirrors the Keeper's NOT EXISTS sweep
+  // over memory_edges. Unconditional (not gated on reaped > 0): a previous
+  // partial reap or a hand-deleted row would otherwise strand a counter forever.
+  await _db.query('DELETE FROM memory_access a WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.filename = a.filename)');
   if (reaped > 0) {
     await _db.query(`
       INSERT INTO brain_meta (key, value) VALUES ('tombstone_prune_watermark', $1)
@@ -3203,7 +3418,6 @@ async function health(question = 'overview') {
   }
   if (want('director-changes')) observations.push(na('director (router) changes', 'director-change history not retained in this build'));
   if (want('recall-shift')) observations.push(na('recall distribution shift', 'recall history not retained in this build'));
-
   const proposals = [];
   if (observations.some(o => o.significance === 'notable' || o.significance === 'anomalous')) {
     proposals.push({ kind: 'snapshot', reason: 'one or more observations are above baseline — a snapshot now preserves a clean restore point before anything drifts further' });
@@ -3369,6 +3583,10 @@ module.exports = {
   RELEVANCE_FLOORS,
   isRelevant,
   filterRelevant,
+  // elifant#8 — reinforcement: which callers count as a real recall, and the
+  // per-memory counters the fusion's strength leg ranks by
+  RECALL_ORIGINS,
+  getRecallCounts,
   // elifant#16 — inject guard: one canonical answer for how a memory may travel
   // into an AI-facing context block ('plain' | 'mark-third-party' | 'hold')
   injectDisposition: _guardModule.injectDisposition,
