@@ -122,6 +122,44 @@ test('promotable: all three gates required — confidence, n, age', () => {
   assert.equal(mind.promotable({ ...base, status: 'hardened' }, now), false, 'only forming promotes');
 });
 
+test('#20 promotable: promoteHighN is the age gate\'s only escape hatch, and it is off by default', () => {
+  const now = Date.parse('2026-07-31T00:00:00Z');
+  // (c) the default must be a no-op for every existing consumer.
+  assert.equal(mind.DEFAULTS.promoteHighN, Infinity,
+    'off by default — no consumer\'s behavior changes unless it opts in explicitly');
+  const young = { status: 'forming', confidence: 0.9, signal: { n: 40 }, born: now - 1 * HOUR };
+  assert.equal(mind.promotable(young, now), false,
+    'n=40 an hour old still waits: Infinity means no n can ever clear the hatch');
+
+  // (a) opted in, and the evidence reaches it -> age is bought out.
+  assert.equal(mind.promotable(young, now, { ...mind.DEFAULTS, promoteHighN: 12 }), true,
+    'n >= promoteHighN promotes regardless of age');
+  // (b) opted in, evidence short of it -> the 24h gate applies exactly as today.
+  const shallow = { ...young, signal: { n: 11 } };
+  assert.equal(mind.promotable(shallow, now, { ...mind.DEFAULTS, promoteHighN: 12 }), false,
+    'n < promoteHighN still waits out promoteAgeH');
+  assert.equal(mind.promotable({ ...shallow, born: now - 2 * DAY }, now, { ...mind.DEFAULTS, promoteHighN: 12 }), true,
+    '...and clears it the normal way once it is genuinely old');
+
+  // A config that has been through JSON — where Infinity becomes null, and a
+  // bare `n >= null` would read as `n >= 0` and open the hatch for EVERYTHING.
+  // The one value that means "off" must not become the value that means
+  // "always on" just because a host wrote its settings to a file.
+  const roundTripped = JSON.parse(JSON.stringify(mind.DEFAULTS));
+  assert.equal(roundTripped.promoteHighN, null, 'this is what JSON does to Infinity');
+  assert.equal(mind.promotable(young, now, roundTripped), false,
+    'a JSON round trip must not silently turn the age gate off');
+  assert.equal(mind.promotable(young, now, { ...mind.DEFAULTS, promoteHighN: undefined }), false,
+    'nor an explicitly-undefined override');
+
+  // The hatch is scoped to AGE. It never buys out confidence or recurrence.
+  const hi = { ...mind.DEFAULTS, promoteHighN: 12 };
+  assert.equal(mind.promotable({ ...young, confidence: 0.7 }, now, hi), false, 'confidence gate still hard');
+  assert.equal(mind.promotable({ ...young, signal: { n: 4 } }, now, hi), false,
+    'promoteN still hard — n=4 clears neither gate');
+  assert.equal(mind.promotable({ ...young, status: 'hardened' }, now, hi), false, 'only forming promotes');
+});
+
 test('renderKnowledge/appendHistory: history accumulates, never rewrites', () => {
   const c1 = mind.renderKnowledge('garden, compost', '5 memories about garden over 9 days',
     '2026-07-31', ['2026-07-31 promoted (confidence 1, n=5)']);
@@ -137,6 +175,63 @@ test('renderKnowledge/appendHistory: history accumulates, never rewrites', () =>
 test('threadOf: parses the keeper shelf thread line; honest empty otherwise', () => {
   assert.deepEqual(mind.threadOf('# shelf\ncommon thread: garden, compost\n- a.md'), ['garden', 'compost']);
   assert.deepEqual(mind.threadOf('# shelf\n- a.md'), []);
+});
+
+test('#18 themeSignature: order-independent, and an unnamed subject is NOT an identity', () => {
+  assert.equal(mind.themeSignature('garden, compost'), mind.themeSignature('compost, Garden'),
+    'the same two tokens in either order sign the same');
+  assert.notEqual(mind.themeSignature('garden, compost'), mind.themeSignature('garden'));
+  // The Keeper's honest degradation must never become a shared identity: every
+  // threadless shelf would otherwise be "the same subject" as every other one.
+  assert.equal(mind.themeSignature('similar things'), '');
+  assert.equal(mind.themeSignature(''), '');
+  assert.equal(mind.themeSignature(null), '');
+});
+
+test('#18 adoptionClaims: evidence outranks subject, ambiguity is refused, claims are one-to-one', () => {
+  const shelfC = (id, members, sig) => ({ id, kind: 'shelf-recurrence', members, threadSig: sig });
+  const shelfO = (id, liveRefs, sig) => ({ id, kind: 'shelf-recurrence', liveRefs, threadSig: sig });
+
+  // Evidence: keeper matchClusters' own threshold — half the smaller side.
+  assert.deepEqual([...mind.adoptionClaims(
+    [shelfC('c1', ['a.md', 'b.md', 'c.md'], '')], [shelfO('p1', ['a.md', 'b.md'], '')]
+  )], [['c1', 'p1']], '2 of 2 surviving refs are in the reforming cluster');
+  assert.deepEqual([...mind.adoptionClaims(
+    [shelfC('c1', ['a.md', 'x.md', 'y.md', 'z.md'], '')], [shelfO('p1', ['a.md', 'b.md', 'c.md', 'd.md'], '')]
+  )], [], '1 of 4 is not continuity, it is a coincidence');
+
+  // Subject is the fallback, and it loses to evidence when both are on offer.
+  assert.deepEqual([...mind.adoptionClaims(
+    [shelfC('c1', ['n1.md', 'n2.md', 'n3.md'], 'garden')],
+    [shelfO('pTheme', [], 'garden'), shelfO('pEvidence', ['n1.md', 'n2.md'], 'compost')]
+  )], [['c1', 'pEvidence']], 'shared memories beat a shared word');
+
+  // Ambiguity is refused outright rather than guessed — either side.
+  assert.deepEqual([...mind.adoptionClaims(
+    [shelfC('c1', ['n1.md'], 'garden')], [shelfO('p1', [], 'garden'), shelfO('p2', [], 'garden')]
+  )], [], 'two orphans on one subject: unanswerable, so unanswered');
+  assert.deepEqual([...mind.adoptionClaims(
+    [shelfC('c1', ['n1.md'], 'garden'), shelfC('c2', ['n2.md'], 'garden')], [shelfO('p1', [], 'garden')]
+  )], [], 'two reforming clusters on one subject: same refusal');
+  // Two threadless shelves are unambiguously alone on the empty signature —
+  // and still must not match, because '' is not a subject.
+  assert.deepEqual([...mind.adoptionClaims(
+    [shelfC('c1', ['n1.md'], '')], [shelfO('p1', [], '')]
+  )], [], 'an empty signature matches nothing, however alone it is');
+
+  // Kinds never cross: a confirmed vouch and a statistical shelf are different
+  // evidence with different weighting rules.
+  assert.deepEqual([...mind.adoptionClaims(
+    [{ id: 'c1', kind: 'confirmed-dup', members: ['a.md', 'b.md'], threadSig: 'rent' }],
+    [shelfO('p1', ['a.md', 'b.md'], 'rent')]
+  )], [], 'a confirmed pair never adopts a shelf pattern');
+
+  // One-to-one: the best-supported claim takes the pattern, the loser gets none.
+  const twoWay = mind.adoptionClaims(
+    [shelfC('cWeak', ['a.md', 'q.md'], ''), shelfC('cStrong', ['a.md', 'b.md', 'c.md'], '')],
+    [shelfO('p1', ['a.md', 'b.md', 'c.md'], '')]
+  );
+  assert.deepEqual([...twoWay], [['cStrong', 'p1']], 'overlap decides, and only one candidate can win');
 });
 
 // ── the acceptance walk: up the ladder and back down, every rung receipted ──
@@ -245,6 +340,61 @@ test('a pattern below the gates grows across ticks and promotes when it earns it
   await brain.close();
 });
 
+test('#20: a rolling-window host can promote on evidence depth alone — but only by opting in', async () => {
+  // askari/mind (Allen) keeps a ~24h rolling window, so a pattern's `born`
+  // — derived from the member rows' own updated_at — can never age past the
+  // window however much evidence stacks up. Without an escape hatch a
+  // 40-observation pattern sits in `forming` forever.
+  await freshBrain();
+  const T = Date.now();
+  for (let i = 0; i < 6; i++) {
+    await brain.setMemory(`window-${i}.md`, `route note ${i} about the north tunnel checkpoint`,
+      'test', 'instance', nearVec(160, 161 + i));
+  }
+  // (c) DEFAULT: promoteHighN is Infinity, so this is exactly today's kernel —
+  // minutes-old evidence waits out the 24h gate no matter how deep it is.
+  const r1 = await brain.keeperTick({ mind: { now: iso(T) } });
+  assert.equal(r1.mind.upserted, 1, 'one shelf, one pattern');
+  assert.equal(r1.mind.promoted, 0, 'default promoteHighN Infinity — the age gate is unconditional');
+
+  // (b) opted in, but the evidence does not reach the hatch: unchanged.
+  const r2 = await brain.mindTick({ now: iso(T + 60000), promoteHighN: 12 });
+  assert.equal(r2.promoted, 0, 'n=6 < promoteHighN 12 — still waits out promoteAgeH exactly as today');
+
+  // (a) opted in and the evidence reaches it: promotes at ~0h old.
+  const r3 = await brain.mindTick({ now: iso(T + 120000), promoteHighN: 6 });
+  assert.equal(r3.promoted, 1, 'n=6 >= promoteHighN — depth of evidence buys out the calendar');
+  const know = (await brain._internal.query(
+    `SELECT content, pinned, trust_tier FROM memories WHERE synthesized_via = $1`, [mind.MIND_VIA])).rows;
+  assert.equal(know.length, 1, 'a real knowledge row, on the normal promotion path');
+  assert.equal(know[0].pinned, true);
+  assert.equal(know[0].trust_tier, 'tier-2-synthesized', 'still never the keyholder vouch path');
+  await brain.close();
+});
+
+test('#20: promoteHighN never reaches the Guard — deep evidence about a third party still promotes nothing', async () => {
+  // The hatch is scoped to ONE gate. Everything the kernel refuses to infer it
+  // still refuses at any n (elifant#16/#17: the floor reads no config at all).
+  await freshBrain();
+  const T = Date.now();
+  const gripes = [
+    'Dave was late to standup again and the whole morning slipped',
+    'Dave shipped the broken build again, he never runs the tests',
+    'so tired of covering for Dave, he is impossible to plan around',
+    'Dave talked over me for the entire retro meeting',
+    'another Dave morning, he left the build red and went home',
+    'Dave skipped the handoff again and nobody could ship',
+  ];
+  for (let i = 0; i < gripes.length; i++) {
+    await brain.setMemory(`hn-gripe-${i}.md`, gripes[i], 'test', 'instance', nearVec(30, 31 + i));
+  }
+  await brain.keeperTick({ mind: false });
+  const r = await brain.mindTick({ now: iso(T), promoteHighN: 1 });
+  assert.equal(r.promoted, 0, 'no promoteHighN value reaches the third-party floor');
+  assert.ok(r.guarded >= 1, 'the guard is what held it');
+  await brain.close();
+});
+
 // ── contradiction is structural, not just calendar ──────────────────────────
 
 test('evidence loss collapses a pattern without waiting for the calendar', async () => {
@@ -300,6 +450,153 @@ test('fresh evidence revives a retired pattern and it can harden again', async (
 
   const r2 = await brain.mindTick({ now: iso(T + 30 * DAY + HOUR) });
   assert.equal(r2.promoted + r2.revived + r2.revised + r2.retired, 0, 'and then holds steady');
+  await brain.close();
+});
+
+// ── elifant#18: identity survives archive-and-reform ────────────────────────
+
+// The Keeper's own dissolve primitive — a shelf whose cluster fell below
+// MIN_SHELF is archived, reversible, never deleted (keeper.js's end-of-tick
+// sweep). Driving it directly keeps these tests about the MIND's identity
+// resolution rather than about which edge-graph accident dissolved the shelf.
+async function dissolveShelf(filename) { await brain.setMemoryArchive(filename, true); }
+
+// Rewrite a live shelf's membership in place (what the Keeper does when a
+// cluster grows or shrinks without dissolving — the shelf keeps its filename).
+async function setShelfMembers(filename, members, thread, ts0) {
+  const lines = members.map((m) => `- ${m} (${iso(ts0).slice(0, 10)})`).join('\n');
+  await brain._internal.query('UPDATE memories SET content = $1 WHERE filename = $2', [
+    `# on this shelf: ${members.length} memories\ncommon thread: ${thread}\n\n${lines}\n`, filename,
+  ]);
+}
+
+test('#18 acceptance: a shelf that is ARCHIVED and later reforms revives as the SAME pattern, one continuous history', async () => {
+  // The gap this closes: a shelf that merely shrinks keeps its filename
+  // (matchClusters), so revival always worked. A shelf that fully DISSOLVES is
+  // archived, and the reformation lands on a new filename — shelfSlug's clash
+  // loop refuses an archived-but-not-deleted name — which used to be a new,
+  // disconnected pattern with its own second knowledge row.
+  await freshBrain();
+  const T = Date.now();
+  const beds = ['bed-0.md', 'bed-1.md', 'bed-2.md', 'bed-3.md', 'bed-4.md'];
+  await seedShelf('shelf/beds.md', beds, 'garden', T);
+  const r1 = await brain.mindTick({ now: iso(T) });
+  assert.equal(r1.upserted, 1);
+  assert.equal(r1.promoted, 1, 'nine days of evidence, n=5 — it hardens on tick one');
+
+  // The cluster dissolves. The memories themselves are untouched: this is the
+  // edge graph changing its mind, not the keyholder deleting anything.
+  await dissolveShelf('shelf/beds.md');
+  const r2 = await brain.mindTick({ now: iso(T + 28 * DAY) });
+  assert.equal(r2.retired, 1, 'no shelf, no fresh evidence — it goes quiet and retires');
+
+  // A month on, the same memories re-cluster. The Keeper cannot reuse the
+  // archived name, so this arrives as a brand-new producer row.
+  await seedShelf('shelf/beds-2.md', beds, 'garden', T + 30 * DAY);
+  const r3 = await brain.mindTick({ now: iso(T + 30 * DAY) });
+  assert.equal(r3.upserted, 0, 'ADOPTED, not duplicated — no second pattern is born');
+  assert.equal(r3.revived, 1, 'the retired pattern is the one that comes back');
+  assert.equal(r3.promoted, 1, 'and it climbs again');
+
+  // THE acceptance assertion: one pattern, one knowledge row, one history.
+  const know = (await brain._internal.query(
+    `SELECT filename, archived, content FROM memories WHERE synthesized_via = $1`, [mind.MIND_VIA])).rows;
+  assert.equal(know.length, 1, 'ONE knowledge row — the reformation is not a duplicate');
+  assert.equal(know[0].archived, false, 'the original row is un-archived, not replaced');
+  assert.match(know[0].content, /promoted[\s\S]*retired[\s\S]*promoted \(confidence .*\) again/,
+    'one continuous history: promoted, retired, promoted again');
+
+  const st = await brain.mindStatus();
+  assert.equal(st.patterns, 1, 'one ledger row, not two');
+  assert.equal(st.hardened, 1);
+  assert.equal(st.retired, 0);
+
+  // ...and the whole round trip threads as one pattern for any host reading
+  // the capture stream, which is the part a duplicate row cannot fake.
+  const events = (await brain.getCaptures({ source: 'mind' })).reverse();
+  assert.deepEqual(events.map((e) => e.data.stage),
+    ['pattern', 'knowledge', 'retirement', 'pattern', 'knowledge']);
+  assert.equal(new Set(events.map((e) => e.data.patternId)).size, 1,
+    'ONE patternId across the archive boundary');
+  assert.equal(new Set(events.map((e) => e.data.threadKey)).size, 1,
+    'and one threadKey — a host threading by it never sees the seam');
+  assert.match(events[3].data.text, /forming again/);
+
+  // The ledger row itself records which producer rows have carried it — the
+  // durable, auditable receipt that this pattern lived on two shelves.
+  const row = JSON.parse((await brain.getState(mind.STATE_PREFIX + 'shelf:shelf/beds.md')).value);
+  assert.deepEqual(row.aliases, ['shelf:shelf/beds-2.md']);
+  assert.equal(row.id, 'shelf:shelf/beds.md', 'the id never moves — that is what makes it an identity');
+  await brain.close();
+});
+
+test('#18: a subject that reforms on entirely NEW memories revives the same pattern too — the theme fallback', async () => {
+  // The case evidence cannot answer: not one memory the pattern stood on
+  // survives, so overlap is structurally zero. The subject signature is the
+  // only thing left, and it is used ONLY here.
+  await freshBrain();
+  const T = Date.now();
+  await seedShelf('shelf/kiln.md', ['k-0.md', 'k-1.md', 'k-2.md', 'k-3.md', 'k-4.md'], 'pottery', T);
+  assert.equal((await brain.mindTick({ now: iso(T) })).promoted, 1);
+
+  await dissolveShelf('shelf/kiln.md');
+  for (let i = 0; i < 5; i++) await brain.deleteMemory(`k-${i}.md`);
+  const r2 = await brain.mindTick({ now: iso(T + HOUR) });
+  assert.equal(r2.retired, 1, 'every ref is gone — n recomputes to 0 and it retires the same hour');
+
+  // Two months later the keyholder comes back to pottery, on all-new notes.
+  await seedShelf('shelf/kiln-2.md', ['k2-0.md', 'k2-1.md', 'k2-2.md', 'k2-3.md', 'k2-4.md'], 'pottery', T + 60 * DAY);
+  const r3 = await brain.mindTick({ now: iso(T + 60 * DAY) });
+  assert.equal(r3.upserted, 0, 'one orphan, one reforming cluster, one subject — unambiguous');
+  assert.equal(r3.revived, 1);
+  assert.equal(r3.promoted, 1);
+  const know = (await brain._internal.query(
+    `SELECT content FROM memories WHERE synthesized_via = $1`, [mind.MIND_VIA])).rows;
+  assert.equal(know.length, 1, 'still one knowledge row, still one history');
+  assert.match(know[0].content, /promoted[\s\S]*retired[\s\S]*again/);
+  await brain.close();
+});
+
+test('#18: adoption never fabricates continuity — no shared evidence and no shared subject is a NEW pattern', async () => {
+  // The control. If adoption could not fail, the tests above would prove
+  // nothing: they would just be describing a kernel that merges everything.
+  await freshBrain();
+  const T = Date.now();
+  await seedShelf('shelf/kiln.md', ['k-0.md', 'k-1.md', 'k-2.md', 'k-3.md', 'k-4.md'], 'pottery', T);
+  await brain.mindTick({ now: iso(T) });
+  await dissolveShelf('shelf/kiln.md');
+  for (let i = 0; i < 5; i++) await brain.deleteMemory(`k-${i}.md`);
+  await brain.mindTick({ now: iso(T + HOUR) });
+
+  await seedShelf('shelf/bikes.md', ['b-0.md', 'b-1.md', 'b-2.md', 'b-3.md', 'b-4.md'], 'bicycle', T + 2 * DAY);
+  const r = await brain.mindTick({ now: iso(T + 2 * DAY) });
+  assert.equal(r.upserted, 1, 'a genuinely different cluster is a genuinely new pattern');
+  assert.equal(r.revived, 0, 'the pottery pattern stays retired — nothing revived it');
+  assert.equal((await brain.mindStatus()).patterns, 2, 'two patterns, honestly separate');
+  const know = (await brain._internal.query(
+    `SELECT filename FROM memories WHERE synthesized_via = $1`, [mind.MIND_VIA])).rows;
+  assert.equal(know.length, 2, 'two knowledge rows — a bicycle never inherits pottery\'s history');
+  await brain.close();
+});
+
+test('#18: a live pattern is never on offer — a cluster that SPLITS cannot steal the surviving half\'s identity', async () => {
+  // Adoption only ever considers patterns no live candidate is carrying. A
+  // split leaves the original shelf live (matchClusters hands it to the bigger
+  // half), so the breakaway half must start its own life even though it shares
+  // both evidence and subject with the original.
+  await freshBrain();
+  const T = Date.now();
+  const all = ['s-0.md', 's-1.md', 's-2.md', 's-3.md', 's-4.md', 's-5.md'];
+  await seedShelf('shelf/split.md', all, 'sourdough', T);
+  assert.equal((await brain.mindTick({ now: iso(T) })).upserted, 1);
+
+  // The original shelf survives on three members; three break away onto a new
+  // shelf. Same subject, and the original pattern's refs still name all six.
+  await setShelfMembers('shelf/split.md', all.slice(0, 3), 'sourdough', T + DAY);
+  await seedShelf('shelf/split-2.md', all.slice(3), 'sourdough', T + DAY);
+  const r = await brain.mindTick({ now: iso(T + DAY) });
+  assert.equal(r.upserted, 1, 'the breakaway half is a new pattern, not a hijack of the original');
+  assert.equal((await brain.mindStatus()).patterns, 2);
   await brain.close();
 });
 

@@ -946,6 +946,13 @@ export interface MindTickOptions {
   promoteConf?: number;
   promoteN?: number;
   promoteAgeH?: number;
+  /** Evidence depth that buys a pattern out of `promoteAgeH` — and out of
+   *  NOTHING else (confidence, recurrence and the Guard all still apply).
+   *  Defaults to Infinity, so the age gate is unconditional unless a host
+   *  opts in. For hosts whose evidence lives in a rolling window, where a
+   *  pattern's `born` can never age past the window however deep the
+   *  evidence gets (elifant#20). */
+  promoteHighN?: number;
   reviseConf?: number;
   retireConf?: number;
   targetN?: number;
@@ -987,6 +994,10 @@ export interface MindEvent {
   stage: 'pattern' | 'knowledge' | 'revision' | 'retirement' | 'guard';
   patternId: string;
   kind: string;
+  /** The producer row this pattern was BORN on (a shelf/confirmed filename).
+   *  Stable for the pattern's whole life — a pattern that dissolves and later
+   *  reforms on a new shelf keeps this one (elifant#18), so it is an identity,
+   *  not a pointer to a currently-live row. */
   theme: string;
   themeLabel: string;
   /** Stable public grouping key (hash of theme) — thread events without the raw id. */
