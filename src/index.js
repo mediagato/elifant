@@ -424,12 +424,41 @@ async function _applySchema(db) {
   // explicitly (see importBrain / _mergeWriteSteering) precisely so a foreign
   // row can never land in a half-attributed state.
   //
-  // elifant#15's job is to close the remaining gap: backfill origin on legacy
-  // rows, decide whether a foreign soul's steering may be enabled at all, then
-  // DROP the `origin IS NULL` clause. Until then the honest statement is: an
-  // ungranted enabled steering row is impossible through the public API and
-  // impossible in SQL for any row with declared provenance; a legacy or
-  // imported row can still be enabled by raw SQL.
+  // elifant#15's three decisions, made:
+  //
+  //   1. importBrain / _mergeWriteSteering now force enabled=false on every
+  //      foreign row, unconditionally — closing the gap #11 left open. A
+  //      foreign soul's steering may NEVER be active through import, in any
+  //      conflict mode; it lands exactly where resurrection already lands
+  //      (disabled) and needs its own local grant to do anything.
+  //   2. Legacy (pre-#11) rows are NOT backfilled with an invented origin, and
+  //      the `origin IS NULL` escape stays OPEN — on purpose, not as an
+  //      oversight. Backfilling origin on an already-enabled, already-
+  //      ungranted row is not representable without either (a) fabricating a
+  //      grantor, which is the exact promotion this whole API exists to
+  //      forbid (K-CARBON-4: never invent provenance), or (b) silently
+  //      disabling behaviour a keyholder has been relying on since before this
+  //      migration existed — itself an unrequested personality change, the
+  //      same failure mode elifant#15 is about. Neither is a MECHANICAL
+  //      migration may perform on its own. So: legacy rows keep whatever
+  //      enabled/disabled state they already had, forever ineligible for the
+  //      grant floor (their provenance is genuinely unknown, not merely
+  //      undeclared) — the escape is not a placeholder for "someday", it is
+  //      the honest permanent answer for data this API was never present to
+  //      attribute. seedFromSpore (below) is the same case going FORWARD: a
+  //      shell's default persona ships enabled with origin=NULL, unchanged,
+  //      for the identical reason — inventing 'shell-seeded' provenance on
+  //      write would immediately need a grant it has no keyholder to supply.
+  //   3. Whether a foreign soul's steering may be enabled at all: NO — see (1).
+  //      A keyholder reviews an imported proposal like any other disabled row
+  //      (getAllSteering({enabled:false})) and grants it explicitly if wanted.
+  //
+  // Net effect: an ungranted ENABLED steering row is impossible through the
+  // public API for any row whose provenance is declared, AND unreachable going
+  // forward through import (every import path now hard-disables). Only a
+  // pre-existing, already-enabled legacy row — never touched by proposeSteering
+  // and never re-enabled by import — can still show enabled=true with no
+  // grant, and only because its provenance predates the concept of one.
   //
   // No `ADD CONSTRAINT IF NOT EXISTS` exists in Postgres, hence the
   // pg_constraint lookup — this runs on every init and must be idempotent.
@@ -2208,12 +2237,16 @@ async function seedFromSpore(sporeData) {
   }
 
   if (sporeData.steering) {
-    // Spore rows land enabled with NO origin, exactly as they always have. That
-    // leaves them under the steering_enabled_requires_grant floor's grandfather
-    // clause (see _applySchema) — deliberate: retrofitting a grant here would
-    // mean inventing one, and changing spores to seed DISABLED rows is a
-    // behaviour change for every existing shell. elifant#15 owns that call.
-    // New code should prefer proposeSteering() + grantSteering().
+    // Spore rows land enabled with NO origin, exactly as they always have.
+    // elifant#15's decision (see _applySchema's grant-floor comment): this
+    // stays as-is, on purpose. It is NOT the import gap #15 closed — a spore
+    // is the shell's OWN default persona, installed at birth, not a foreign
+    // keyholder's steering arriving over YOINK/SUMMON — and retrofitting a
+    // grant here would mean inventing one (K-CARBON-4), while force-disabling
+    // it would silently take away behaviour every existing shell ships with,
+    // which is itself the unrequested-personality-change failure this issue
+    // exists to prevent. It stays under the grandfather clause permanently,
+    // not provisionally. New code should prefer proposeSteering() + grantSteering().
     for (const s of sporeData.steering) {
       await _db.query(`
         INSERT INTO steering (id, name, content, mode, match_pattern, priority, enabled, layer, created_at, updated_at)
@@ -3150,24 +3183,26 @@ async function importBrain(input) {
       // on conflict (elifant#11). A grant is a LOCAL act by the LOCAL keyholder
       // over LOCAL text: once a foreign row replaces the text, any local grant
       // described something that no longer exists, so carrying it forward would
-      // be a lie and re-deriving one would be a forgery. Clearing them also
-      // keeps this path out of the steering_enabled_requires_grant floor's way
-      // (that floor binds declared-provenance rows), so a peer's ordinary
-      // enabled steering row imports exactly as it always has.
-      // KNOWN GAP, elifant#15's to close: that means an imported soul CAN land
-      // an enabled steering entry here with no keyholder grant. Deciding whether
-      // a foreign manner rule may be active at all is #15's call, not a silent
-      // change smuggled in with a read API.
+      // be a lie and re-deriving one would be a forgery.
+      // enabled is forced false, ALWAYS, regardless of what the foreign row
+      // carried (elifant#15 — closing the gap #11 flagged and left open). This
+      // answers #11's open policy question ("may a foreign soul's steering be
+      // enabled at all?") with no: import lands exactly where resurrection
+      // already lands (see _rollbackForwardMerge below) — disabled, because a
+      // manner rule steers behaviour and a peer's SUMMON is not a keyholder
+      // grant over THIS bowl's local text. A keyholder who wants a peer's rule
+      // active reviews it via getAllSteering({enabled:false}) and grants it
+      // explicitly, same as any other proposal.
       await _db.query(`
         INSERT INTO steering (id, name, content, mode, match_pattern, priority, enabled, layer, created_at, updated_at, trust_tier, version_vector, content_hash, deleted_at, origin, granted_by, granted_at, proposal_id)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NULL, NULL, NULL, NULL)
+        VALUES ($1, $2, $3, $4, $5, $6, false, $7, $8, $9, $10, $11, $12, $13, NULL, NULL, NULL, NULL)
         ON CONFLICT(id) DO UPDATE SET
           name = EXCLUDED.name,
           content = EXCLUDED.content,
           mode = EXCLUDED.mode,
           match_pattern = EXCLUDED.match_pattern,
           priority = EXCLUDED.priority,
-          enabled = EXCLUDED.enabled,
+          enabled = false,
           layer = EXCLUDED.layer,
           updated_at = EXCLUDED.updated_at,
           trust_tier = EXCLUDED.trust_tier,
@@ -3178,7 +3213,7 @@ async function importBrain(input) {
           granted_by = NULL,
           granted_at = NULL,
           proposal_id = NULL
-      `, [row.id, row.name, row.content, row.mode || 'always', row.match_pattern || null, row.priority || 0, row.enabled !== false, row.layer || 'instance', row.created_at || _ts(), row.updated_at || _ts(), _resolveImportTier(row.trust_tier, tierPolicy), row.version_vector || '{}', row.content_hash || _sha256(row.content), row.deleted_at || null]);
+      `, [row.id, row.name, row.content, row.mode || 'always', row.match_pattern || null, row.priority || 0, row.layer || 'instance', row.created_at || _ts(), row.updated_at || _ts(), _resolveImportTier(row.trust_tier, tierPolicy), row.version_vector || '{}', row.content_hash || _sha256(row.content), row.deleted_at || null]);
       imported.steering++;
     }
   }
@@ -3407,12 +3442,15 @@ async function _mergeWriteMemory(r, { tierPolicy, keyOverride, vv, deleted } = {
 }
 // Same origin/grant-clearing rule as importBrain's one-shot steering path
 // (elifant#11): a merged-in row's text is not the text this keyholder granted,
-// so the local provenance + grant are cleared rather than inherited.
+// so the local provenance + grant are cleared rather than inherited. And the
+// same elifant#15 closure as that path: enabled is forced false regardless of
+// what the incoming/losing row carried — a foreign soul's steering never
+// lands active through ANY import branch, conflict-policy included.
 async function _mergeWriteSteering(r, { tierPolicy, keyOverride, vv, deleted } = {}) {
   await _db.query(`INSERT INTO steering (id,name,content,mode,match_pattern,priority,enabled,layer,created_at,updated_at,trust_tier,version_vector,content_hash,deleted_at,origin,granted_by,granted_at,proposal_id)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NULL,NULL,NULL,NULL)
-    ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name,content=EXCLUDED.content,mode=EXCLUDED.mode,match_pattern=EXCLUDED.match_pattern,priority=EXCLUDED.priority,enabled=EXCLUDED.enabled,layer=EXCLUDED.layer,updated_at=EXCLUDED.updated_at,trust_tier=EXCLUDED.trust_tier,version_vector=EXCLUDED.version_vector,content_hash=EXCLUDED.content_hash,deleted_at=EXCLUDED.deleted_at,origin=NULL,granted_by=NULL,granted_at=NULL,proposal_id=NULL`,
-    [keyOverride || r.id, r.name, r.content, r.mode || 'always', r.match_pattern || null, r.priority || 0, r.enabled !== false, r.layer || 'instance', r.created_at || _ts(), r.updated_at || _ts(), _resolveImportTier(r.trust_tier, tierPolicy),
+    VALUES ($1,$2,$3,$4,$5,$6,false,$7,$8,$9,$10,$11,$12,$13,NULL,NULL,NULL,NULL)
+    ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name,content=EXCLUDED.content,mode=EXCLUDED.mode,match_pattern=EXCLUDED.match_pattern,priority=EXCLUDED.priority,enabled=false,layer=EXCLUDED.layer,updated_at=EXCLUDED.updated_at,trust_tier=EXCLUDED.trust_tier,version_vector=EXCLUDED.version_vector,content_hash=EXCLUDED.content_hash,deleted_at=EXCLUDED.deleted_at,origin=NULL,granted_by=NULL,granted_at=NULL,proposal_id=NULL`,
+    [keyOverride || r.id, r.name, r.content, r.mode || 'always', r.match_pattern || null, r.priority || 0, r.layer || 'instance', r.created_at || _ts(), r.updated_at || _ts(), _resolveImportTier(r.trust_tier, tierPolicy),
      vv !== undefined ? vv : (r.version_vector || '{}'), r.content_hash || _sha256(r.content), deleted !== undefined ? deleted : (r.deleted_at || null)]);
 }
 
@@ -4216,6 +4254,12 @@ const _keeper = _keeperModule.createKeeper({
   snapshot,
   ts: _ts,
   trustTier: TRUST_TIER,
+  // elifant#15 — the manner-mismatch notice's only door into steering: it may
+  // propose (never enable, see proposeSteering's own grant floor) and read
+  // (to avoid re-nagging about an already-granted rule). Nothing else here
+  // hands the Keeper a write path into steering.
+  proposeSteering,
+  getSteering,
 });
 
 // ── the Mind (0.23.0 — elifant#5) ─────────────────────────────────────────

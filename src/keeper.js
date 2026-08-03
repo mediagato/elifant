@@ -32,6 +32,20 @@
  *      once per pair per content-state (a keeper_pairs ledger tracks
  *      {kind, sig}); NEVER a silent merge and NEVER an auto-resolved
  *      contradiction — the keyholder decides, sources untouched either way.
+ *   6. notices a MANNER MISMATCH (elifant#15) — the SAME pair (kernel's own
+ *      definition of "the same project": two memories bound by the shelf-
+ *      tight embedding floor) staying open and unresolved for
+ *      MANNER_MISMATCH_MIN_TICKS consecutive ticks is "gentle nudges about
+ *      the same project, all ignored". This is the K-CARBON-4 guarantee
+ *      applied to the mind's OWN manner, not just its knowledge: noticing is
+ *      arithmetic over the same keeper_pairs ledger the pair pass already
+ *      keeps (extended with an ask-count and a first-seen stamp), and the
+ *      only actions it may ever take are (a) proposeSteering(...,
+ *      {origin:'learned'}) — which cannot enable anything, see index.js's
+ *      grant floor — and (b) a needs-decision capture with the receipts
+ *      that prompted it. Never proposes twice for the same open occurrence
+ *      (an ask-count latch, same shape as keeper_pairs' own idempotency) and
+ *      never re-asks once the keyholder has already granted the rule.
  *
 
  * THE QUEUE IS THE WATERMARK (elifant#1's durability requirement). Progress
@@ -103,6 +117,35 @@ const FIRST_LIGHT_MIN_CORPUS = 8; // below this, everything is new territory —
 const BULK_SNAPSHOT_ROWS = 100;   // kernel-ethic #11: snapshot before >100-row passes
 const SHELVING_VIA = 'keeper/shelving-v1';
 const PAIR_LEDGER_KEY = 'keeper_pairs'; // brain_meta key: last-asked {kind, sig} per pair (elifant#6/#7)
+
+// elifant#15 — manner-mismatch: how many consecutive ticks a pair may stay
+// open, unresolved, and un-acted-upon before "asked gently" becomes "noticed
+// as a pattern". 6 is not arbitrary — it is the issue's own illustrative
+// number ("six gentle nudges about the same project, all ignored"), and it
+// holds up independently: a keeper tick fires once per idle period, so
+// requiring the SAME two-memory pair (the kernel's own definition of "the
+// same project" — bound by the shelf-tight SHELF_EDGE_FLOOR) to survive six
+// separate ticks with no change in its content-state rules out "the
+// keyholder just hasn't opened the Bell yet" (one missed session), while
+// still catching a real pattern well inside the span of a week of ordinary
+// use. Exported alongside FLOORS so a shell or test can see and reason about
+// it, exactly like every other calibrated threshold in this file.
+const MANNER_MISMATCH_MIN_TICKS = 6;
+
+// The steering proposal this detector writes. One canonical id + fixed,
+// generic content — never per-pair, never per-occurrence — because the rule
+// it proposes is about MANNER in general ("say it more directly"), not about
+// any one project. A fixed body also means every re-propose across separate
+// occurrences is content-IDENTICAL, which is what makes proposeSteering's own
+// "identical re-propose keeps an existing grant" rule (elifant#11) do the
+// right thing here: once the keyholder grants this once, a later, unrelated
+// occurrence re-proposing the same id+text is a harmless no-op, never a fresh
+// nag and never a reset of the keyholder's own decision.
+const MANNER_STEERING_ID = 'learned-manner-directness';
+const MANNER_STEERING_NAME = 'be more direct after repeated unresolved asks';
+const MANNER_STEERING_CONTENT =
+  'when the same point keeps needing to be re-raised without ever being resolved, ' +
+  'say it more directly instead of repeating a gentle nudge.';
 
 const STOPWORDS = new Set(('a an and are as at be but by for from has have i if in into is it its me my not of on or ' +
   'our so that the their them they this to was we were what when which who will with you your just really very ' +
@@ -264,6 +307,18 @@ function pairPrompt(kind, aFile, aExcerpt, bFile, bExcerpt) {
     : `two of your memories say close to the same thing — "${aExcerpt}" (${aFile}) and "${bExcerpt}" (${bFile}). keep both, or fold them into one?`;
 }
 
+// The Bell prompt for a manner-mismatch (elifant#15). States what was
+// observed — which two memories, how many ticks, since when — and offers a
+// choice; never implies the keyholder did something wrong by leaving it open
+// (same copy constraint as pairPrompt above, applied to the mind's OWN
+// manner rather than to a content question).
+function mannerMismatchPrompt(aFile, bFile, kind, askCount, firstSeenDay) {
+  const verb = kind === 'contradiction' ? 'asking which one is current' : 'asking whether to fold them together';
+  return `since ${firstSeenDay} I've been ${verb} about two of your memories (${aFile}, ${bFile}) — ` +
+    `${askCount} keeper passes now, still open every time. want me to be more direct about ` +
+    `things like this instead of raising them gently and leaving them?`;
+}
+
 // Union-find over strict-floor edges.
 function components(edges /* [{a, b}] */) {
   const parent = new Map();
@@ -321,9 +376,14 @@ function matchClusters(clusters, shelves /* [{filename, members}] */) {
  *   snapshot(reason, opts)      kernel-ethic #11 guard
  *   ts()                        kernel timestamp
  *   trustTier                   TRUST_TIER constants
+ *   proposeSteering(entry)      elifant#11's propose door (elifant#15: the
+ *                               ONLY way the manner-mismatch notice may ever
+ *                               touch steering — it cannot enable anything)
+ *   getSteering(id)             elifant#11's read door (elifant#15: so an
+ *                               already-granted rule is never re-nagged)
  */
 function createKeeper(ctx) {
-  const { query, addCapture, setMemoryDerived, setMemoryArchive, snapshot, ts, trustTier } = ctx;
+  const { query, addCapture, setMemoryDerived, setMemoryArchive, snapshot, ts, trustTier, proposeSteering, getSteering } = ctx;
 
   // The eligibility predicate for a SOURCE row (something the Keeper may read
   // and link): live, unarchived, not itself derived, and the keyholder's own
@@ -483,6 +543,7 @@ function createKeeper(ctx) {
     const receipt = {
       at: now, processed: 0, firstLights: 0, shelvesWritten: 0, shelvesArchived: 0,
       thoughts: 0, contradictions: 0, nearDups: 0, prunedEdges: 0, snapshotTaken: false,
+      mannerMismatches: 0,
     };
 
     // Plan the tick's write volume and run the snapshot guard BEFORE the first
@@ -645,22 +706,83 @@ function createKeeper(ctx) {
       const key = pairKey(a, b);
       const kind = classifyPair(details[0].content, details[1].content);
       const sig = details.map((d) => String(d.updated_at)).join('|');
-      nextPairLedger[key] = { kind, sig };
       const prior = priorPairLedger[key];
-      if (prior && prior.sig === sig && prior.kind === kind) continue; // unchanged — no re-ask
-      const excerptA = _excerpt(details[0].content);
-      const excerptB = _excerpt(details[1].content);
-      await addCapture({
-        source: 'keeper',
-        type: 'needs-decision',
-        data: {
-          key, who: 'the keeper', kind,
-          prompt: pairPrompt(kind, a, excerptA, b, excerptB),
-          a: { filename: a, excerpt: excerptA },
-          b: { filename: b, excerpt: excerptB },
-        },
-      });
-      receipt[kind === 'contradiction' ? 'contradictions' : 'nearDups']++;
+      // elifant#15: an occurrence is "the same still-open ask" exactly when the
+      // ledger already knows this pairKey AND its content-state (sig) has not
+      // moved — the identical condition the near-dup/contradiction re-ask check
+      // below already uses. A sig change means the keyholder edited one side:
+      // that is an ACT, not a silent ignore, so the count restarts fresh.
+      const sameOccurrence = !!(prior && prior.sig === sig);
+      const askCount = sameOccurrence ? (Number(prior.askCount) || 1) + 1 : 1;
+      const firstSeen = (sameOccurrence && prior.firstSeen) ? prior.firstSeen : now;
+      let mannerProposed = sameOccurrence ? !!prior.mannerProposed : false;
+      nextPairLedger[key] = { kind, sig, askCount, firstSeen, mannerProposed };
+
+      if (!(prior && prior.sig === sig && prior.kind === kind)) {
+        // unchanged from before elifant#15: the original near-dup/contradiction
+        // ask, asked once per pair per content-state.
+        const excerptA = _excerpt(details[0].content);
+        const excerptB = _excerpt(details[1].content);
+        await addCapture({
+          source: 'keeper',
+          type: 'needs-decision',
+          data: {
+            key, who: 'the keeper', kind,
+            prompt: pairPrompt(kind, a, excerptA, b, excerptB),
+            a: { filename: a, excerpt: excerptA },
+            b: { filename: b, excerpt: excerptB },
+          },
+        });
+        receipt[kind === 'contradiction' ? 'contradictions' : 'nearDups']++;
+      }
+
+      // elifant#15 — manner mismatch: the same pair has stayed open, unresolved,
+      // and un-acted-upon for MANNER_MISMATCH_MIN_TICKS ticks running. Notice
+      // it, propose (never enable) the general steering rule, and ask — once
+      // per occurrence, and never again once the rule is already granted (that
+      // would be nagging about a question the keyholder already answered).
+      if (!mannerProposed && askCount >= MANNER_MISMATCH_MIN_TICKS) {
+        const already = await getSteering(MANNER_STEERING_ID);
+        if (!already || !already.enabled) {
+          const proposalId = `${key}@${firstSeen}`;
+          // The ONLY steering write this whole pass may ever make. proposeSteering
+          // cannot enable a rule under any argument (elifant#11's grant floor) —
+          // that is the structural guarantee this issue exists to prove holds.
+          await proposeSteering({
+            id: MANNER_STEERING_ID,
+            name: MANNER_STEERING_NAME,
+            content: MANNER_STEERING_CONTENT,
+            mode: 'always',
+            layer: 'instance',
+            origin: 'learned',
+            proposalId,
+          });
+          const excerptA = _excerpt(details[0].content);
+          const excerptB = _excerpt(details[1].content);
+          await addCapture({
+            source: 'keeper',
+            type: 'needs-decision',
+            data: {
+              key: `manner:${proposalId}`, who: 'the keeper', kind: 'manner-mismatch',
+              prompt: mannerMismatchPrompt(a, b, kind, askCount, String(firstSeen).slice(0, 10)),
+              // The receipts: which project (the pair), how many nudges, over
+              // what period — exactly what elifant#15 asks a manner-mismatch
+              // Bell item to carry.
+              receipts: {
+                pair: key, files: [a, b], excerpts: [excerptA, excerptB],
+                underlyingKind: kind, askCount, firstSeen, lastSeen: now,
+              },
+              proposalId, steeringId: MANNER_STEERING_ID,
+            },
+          });
+          receipt.mannerMismatches++;
+        }
+        // Latches either way: a proposal just asked, or the rule was already
+        // granted by an earlier occurrence — neither case should re-check on
+        // every subsequent tick this same pair stays open.
+        mannerProposed = true;
+        nextPairLedger[key].mannerProposed = true;
+      }
     }
     // Rebuilt fresh each tick (not merged with priorPairLedger), so a pair
     // that no longer exists — grew into a shelf, dissolved, or one side was
@@ -710,4 +832,11 @@ module.exports = {
   SHELVING_VIA,
   PAIR_LEDGER_KEY,
   FLOORS: { NEIGHBOUR_K, EDGE_KEEP_FLOOR, SHELF_EDGE_FLOOR, MIN_SHELF, FIRST_LIGHT_MIN_CORPUS },
+  // elifant#15 — manner-mismatch notice: pure helper + the tunables/ids a test
+  // needs to assert against without hardcoding this file's internals twice.
+  mannerMismatchPrompt,
+  MANNER_MISMATCH_MIN_TICKS,
+  MANNER_STEERING_ID,
+  MANNER_STEERING_NAME,
+  MANNER_STEERING_CONTENT,
 };

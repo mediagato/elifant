@@ -340,5 +340,95 @@ test('SUMMON: a foreign soul\'s steering clears local provenance instead of inhe
     assert.equal(row.granted_at, null);
     assert.equal(row.origin, null, 'provenance is not inherited from a foreign row');
     assert.equal(row.proposal_id, null);
+    // elifant#15: bowl A's exported row carried enabled=true (alice's grant made
+    // it active there) — the wire format serializes `enabled` even though it
+    // drops the grant columns. Before #15's fix this landed here enabled=true,
+    // origin=null, granted_by=null: an active manner rule with NO recorded
+    // keyholder grant, invisible to the CHECK constraint because origin IS NULL
+    // is its own escape. That was the exact gap #11 flagged and left open.
+    assert.equal(row.enabled, false, 'a foreign soul\'s steering never lands enabled through import');
   } finally { await brain.close(); }
+});
+
+// ── elifant#15: the import-path gap #11 explicitly left open, now closed ────
+
+test('elifant#15: importBrain (plain conflict modes) never lands an enabled foreign steering row', async () => {
+  const dirA = tmpDir();
+  await brain.init(dirA);
+  let payload;
+  try {
+    await brain.proposeSteering({ id: 'foreign-rule', name: 'Foreign', content: 'be terse always', origin: 'keyholder' });
+    await brain.grantSteering('foreign-rule', { grantedBy: 'alice' });
+    assert.equal((await brain.getSteering('foreign-rule')).enabled, true);
+    payload = (await brain.exportBrain()).payload;
+  } finally { await brain.close(); }
+
+  // 'skip' means "never overwrite an existing local row" — it only imports
+  // when there is NO local conflict, so it gets a bowl with nothing under
+  // that id yet. 'newer-wins' needs an OLDER local row so the incoming row
+  // wins and the overwrite branch actually runs. 'overwrite' needs neither.
+  for (const conflict of ['skip', 'newer-wins', 'overwrite']) {
+    const dirB = tmpDir();
+    await brain.init(dirB);
+    try {
+      if (conflict === 'newer-wins') {
+        await brain._internal.query(
+          `INSERT INTO steering (id,name,content,mode,priority,enabled,layer,created_at,updated_at)
+           VALUES ('foreign-rule','Local','local text','always',0,false,'instance','2000-01-01T00:00:00Z','2000-01-01T00:00:00Z')`
+        );
+      }
+      const r = await brain.importBrain({ payload, conflict, allow_unsigned: true });
+      assert.equal(r.imported.steering, 1, `conflict=${conflict} applied the row`);
+      const row = await brain.getSteering('foreign-rule');
+      assert.ok(row, `conflict=${conflict} row exists`);
+      assert.equal(row.enabled, false, `conflict=${conflict}: a foreign row is never enabled by import`);
+      assert.equal(row.origin, null);
+      assert.equal(row.granted_by, null);
+    } finally { await brain.close(); }
+  }
+});
+
+test('elifant#15: importBrain conflict:"merge" never lands an enabled row, winner or conflict-copy', async () => {
+  const dirA = tmpDir(), dirB = tmpDir();
+  async function putSteering(id, name, content, vvKey) {
+    const ch = brain._internal.sha256(content);
+    await brain._internal.query(
+      `INSERT INTO steering (id,name,content,mode,match_pattern,priority,enabled,layer,created_at,updated_at,trust_tier,version_vector,content_hash,deleted_at)
+       VALUES ($1,$2,$3,'always',NULL,0,true,'instance','2026-07-02T00:00:00Z','2026-07-02T00:00:00Z','tier-1-keyholder-direct',$4,$5,NULL)`,
+      [id, name, content, JSON.stringify({ [vvKey]: 1 }), ch]
+    );
+  }
+  try {
+    // Both sides write enabled=true directly (the pre-#11 shape a legacy or
+    // hand-seeded row can still take) with concurrent version vectors, so the
+    // merge takes the edit-vs-edit branch and BOTH the winner and the local
+    // loser's conflict-copy get written through _mergeWriteSteering.
+    const c1 = 'merge body ALPHA', c2 = 'merge body BETA';
+    const [incContent, locContent] =
+      brain._internal.sha256(c1) > brain._internal.sha256(c2) ? [c1, c2] : [c2, c1];
+
+    await brain.init(dirA);
+    await putSteering('m1', 'Rule From A', incContent, 'idA');
+    const payload = (await brain.exportBrain()).payload;
+    await brain.close();
+
+    await brain.init(dirB);
+    await putSteering('m1', 'Rule From B', locContent, 'idB'); // concurrent VV → edit-vs-edit
+    const res = await brain.importBrain({ payload, conflict: 'merge' });
+    assert.equal(res.conflict_copies, 1, 'the merge conflict path ran (regression guard for the #11 crash fix)');
+
+    const rows = (await brain._internal.query(
+      "SELECT id, content, enabled, origin, granted_by FROM steering WHERE id = 'm1' OR id LIKE 'm1.conflict-%'"
+    )).rows;
+    assert.equal(rows.length, 2, 'winner + one conflict-copy');
+    for (const r of rows) {
+      assert.equal(r.enabled, false, `${r.id}: merge conflict path never enables a foreign/losing row either`);
+      assert.equal(r.origin, null);
+      assert.equal(r.granted_by, null);
+    }
+  } finally {
+    try { await brain.close(); } catch { /* already closed */ }
+    fs.rmSync(dirA, { recursive: true, force: true });
+    fs.rmSync(dirB, { recursive: true, force: true });
+  }
 });
