@@ -307,10 +307,17 @@ function confidence({ n, last }, nowMs, cfg = DEFAULTS) {
 function promotable(p, nowMs, cfg = DEFAULTS) {
   const ageH = (nowMs - (p.born || nowMs)) / 3600000;
   const n = p.signal.n || 0;
+  // Anything that is not an explicit FINITE number reads as "no escape hatch".
+  // Not defensive noise: the default is Infinity, and JSON.stringify turns
+  // Infinity into `null` — so a host that round-trips its config through JSON
+  // (or a settings file, or a wire hop) would hand back null, and `n >= null`
+  // is `n >= 0`, which is true for every pattern alive. The one value meaning
+  // "off" would have silently become the value meaning "always on".
+  const highN = Number.isFinite(cfg.promoteHighN) ? cfg.promoteHighN : Infinity;
   return p.status === 'forming'
     && p.confidence >= cfg.promoteConf
     && n >= cfg.promoteN
-    && (ageH >= cfg.promoteAgeH || n >= cfg.promoteHighN);
+    && (ageH >= cfg.promoteAgeH || n >= highN);
 }
 
 // The knowledge row — the receipt IS the content, keeper style. The `## history`

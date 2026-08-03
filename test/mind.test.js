@@ -141,6 +141,17 @@ test('#20 promotable: promoteHighN is the age gate\'s only escape hatch, and it 
   assert.equal(mind.promotable({ ...shallow, born: now - 2 * DAY }, now, { ...mind.DEFAULTS, promoteHighN: 12 }), true,
     '...and clears it the normal way once it is genuinely old');
 
+  // A config that has been through JSON — where Infinity becomes null, and a
+  // bare `n >= null` would read as `n >= 0` and open the hatch for EVERYTHING.
+  // The one value that means "off" must not become the value that means
+  // "always on" just because a host wrote its settings to a file.
+  const roundTripped = JSON.parse(JSON.stringify(mind.DEFAULTS));
+  assert.equal(roundTripped.promoteHighN, null, 'this is what JSON does to Infinity');
+  assert.equal(mind.promotable(young, now, roundTripped), false,
+    'a JSON round trip must not silently turn the age gate off');
+  assert.equal(mind.promotable(young, now, { ...mind.DEFAULTS, promoteHighN: undefined }), false,
+    'nor an explicitly-undefined override');
+
   // The hatch is scoped to AGE. It never buys out confidence or recurrence.
   const hi = { ...mind.DEFAULTS, promoteHighN: 12 };
   assert.equal(mind.promotable({ ...young, confidence: 0.7 }, now, hi), false, 'confidence gate still hard');
