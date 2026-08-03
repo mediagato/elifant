@@ -422,6 +422,38 @@ async function _applySchema(db) {
     );
   `);
 
+  // Migration (elifant#10 — the recall log). health('recall-shift') answered a
+  // flat 'not available' because nothing retained what had been recalled; a mind
+  // that cannot be asked how its own attention moved is missing a sense, not a
+  // feature.
+  //
+  // Deliberately a DIFFERENT shape from memory_access above, and the reason
+  // elifant#8 and #10 are co-travellers rather than a chain: a durable per-row
+  // strength score cannot be derived from a log that is designed to be evicted.
+  // The counters must survive indefinitely; this log must not, so it carries its
+  // own ceiling (_trimRecallLog) instead of growing with use.
+  //
+  // What is retained is deliberately thin. query_fp is a FINGERPRINT of the
+  // query's content terms, never the words — an ever-growing record of
+  // everything the keyholder ever asked is a disclosure surface the kernel has
+  // no business creating, and a fingerprint answers "is this the same question
+  // again?" without it. `hits` is the capped list of what actually counted as
+  // recalled, with distances, which is what a distribution-shift question needs.
+  // Device-local for the same reason as memory_access: not in ALL_TABLES.
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS recall_log (
+      id BIGSERIAL PRIMARY KEY,
+      ts TEXT NOT NULL,
+      origin TEXT NOT NULL,
+      query_fp TEXT NOT NULL,
+      hit_count INTEGER NOT NULL,
+      counted_count INTEGER NOT NULL,
+      top_distance REAL,
+      hits JSONB
+    );
+  `);
+  await db.exec(`CREATE INDEX IF NOT EXISTS recall_log_ts_idx ON recall_log (ts DESC);`);
+
   // v0.7.0 — record the Nose (embedder) identity so a brain knows which model
   // produced its Scents. Seeds the historical MiniLM/384 Nose ONLY if absent,
   // so existing brains stay byte-identical. A future Nose swap bumps these via
@@ -1068,12 +1100,12 @@ function filterRelevant(hits, tier = 'strict') {
   return (hits || []).filter((h) => isRelevant(h, tier));
 }
 
-// ── What counts as a recall (elifant#8) ──────────────────────────────────────
+// ── What counts as a recall (elifant#8 + elifant#10) ─────────────────────────
 // Counters are only worth something if they count REAL recalls. From the inside
 // the kernel cannot tell a keyholder asking a question from a shell sweeping its
 // own bookkeeping — both arrive as a vector and a k — so the CALLER must say.
-// Fail closed: an unattributed search (the default) counts nothing, which means
-// the feature stays dead until a caller opts in on purpose.
+// Fail closed: an unattributed search (the default) counts nothing and logs
+// nothing, which means the feature stays dead until a caller opts in on purpose.
 // That is the correct trade. A counter that quietly counts the wrong thing is
 // worse than no counter, because the ranking then encodes it and nobody can see
 // why.
@@ -1131,9 +1163,10 @@ function _recallCounts(origin) {
 // {rerank:false} to force base mode.
 //
 // {recall} says WHO is asking (see RECALL_ORIGINS). A real recall advances the
-// access counter of every hit that cleared the LOOSE relevance floor; anything
-// else — including the default of saying nothing — leaves no trace at all.
-// Accounting runs in BOTH modes; only the strength LEG is hybrid-only.
+// access counter of every hit that cleared the LOOSE relevance floor and appends
+// one row to the recall log; anything else — including the default of saying
+// nothing — leaves no trace at all. Accounting runs in BOTH modes; only the
+// strength LEG is hybrid-only.
 //
 // Returns base mode:  [{ filename, content, layer, updated_at, distance }]
 //         hybrid mode: [{ ..., distance (raw cosine, unchanged), rerank_score, pinned, strength }]
@@ -1247,17 +1280,44 @@ async function searchMemories({ queryEmbedding, queryText = null, k = 5, layer =
   if (counts) {
     // Best-effort: bookkeeping must never turn a successful recall into a failed
     // one — the keyholder asked a question and the answer is already computed.
-    // Loud in the debug channel. Counters that stop advancing are visible to any
-    // caller through getRecallCounts rather than only to the ranker.
-    try { await _recordRecall(out); }
+    // It is loud in the debug channel, and it is not silent at the surface
+    // either: a log that stops being written shows up in health('recall-shift')
+    // as zero recalls, which reads as "nothing was recalled", not as health.
+    try { await _recordRecall(recall, out, queryText, queryEmbedding); }
     catch (e) { _debug(`[brain] recall bookkeeping failed: ${e.message}`); }
   }
   return out;
 }
 
-// ── Recall accounting: the counter write path (elifant#8) ───────────────────
+// ── Recall accounting (elifant#8 write path + elifant#10 log) ────────────────
+//
+// One gate, two consumers, deliberately: a query that does not count as a recall
+// did not happen as far as the mind's own history is concerned either. Logging
+// housekeeping sweeps would pollute recall-shift with exactly the traffic the
+// counters already refuse to be moved by.
 
-async function _recordRecall(hits) {
+// Cap on how many hits ride inside one log row. `k` is caller-chosen and
+// unbounded; a log row must not be.
+const RECALL_LOG_MAX_HITS = 20;
+
+// Fingerprint, never the words. Content terms are deduped and SORTED, so
+// "grateful dead setlists" and "setlists grateful dead" collapse to one
+// fingerprint — the same question asked twice is the thing a shift reader wants
+// to see. 16 hex chars distinguishes questions comfortably and is far too short
+// to be worth attacking; there is nothing to recover from it anyway, since the
+// pre-image is a bag of stemless tokens the keyholder already holds.
+function _queryFingerprint(queryText, queryEmbedding) {
+  const toks = _rerankToks(queryText);
+  const basis = toks.length
+    ? 'q:' + [...new Set(toks)].sort().join(' ')
+    // No query text (base mode). Fingerprint the query Scent instead, rounded to
+    // 3dp so floating-point noise in an otherwise identical query doesn't split
+    // the group into two questions.
+    : 'v:' + queryEmbedding.map((x) => x.toFixed(3)).join(',');
+  return _sha256(basis).slice(7, 23);
+}
+
+async function _recordRecall(origin, hits, queryText, queryEmbedding) {
   // Only what actually cleared the LOOSE floor counts as recalled. searchMemories
   // returns top-k unconditionally and top-k is NOT a relevance judgement: on a
   // thin brain the k-th hit can be pure noise, and reinforcing it would teach the
@@ -1280,6 +1340,59 @@ async function _recordRecall(hits) {
         last_accessed = EXCLUDED.last_accessed
     `, [h.filename, ts]);
   }
+
+  const dists = hits.map((h) => h.distance).filter((d) => Number.isFinite(d));
+  const payload = counted.slice(0, RECALL_LOG_MAX_HITS).map((h) => ({
+    f: h.filename,
+    d: Number.isFinite(h.distance) ? Number(h.distance.toFixed(4)) : null,
+  }));
+  const r = await _db.query(`
+    INSERT INTO recall_log (ts, origin, query_fp, hit_count, counted_count, top_distance, hits)
+    VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id
+  `, [
+    ts, origin, _queryFingerprint(queryText, queryEmbedding), hits.length, counted.length,
+    // The CLOSEST thing the query found, whatever the fusion then did with the
+    // order — "are my questions still finding good answers?" is a different
+    // question from "what surfaced first", and this column answers the first one.
+    dists.length ? Number(Math.min(...dists).toFixed(4)) : null,
+    JSON.stringify(payload),
+  ]);
+
+  // Amortized trim. Doing it on every write would put a DELETE + subquery on the
+  // read path; doing it never would make "bounded" a lie. The trigger is the
+  // BIGSERIAL id, NOT an in-process counter — a host that restarts between every
+  // recall would reset an in-memory counter to zero forever and the log would
+  // grow without limit while the code claimed a ceiling.
+  const id = Number(r.rows[0].id);
+  const max = _recallLogMax();
+  if (Number.isSafeInteger(id) && id % _recallTrimEvery(max) === 0) await _trimRecallLog(max);
+}
+
+// Runtime-evaluated (never module-load), so a host can set the cap after
+// require() — the lesson _debug learned the hard way in 0.3.0-dev.2. Floor of 10
+// so a pathological config can't turn the log into a single-row table that
+// answers nothing.
+function _recallLogMax() {
+  const n = parseInt(process.env.ELIFANT_RECALL_LOG_MAX, 10);
+  return Math.max(10, Number.isFinite(n) && n > 0 ? n : 5000);
+}
+function _recallTrimEvery(max) { return Math.max(1, Math.min(64, Math.floor(max / 10))); }
+
+/**
+ * The hard ceiling on retained recall-log rows: the cap plus the amortization
+ * slack (at most one trim interval of overshoot). Exposed because a bound nobody
+ * can read is a bound nobody can check.
+ */
+function recallLogCeiling() { const m = _recallLogMax(); return m + _recallTrimEvery(m) - 1; }
+
+// Keep the newest `max` rows, drop everything older. Cutting by id (monotonic)
+// rather than by ts (second-precision, so a whole burst can share one stamp)
+// means the boundary is exact instead of taking a whole second with it.
+async function _trimRecallLog(max) {
+  const cut = await _db.query('SELECT id FROM recall_log ORDER BY id DESC OFFSET $1 LIMIT 1', [max]);
+  if (!cut.rows[0]) return 0;
+  const r = await _db.query('DELETE FROM recall_log WHERE id <= $1', [cut.rows[0].id]);
+  return r.affectedRows || 0;
 }
 
 /**
@@ -1297,6 +1410,63 @@ async function getRecallCounts({ filenames = null, limit = 1000 } = {}) {
     ? await _db.query(`SELECT ${cols} FROM memory_access WHERE filename = ANY($1::text[]) ORDER BY access_count DESC, filename LIMIT $2`, [filenames, lim])
     : await _db.query(`SELECT ${cols} FROM memory_access ORDER BY access_count DESC, filename LIMIT $1`, [lim]);
   return r.rows.map((row) => ({ ...row, strength: _strengthOf(row.access_count, row.last_accessed) }));
+}
+
+/**
+ * Read the recall log (elifant#10), newest first. Feeds health('recall-shift')
+ * and is the substrate a Keeper noticing detector would read — NOTE the honest
+ * gap: no detector reads it yet, the kernel's Keeper does not consult it, and
+ * wiring one is deliberate follow-on work rather than something to infer here.
+ * @param {object} [filter] {since, until, origin, limit}
+ */
+async function getRecallLog({ since = null, until = null, origin = null, limit = 200 } = {}) {
+  _ensure();
+  const lim = Math.max(1, Math.min(parseInt(limit, 10) || 200, 10000));
+  const where = [];
+  const params = [];
+  let i = 1;
+  if (since) { where.push(`ts >= $${i++}`); params.push(since); }
+  if (until) { where.push(`ts <= $${i++}`); params.push(until); }
+  if (origin) { where.push(`origin = $${i++}`); params.push(origin); }
+  params.push(lim);
+  const r = await _db.query(`
+    SELECT id, ts, origin, query_fp, hit_count, counted_count, top_distance, hits
+    FROM recall_log
+    ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+    ORDER BY id DESC
+    LIMIT $${i}
+  `, params);
+  return r.rows.map((row) => ({
+    ...row,
+    id: String(row.id),
+    top_distance: row.top_distance == null ? null : Number(row.top_distance),
+    hits: row.hits || [],
+  }));
+}
+
+/**
+ * Prune the recall log deliberately, by time (`olderThan`) and/or by count
+ * (`keep` newest rows). One of the two is required — the log is ALREADY bounded
+ * automatically (see recallLogCeiling), so this is the keyholder's gesture, not
+ * the safety net, and an unfiltered call is far more likely to be a mistake than
+ * an intent. Mirrors deleteCaptures' refusal to wipe on no filter.
+ * @returns {Promise<number>} rows deleted
+ */
+async function pruneRecallLog({ olderThan = null, keep = null } = {}) {
+  _ensure();
+  if (!olderThan && keep == null) {
+    throw new Error('pruneRecallLog: one of olderThan (ISO-8601 cutoff) or keep (newest-N to retain) is required');
+  }
+  let n = 0;
+  if (olderThan) {
+    const r = await _db.query('DELETE FROM recall_log WHERE ts <= $1', [olderThan]);
+    n += r.affectedRows || 0;
+  }
+  if (keep != null) {
+    const k = Math.max(0, parseInt(keep, 10) || 0);
+    n += await _trimRecallLog(k);
+  }
+  return n;
 }
 
 async function deleteMemory(filename) {
@@ -3417,7 +3587,89 @@ async function health(question = 'overview') {
     }
   }
   if (want('director-changes')) observations.push(na('director (router) changes', 'director-change history not retained in this build'));
-  if (want('recall-shift')) observations.push(na('recall distribution shift', 'recall history not retained in this build'));
+  if (want('recall-shift')) {
+    // elifant#10 — this used to be a flat 'not available' ("recall history not
+    // retained in this build"). It is retained now, so the question gets a real
+    // answer: how much recall there was, whether it is landing where it was
+    // landing before, and how concentrated it is.
+    //
+    // An EMPTY log is still a real answer — "no recalls recorded in the window"
+    // — not a refusal. The only honest 'not available' left here is a query that
+    // actually failed. And nothing below is judged without enough volume to
+    // judge it: an under-evidenced reading is REPORTED with its number and left
+    // at 'normal', never rounded up to a significance it hasn't earned.
+    try {
+      const dayAgo = _tsAgo(_DAY_MS), weekAgo = _tsAgo(7 * _DAY_MS);
+      const last24 = (await _db.query('SELECT count(*)::int n FROM recall_log WHERE ts >= $1', [dayAgo])).rows[0].n;
+      const last7 = (await _db.query('SELECT count(*)::int n FROM recall_log WHERE ts >= $1', [weekAgo])).rows[0].n;
+      const dailyAvg = last7 / 7;
+      let volSig = 'normal';
+      // Same baseline guard as capture volume: a brand-new brain's first day of
+      // recalls is not drift.
+      if (last7 >= 7 && dailyAvg > 0) {
+        const ratio = last24 / dailyAvg;
+        if (ratio >= 5) volSig = 'anomalous'; else if (ratio >= 2.5) volSig = 'notable';
+      }
+      observations.push({
+        dimension: 'recall volume — last 24h vs trailing-7d daily average',
+        baseline: Number(dailyAvg.toFixed(2)),
+        current: last24,
+        delta: dailyAvg > 0 ? Number((last24 - dailyAvg).toFixed(2)) : last24,
+        significance: volSig,
+        ...(last7 === 0 ? { note: 'no recalls recorded in the window — either nothing was recalled, or the callers are not naming a recall origin (an unattributed search is deliberately never counted)' } : {}),
+      });
+
+      // Per-memory hit counts inside a window. Guarded on jsonb_typeof so a
+      // hand-written or future-shaped row can't take the whole facet down.
+      const hitCounts = async (from, to) => {
+        const w = ['hits IS NOT NULL', "jsonb_typeof(hits) = 'array'", 'ts >= $1'];
+        const p = [from];
+        if (to) { w.push('ts < $2'); p.push(to); }
+        const r = await _db.query(
+          `SELECT h->>'f' AS f, count(*)::int AS n FROM recall_log, LATERAL jsonb_array_elements(hits) h WHERE ${w.join(' AND ')} GROUP BY 1`, p
+        );
+        return r.rows;
+      };
+
+      // The shift itself: of the hits recalled in the last 24h, what share landed
+      // on memories the prior six days never surfaced? High novelty is attention
+      // MOVING; zero is attention settled. Neither is a fault — that is the
+      // keyholder's call, which is why this reports a share and not a verdict.
+      const today = await hitCounts(dayAgo, null);
+      const prior = await hitCounts(weekAgo, dayAgo);
+      const priorSet = new Set(prior.map((r) => r.f));
+      const todayHits = today.reduce((s, r) => s + r.n, 0);
+      const novelHits = today.filter((r) => !priorSet.has(r.f)).reduce((s, r) => s + r.n, 0);
+      const novelty = todayHits > 0 ? novelHits / todayHits : 0;
+      const judgeable = todayHits >= 5 && priorSet.size >= 5;
+      let shiftSig = 'normal';
+      if (judgeable) { if (novelty >= 0.8) shiftSig = 'anomalous'; else if (novelty >= 0.5) shiftSig = 'notable'; }
+      observations.push({
+        dimension: 'recall distribution shift — last-24h hits landing outside the prior 6 days',
+        baseline: `${priorSet.size} memories recalled in the prior 6 days`,
+        current: todayHits > 0 ? `${Math.round(novelty * 100)}% of ${todayHits} hits are new` : 'no recall hits in the last 24h',
+        delta: Number(novelty.toFixed(2)),
+        significance: shiftSig,
+        ...(judgeable ? {} : { note: 'below the volume needed to call a shift (wants >= 5 hits today and >= 5 memories in the baseline) — reported, not judged' }),
+      });
+
+      // Concentration: is recall spreading across the library or collapsing onto
+      // a handful of rows? Informational at any value — a concentrated brain is
+      // not a sick one, it is a brain with a current obsession, and only the
+      // keyholder knows whether that is the right obsession.
+      const week = await hitCounts(weekAgo, null);
+      const totalHits = week.reduce((s, r) => s + r.n, 0);
+      const top5 = week.map((r) => r.n).sort((a, b) => b - a).slice(0, 5).reduce((s, n) => s + n, 0);
+      observations.push({
+        dimension: 'recall concentration — share of trailing-7d hits on the top 5 memories',
+        baseline: `${week.length} distinct memories recalled`,
+        current: totalHits > 0 ? `${Math.round((top5 / totalHits) * 100)}% of ${totalHits} hits` : 'no recall hits in the window',
+        delta: totalHits > 0 ? Number((top5 / totalHits).toFixed(2)) : 0,
+        significance: 'normal',
+      });
+    } catch (e) { observations.push(na('recall distribution shift', 'query failed: ' + e.message)); }
+  }
+
   const proposals = [];
   if (observations.some(o => o.significance === 'notable' || o.significance === 'anomalous')) {
     proposals.push({ kind: 'snapshot', reason: 'one or more observations are above baseline — a snapshot now preserves a clean restore point before anything drifts further' });
@@ -3587,6 +3839,10 @@ module.exports = {
   // per-memory counters the fusion's strength leg ranks by
   RECALL_ORIGINS,
   getRecallCounts,
+  // elifant#10 — retained recall history (bounded), feeding health('recall-shift')
+  getRecallLog,
+  pruneRecallLog,
+  recallLogCeiling,
   // elifant#16 — inject guard: one canonical answer for how a memory may travel
   // into an AI-facing context block ('plain' | 'mark-third-party' | 'hold')
   injectDisposition: _guardModule.injectDisposition,
