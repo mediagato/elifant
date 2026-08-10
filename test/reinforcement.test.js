@@ -83,17 +83,25 @@ test('a memory recalled repeatedly outranks an equally-similar one that never ha
   for (const winner of ['a-note.md', 'b-note.md']) {
     const dir = tmpDir();
     await brain.init(dir);
-    const vec = normalize(axisVec(3));
+    // axis 0, to match tilted()'s own hardcoded base axis (see its definition
+    // above) -- tilted() measures distance from a pure-axis-0 query.
+    const q = normalize(axisVec(0));
     const body = 'the sourdough starter lives in the door of the fridge';
-    // Identical vector => identical cosine distance. Identical text => identical
-    // BM25. Same stamp => identical recency.
-    await brain.setMemory('a-note.md', body, 'test', 'instance', vec);
-    await brain.setMemory('b-note.md', body, 'test', 'instance', vec);
+    // TIED cosine distance to the query via a symmetric tilt toward two
+    // DIFFERENT axes at the same magnitude, NOT the literal same vector --
+    // the near-dup guard (elifant "doubles and injects" fix) now correctly
+    // collapses a true duplicate, which would make searchMemories return
+    // only ONE row and defeat the point of this test (proving the STRENGTH
+    // leg specifically breaks a cosine+lexical tie between two genuinely
+    // distinct rows). Identical text => identical BM25. Same stamp =>
+    // identical recency.
+    await brain.setMemory('a-note.md', body, 'test', 'instance', tilted(103, 0.5));
+    await brain.setMemory('b-note.md', body, 'test', 'instance', tilted(104, 0.5));
     await flattenRecency();
 
-    await recallOnly(winner, vec, 'sourdough starter', 12);
+    await recallOnly(winner, q, 'sourdough starter', 12);
 
-    const hits = await brain.searchMemories({ queryEmbedding: vec, queryText: 'sourdough starter', k: 2 });
+    const hits = await brain.searchMemories({ queryEmbedding: q, queryText: 'sourdough starter', k: 2 });
     assert.equal(hits.length, 2);
     assert.equal(hits[0].filename, winner,
       `expected the reinforced memory (${winner}) to surface first, got ${hits.map((h) => h.filename).join(', ')}`);
@@ -160,23 +168,32 @@ test('a pin is never made worse by the strength leg', async () => {
   // and this test fails.
   const dir = tmpDir();
   await brain.init(dir);
-  const vec = normalize(axisVec(7));
+  // axis 0, to match tilted()'s own hardcoded base axis.
+  const q = normalize(axisVec(0));
   const body = 'the spare key is taped under the third step';
 
-  // A dozen rivals, identical geometry, all recalled — so the crowd occupies the
-  // whole top of the strength ranking.
+  // A dozen rivals, same DISTANCE-TO-QUERY (tied cosine) via a symmetric tilt
+  // toward 12 different axes at the same magnitude -- NOT the literal same
+  // vector. The near-dup guard (elifant "doubles and injects" fix) now
+  // correctly collapses true duplicates, which would crush this crowd down
+  // to one survivor and defeat the entire point of the test (a CROWD of
+  // reinforced, genuinely distinct rows pushing an unreinforced pin down).
+  // All recalled — so the crowd occupies the whole top of the strength
+  // ranking.
   for (let i = 0; i < 12; i++) {
-    await brain.setMemory(`rival-${i}.md`, body, 'test', 'instance', vec);
+    await brain.setMemory(`rival-${i}.md`, body, 'test', 'instance', tilted(300 + i, 0.5));
   }
-  const bulk = await brain.searchMemories({ queryEmbedding: vec, queryText: 'spare key', k: 12, recall: 'keyholder' });
+  const bulk = await brain.searchMemories({ queryEmbedding: q, queryText: 'spare key', k: 12, recall: 'keyholder' });
   assert.equal(bulk.length, 12, 'the whole crowd should have been recalled at once');
 
-  // The pin arrives afterwards and is never recalled at all.
-  await brain.setMemory('pinned.md', body, 'test', 'instance', vec);
+  // The pin arrives afterwards and is never recalled at all. Same tilt
+  // technique, a 13th distinct axis, so it neither collapses into nor is
+  // eclipsed by the crowd on cosine alone.
+  await brain.setMemory('pinned.md', body, 'test', 'instance', tilted(320, 0.5));
   await brain.setMemoryPin('pinned.md', true);
   await flattenRecency();
 
-  const hits = await brain.searchMemories({ queryEmbedding: vec, queryText: 'spare key', k: 13 });
+  const hits = await brain.searchMemories({ queryEmbedding: q, queryText: 'spare key', k: 13 });
   assert.equal(hits[0].filename, 'pinned.md',
     `a never-recalled pin was pushed below the recalled crowd: ${hits.map((h) => h.filename).join(', ')}`);
   await brain.close();

@@ -219,14 +219,32 @@ test('hybrid lexical leg does not rank a literal-term match WORSE than cosine al
 test('hybrid recency is pin-aware: a pinned memory is not demoted below an unpinned one', async () => {
   const dir = tmpDir();
   await brain.init(dir);
-  const v = normalize(axisVec(0));
-  await brain.setMemory('pinned.md', 'cobalt blue preference', 'test', 'instance', v);
-  await brain.setMemory('plain.md', 'cobalt blue preference', 'test', 'instance', v);
+  const q = normalize(axisVec(0));
+  // TIED cosine distance to the query via a symmetric tilt toward two
+  // DIFFERENT axes at the same magnitude, NOT the literal same vector --
+  // the near-dup guard (elifant "doubles and injects" fix) now correctly
+  // collapses two rows that share one exact embedding, which would hide
+  // plain.md from this test's own result set and defeat the point (proving
+  // the RECENCY leg specifically breaks a cosine+lexical tie). Same
+  // technique reinforcement.test.js's twin-a/twin-b fixture already uses;
+  // pairwise distance between these two is ~0.20, clear of NEAR_DUP_FLOOR
+  // (0.12), while each is equidistant from the query (~0.106), so cosine
+  // stays tied between them.
+  const tilted = (tiltAxis, eps) => {
+    const v = axisVec(0);
+    v[tiltAxis] = eps;
+    return normalize(v);
+  };
+  const vPinned = tilted(101, 0.5);
+  const vPlain = tilted(102, 0.5);
+  await brain.setMemory('pinned.md', 'cobalt blue preference', 'test', 'instance', vPinned);
+  await brain.setMemory('plain.md', 'cobalt blue preference', 'test', 'instance', vPlain);
   await brain.setMemoryPin('pinned.md', true);
 
-  // identical cosine + lexical; the recency leg treats pinned as freshest, so it
-  // must rank at or above the unpinned twin.
-  const hits = await brain.searchMemories({ queryEmbedding: v, queryText: 'cobalt blue', k: 2 });
+  // Tied cosine (by construction above) + identical lexical (same content);
+  // the recency leg treats pinned as freshest, so it must rank at or above
+  // the unpinned twin.
+  const hits = await brain.searchMemories({ queryEmbedding: q, queryText: 'cobalt blue', k: 2 });
   const pinnedRank = hits.findIndex((h) => h.filename === 'pinned.md');
   const plainRank = hits.findIndex((h) => h.filename === 'plain.md');
   assert.ok(pinnedRank <= plainRank, 'pinned memory must not be demoted below the unpinned one');

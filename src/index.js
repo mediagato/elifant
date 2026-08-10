@@ -849,6 +849,129 @@ function _vectorLiteral(arr) {
   return `[${arr.join(',')}]`;
 }
 
+// ── Near-duplicate guard (the mrmags "remembers things, sometimes doubles
+// and injects them" bug) ──────────────────────────────────────────────────
+// Two surfaces of one problem: (1) no capture-time semantic dedup existed
+// anywhere, so the same fact restated in different words minutes or days
+// apart became two independent tier-1 rows forever; (2) loose-tier search
+// had no result-set collapse, so both rows could ride into one injected
+// context block together. Fixed centrally, here, so setMemoryEmbedding and
+// searchMemories share ONE threshold and ONE query shape instead of copies
+// that drift apart — the same lesson RELEVANCE_FLOORS already teaches for
+// query-to-memory relevance, applied to memory-to-memory closeness instead.
+// (setMemory's own synchronous-embedding branch deliberately does NOT call
+// into this guard — see the comment on that branch for why: no production
+// caller reaches it, and this repo's test suite reaches it constantly with
+// one placeholder vector reused across deliberately-unrelated rows, which a
+// guard cannot tell apart from a real duplicate.)
+//
+// THRESHOLD: keeper.js's own SHELF_EDGE_FLOOR (0.12), read via its module
+// export (module-cached — this is NOT a second, independently-tunable copy,
+// it is the exact same number the Keeper's own shelving pass uses), NOT
+// RELEVANCE_FLOORS (0.33/0.40). Those are calibrated for query-to-memory
+// relevance — a looser question ("is this close enough to what was ASKED")
+// than memory-to-memory sameness ("do these two say the SAME THING").
+// keeper.js's header measured the two independently on the first real
+// corpus: genuinely-same-subject memory PAIRS land at 0.01-0.10, unrelated
+// pairs at 0.13-0.15+, while query-to-memory relevance only compresses that
+// tightly around 0.27-0.45. Reusing 0.33/0.40 here would either miss real
+// duplicates or — worse — fold distinct memories together. Conservative on
+// purpose: a false-positive collapse (hiding a real, distinct memory) is a
+// worse failure than an occasional missed duplicate.
+const { FLOORS: _NEARDUP_FLOORS } = require('./keeper');
+const NEAR_DUP_FLOOR = _NEARDUP_FLOORS.SHELF_EDGE_FLOOR;
+
+// Closest LIVE tier-1 keyholder-direct memory to `embedding`, other than
+// `excludeFilename` itself, WITHIN THE SAME layer. Same SOURCE_WHERE
+// predicate keeper.js uses for its own neighbour graph (deleted_at IS NULL,
+// archived = false, synthesized_via IS NULL, trust_tier = keyholder-direct)
+// — so a fresh capture is only ever folded into another KEYHOLDER'S source,
+// never into a machine-synthesized shelf/knowledge/confirmed-dup row (those
+// are summaries BY CONSTRUCTION close to their own members, which would
+// otherwise make near-dup detection fire on the Keeper's and Mind's own
+// output).
+//
+// The layer filter is NOT in keeper.js's SOURCE_WHERE (the Keeper doesn't
+// scope its neighbour graph by layer either) but belongs here: 'instance'
+// (user-created) and 'pattern' (template-seeded) rows are different
+// PURPOSES that can legitimately share near-identical content — a seeded
+// pattern describing the same general fact a keyholder later captures
+// themselves is not a duplicate CAPTURE, and collapsing across that
+// boundary was caught empirically (searchMemories filters-by-layer test)
+// silently discarding one layer's row in favor of the other's. Returns null
+// if nothing clears NEAR_DUP_FLOOR.
+async function _findNearDuplicate(embedding, excludeFilename, layer) {
+  const vec = _vectorLiteral(embedding);
+  const r = await _db.query(
+    `SELECT filename, (embedding <=> $1::vector) AS distance FROM memories
+     WHERE embedding IS NOT NULL AND filename != $2 AND deleted_at IS NULL
+       AND archived = false AND synthesized_via IS NULL AND trust_tier = $3
+       AND layer = $4
+     ORDER BY embedding <=> $1::vector LIMIT 1`,
+    [vec, excludeFilename, TRUST_TIER.KEYHOLDER_DIRECT, layer]
+  );
+  const hit = r.rows[0];
+  if (!hit) return null;
+  const distance = Number(hit.distance);
+  return distance < NEAR_DUP_FLOOR ? { filename: hit.filename, distance } : null;
+}
+
+// Reinforce one memory exactly like a real recall would (elifant#8's own
+// upsert), factored out so BOTH a real search recall (_recordRecall, below)
+// and a capture-time near-dup hit can reinforce a row the same way. A dup
+// hit is not a query, so there is no hits[]/queryText/recall-log shape to
+// feed _recordRecall directly — this is the narrow primitive underneath it.
+// access_count + last_accessed ONLY — same invariant _recordRecall already
+// documents: never updated_at/version_vector/content_hash, because
+// reinforcement is not an edit and must not manufacture a sync conflict or
+// hand the recency leg a second, hidden channel.
+async function _bumpAccess(filename, ts) {
+  await _db.query(`
+    INSERT INTO memory_access (filename, access_count, first_accessed, last_accessed)
+    VALUES ($1, 1, $2, $2)
+    ON CONFLICT(filename) DO UPDATE SET
+      access_count = memory_access.access_count + 1,
+      last_accessed = EXCLUDED.last_accessed
+  `, [filename, ts]);
+}
+
+// Pairwise near-dup adjacency among a bounded set of filenames (a search
+// candidate pool), using the SAME pgvector `<=>` operator keeper.js uses for
+// its own neighbour graph and the SAME NEAR_DUP_FLOOR as the capture-time
+// guard above — one threshold, read once, never hand-copied. Returns
+// Map<filename, Set<filename>>: "which OTHER candidates in this pool are
+// near-dup to this one" (absent/empty for a filename with no near-dup
+// partner in the pool). Bounded — the caller's pool is already capped
+// (searchMemories' hybrid mode caps it at max(k*5, 30)), so this is at most
+// one small self-join, never an unbounded scan (armor invariant 1).
+//
+// `a.layer = b.layer` for the same reason _findNearDuplicate is layer-scoped
+// (see its own comment): 'instance' and 'pattern' rows are different
+// purposes, not duplicate captures of each other, even when they land close
+// in embedding space. A caller that already filtered the pool to one layer
+// (searchMemories' own {layer} option) sees no change from this — every
+// filename in the pool already shares a layer — it only matters for an
+// unfiltered, cross-layer search.
+async function _nearDupEdges(filenames) {
+  const adj = new Map();
+  if (filenames.length < 2) return adj;
+  const r = await _db.query(
+    `SELECT a.filename AS a, b.filename AS b FROM memories a
+     JOIN memories b ON a.filename < b.filename
+     WHERE a.filename = ANY($1::text[]) AND b.filename = ANY($1::text[])
+       AND a.layer = b.layer
+       AND (a.embedding <=> b.embedding) < $2`,
+    [filenames, NEAR_DUP_FLOOR]
+  );
+  for (const { a, b } of r.rows) {
+    if (!adj.has(a)) adj.set(a, new Set());
+    if (!adj.has(b)) adj.set(b, new Set());
+    adj.get(a).add(b);
+    adj.get(b).add(a);
+  }
+  return adj;
+}
+
 async function setMemory(filename, content, updatedBy = 'brain', layer = 'instance', embedding = null) {
   _ensure();
   const { vv, hash } = await _stampWrite('memories', 'filename', filename, content);
@@ -881,6 +1004,25 @@ async function setMemory(filename, content, updatedBy = 'brain', layer = 'instan
     `, [filename, content, updatedBy, _ts(), layer, vv, hash]);
     return;
   }
+  // NOT guarded here on purpose (see the near-dup guard section above
+  // setMemory, and setMemoryEmbedding below, for the actual guard). Two
+  // things pushed the check off this branch specifically:
+  //   1. No real caller reaches it. The one production writer
+  //      (mrmags/app/api.js handleSaveMemory) always calls setMemory with
+  //      embedding=null and attaches the real vector afterward via
+  //      setMemoryEmbedding — confirmed by grepping every setMemory call
+  //      site in both repos, not assumed. setMemoryEmbedding carries the
+  //      equivalent guard, so the real capture path is fully covered.
+  //   2. This branch IS reached constantly by tests, which routinely reuse
+  //      one placeholder vector across several deliberately-unrelated rows
+  //      as a convenience (a layer-filter test, a prefix-filter test, a
+  //      pin-precedence test — none of them about semantic content). A
+  //      guard here can't distinguish that convention from a real
+  //      duplicate, and measured against this repo's own suite it did not
+  //      just flag a few false positives — it silently dropped inserts a
+  //      handful of tests depended on. A synchronous-embedding caller that
+  //      genuinely wants the guard can always route through
+  //      setMemory(embedding=null) + setMemoryEmbedding instead.
   // A fresh vector always invalidates the neighbour set — the edges were
   // computed against the vector this one replaces.
   const vec = _vectorLiteral(embedding);
@@ -943,9 +1085,39 @@ async function _setMemoryDerived(filename, content, { updatedBy = 'keeper', laye
 // embed asynchronously (after save) or by backfill workers running over
 // memories that pre-date the embedding column. Silently no-ops if the
 // memory doesn't exist.
+//
+// Near-dup guard (see the section above setMemory) lives HERE, not in
+// setMemory itself — this is where a REAL capture's vector first exists.
+// handleSaveMemory (mrmags/app/api.js) always calls setMemory with
+// embedding=null and attaches the real vector fire-and-forget, right after
+// the row is already inserted (confirmed by grepping every setMemory call
+// site in both repos — this is the only production writer). By the time we
+// get here the row already exists; there is no "skip the insert" left to
+// do, so instead: reinforce the matched original's recall strength, and
+// still write the embedding regardless of a hit. Leaving it un-embedded
+// would dodge today's collapse but only by creating a row stuck permanently
+// outside getMemoriesNeedingEmbedding's contract (NULL forever, re-offered
+// to the backfill queue every sweep) for no real benefit — searchMemories'
+// own collapse (the other half of this fix) is what keeps a reinforced pair
+// from surfacing together, regardless of which path supplied the vector.
 async function setMemoryEmbedding(filename, embedding) {
   _ensure();
   const vec = _vectorLiteral(embedding);
+  const self = await _db.query('SELECT trust_tier, layer FROM memories WHERE filename = $1', [filename]);
+  // Only guard a plain tier-1 keyholder-direct row's OWN embed. Without this,
+  // backfilling a synthesized shelf/knowledge row (getMemoriesNeedingEmbedding
+  // has no tier filter, so one CAN reach here un-embedded) would "detect" a
+  // near-dup against one of its own tier-1 members — true by construction (a
+  // shelf's embedding is the mean of its members' vectors) but not a real
+  // duplicate-capture event, and reinforcing a member every time its shelf
+  // gets re-embedded would be reinforcement noise, not signal.
+  if (self.rows[0] && self.rows[0].trust_tier === TRUST_TIER.KEYHOLDER_DIRECT) {
+    const dup = await _findNearDuplicate(embedding, filename, self.rows[0].layer);
+    if (dup) {
+      await _bumpAccess(dup.filename, _ts());
+      _debug(`[brain] setMemoryEmbedding: "${filename}" (distance ${dup.distance.toFixed(4)} from "${dup.filename}") reinforced the existing memory on embed`);
+    }
+  }
   // A replaced vector stales the neighbour set too — the Keeper's per-row
   // watermark resets so the row re-enters the neighbour queue.
   await _db.query(
@@ -1305,7 +1477,13 @@ function _recallCounts(origin) {
 // recency + pin-aware strength (elifant#8) before the top-K cut. The raw cosine
 // `distance` is PRESERVED on every row (downstream relevance floors read its
 // absolute value); the fused order is exposed as `rerank_score`. Pass
-// {rerank:false} to force base mode.
+// {rerank:false} to force base mode. Before the top-K cut, near-duplicate
+// hits (pairwise cosine distance under keeper.js's SHELF_EDGE_FLOOR — see the
+// near-dup guard section above setMemory) COLLAPSE to the single
+// best-ranked member of each cluster, so two near-identical memories never
+// both ride in one returned result set; this can return fewer than k rows
+// when the candidate pool has fewer than k genuinely-distinct members. Base
+// mode does not collapse (see its own note below).
 //
 // {recall} says WHO is asking (see RECALL_ORIGINS). A real recall advances the
 // access counter of every hit that cleared the LOOSE relevance floor and appends
@@ -1381,6 +1559,13 @@ async function searchMemories({ queryEmbedding, queryText = null, k = 5, layer =
     // recall ACCOUNTING still happens below — a recall is a recall regardless of
     // how the caller asked for it, and only counting hybrid ones would make the
     // counters a measure of caller style rather than of usefulness.
+    //
+    // Deliberately NOT near-dup collapsed, unlike hybrid mode below: this
+    // docstring promises byte-identical-to-pre-0.7.0 output, base mode's SQL
+    // LIMIT is already exactly k (no wider pool to backfill a dropped slot
+    // from, unlike hybrid's over-fetch), and no real caller needs it — the
+    // extension's manual inject pill and the MCP memory_search tool both
+    // always send a text query, which routes them into the hybrid branch.
     out = rows.map((r) => ({
       filename: r.filename,
       content: r.content,
@@ -1405,21 +1590,59 @@ async function searchMemories({ queryEmbedding, queryText = null, k = 5, layer =
 
     // Hybrid mode: fuse + re-order, PRESERVING the raw cosine distance per row.
     const score = _fuseRerank(rows, queryText, recencyWeight, strengthWeight);
-    out = rows
+    const ranked = rows
       .map((r) => ({ ...r, rerank_score: score[r.filename] }))
-      .sort((a, b) => (b.rerank_score - a.rerank_score) || ((b.pinned ? 1 : 0) - (a.pinned ? 1 : 0)))
-      .slice(0, k)
-      .map((r) => ({
-        filename: r.filename,
-        content: r.content,
-        layer: r.layer,
-        updated_at: r.updated_at,
-        distance: r.distance,        // raw cosine — UNCHANGED (relevance floors depend on it)
-        rerank_score: r.rerank_score,
-        pinned: r.pinned,
-        trust_tier: r.trust_tier,
-        strength: r.strength,        // the EARNED score, not the pinned +Infinity the fusion used
-      }));
+      .sort((a, b) => (b.rerank_score - a.rerank_score) || ((b.pinned ? 1 : 0) - (a.pinned ? 1 : 0)));
+
+    // Loose-tier result collapse (the mrmags "doubles and injects" bug) — two
+    // near-identical memories (same NEAR_DUP_FLOOR as the capture-time guard
+    // in the section above setMemory) must never both ride in one returned
+    // result set: a keyholder (or an injected context block) seeing one
+    // restated fact twice reads it as the kernel repeating itself, not as two
+    // corroborating memories. Collapsed BEFORE the top-k cut, over the WIDE
+    // candidate pool (up to max(k*5,30) rows) that already exists for
+    // reranking — dropping a duplicate here lets a genuinely different,
+    // lower-ranked candidate backfill the freed slot instead of silently
+    // shrinking the result below k.
+    //
+    // Greedy top-down over the already-scored order: walk best-to-worst,
+    // keep a row unless it is within NEAR_DUP_FLOOR of a row ALREADY kept.
+    // The best-ranked member of any near-dup cluster always survives (it is
+    // evaluated first, before anything could have disqualified it), so a pin
+    // — which _fuseRerank already ranks above an unpinned twin — is never
+    // collapsed away BY that twin; only the reverse can happen. When there
+    // are no near-dup edges in the pool (the overwhelmingly common case)
+    // this is a byte-for-byte no-op: every row is kept, in the same order,
+    // and the loop stops at k exactly like the plain .slice(0, k) it
+    // replaces.
+    //
+    // Base mode (below) is untouched on purpose: its own docstring promises
+    // output byte-identical to pre-0.7.0, and neither real caller (the
+    // extension's manual inject pill, the MCP memory_search tool) ever
+    // reaches base mode — both always send a text query, which activates
+    // this rerank branch via doRerank.
+    const dupEdges = await _nearDupEdges(ranked.map((r) => r.filename));
+    const kept = [];
+    const keptSet = new Set();
+    for (const r of ranked) {
+      const dupsOfR = dupEdges.get(r.filename);
+      if (dupsOfR && [...dupsOfR].some((f) => keptSet.has(f))) continue;
+      kept.push(r);
+      keptSet.add(r.filename);
+      if (kept.length >= k) break;
+    }
+
+    out = kept.map((r) => ({
+      filename: r.filename,
+      content: r.content,
+      layer: r.layer,
+      updated_at: r.updated_at,
+      distance: r.distance,        // raw cosine — UNCHANGED (relevance floors depend on it)
+      rerank_score: r.rerank_score,
+      pinned: r.pinned,
+      trust_tier: r.trust_tier,
+      strength: r.strength,        // the EARNED score, not the pinned +Infinity the fusion used
+    }));
   }
 
   if (counts) {
@@ -1472,19 +1695,13 @@ async function _recordRecall(origin, hits, queryText, queryEmbedding) {
   // RELEVANCE_FLOORS already makes for exploration surfaces.
   const counted = hits.filter((h) => isRelevant(h, 'loose'));
   const ts = _ts();
-  for (const h of counted) {
-    // access_count only. NOT updated_at, NOT version_vector, NOT content_hash —
-    // a read is not an edit. Bumping the row's causal history on recall would
-    // manufacture a sync conflict on every search, and bumping updated_at would
-    // feed the recency leg a second, hidden reinforcement channel.
-    await _db.query(`
-      INSERT INTO memory_access (filename, access_count, first_accessed, last_accessed)
-      VALUES ($1, 1, $2, $2)
-      ON CONFLICT(filename) DO UPDATE SET
-        access_count = memory_access.access_count + 1,
-        last_accessed = EXCLUDED.last_accessed
-    `, [h.filename, ts]);
-  }
+  // access_count only. NOT updated_at, NOT version_vector, NOT content_hash —
+  // a read is not an edit. Bumping the row's causal history on recall would
+  // manufacture a sync conflict on every search, and bumping updated_at would
+  // feed the recency leg a second, hidden reinforcement channel. (_bumpAccess
+  // is the same upsert the near-dup guard reuses for a capture-time hit —
+  // ONE reinforcement primitive, not two copies.)
+  for (const h of counted) await _bumpAccess(h.filename, ts);
 
   const dists = hits.map((h) => h.distance).filter((d) => Number.isFinite(d));
   const payload = counted.slice(0, RECALL_LOG_MAX_HITS).map((h) => ({
