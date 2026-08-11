@@ -110,7 +110,29 @@ const { thirdPartyCluster, crisisMatch, THIRD_PARTY_MARK } = require('./guard');
 // the Nose changes; an ambient-distance-adaptive floor is the follow-up idea.
 const NEIGHBOUR_K = 8;            // edges considered per queued memory
 const EDGE_KEEP_FLOOR = 0.40;     // store the edge at all (graph memory)
-const SHELF_EDGE_FLOOR = 0.12;    // an edge tight enough to bind a shelf
+const SHELF_EDGE_FLOOR = 0.12;    // same-fact territory: feeds the near-dup guard only, never shelf binding
+// Measured 2026-08-10 against the live int8 nomic embedder, twice — and the
+// two measurements together are the whole story. On clean prose: same-fact
+// restatements 0.03-0.12, related-distinct 0.21-0.48, unrelated 0.35+, so
+// SHELF_EDGE_FLOOR (0.12) binds ZERO related-distinct pairs and the connect
+// lens was structurally dead on real content. But on the real production
+// corpus (35 extension-captured memories) EVERY floor mushed: 33/35 chained
+// into one component at 0.28 AND 0.32, because the capture template's shared
+// boilerplate dominates short facts' embeddings (a movie preference and
+// licensing advice bound at < 0.28 by their WRAPPER, not their meaning) —
+// the same phenomenon the 2026-07-30 note above records. No scalar separates
+// template-polluted unrelated pairs (0.13-0.28) from clean related pairs
+// (0.21-0.48); the fix is upstream of this file: the app embeds
+// embeddableText(content) (strip provenance scaffolding, embed the FACT —
+// see mrmags/app/embed/embeddable.js), after which the same real corpus
+// measures clean (largest component 10/35, all edges individually coherent,
+// and the only sub-0.12 pairs are true restatements). 0.28 binds real
+// topical clusters without boilerplate chaining; 0.32 mushed even a clean
+// 15-memory corpus transitively. SHELF_EDGE_FLOOR keeps its original
+// meaning ("same fact") and still feeds the near-dup guard exclusively —
+// validated on stripped real data: 4/4 pairs under 0.12 were true
+// restatements, zero false collapses.
+const SHELF_BIND_FLOOR = 0.28;    // an edge tight enough to bind a shelf
 const MIN_SHELF = 3;              // pairs are near-dup territory (elifant#6), not a shelf
 const QUEUE_BATCH = 50;           // bounded work per tick
 const FIRST_LIGHT_MIN_CORPUS = 8; // below this, everything is new territory — stay quiet
@@ -124,7 +146,7 @@ const PAIR_LEDGER_KEY = 'keeper_pairs'; // brain_meta key: last-asked {kind, sig
 // number ("six gentle nudges about the same project, all ignored"), and it
 // holds up independently: a keeper tick fires once per idle period, so
 // requiring the SAME two-memory pair (the kernel's own definition of "the
-// same project" — bound by the shelf-tight SHELF_EDGE_FLOOR) to survive six
+// same project" — bound by the shelf-tight SHELF_BIND_FLOOR) to survive six
 // separate ticks with no change in its content-state rules out "the
 // keyholder just hasn't opened the Bell yet" (one missed session), while
 // still catching a real pattern well inside the span of a week of ordinary
@@ -515,7 +537,7 @@ function createKeeper(ctx) {
       SELECT e.a_filename AS a, e.b_filename AS b FROM memory_edges e
       JOIN memories ma ON ma.filename = e.a_filename AND ${sourceWhere('ma')}
       JOIN memories mb ON mb.filename = e.b_filename AND ${sourceWhere('mb')}
-      WHERE e.distance < $1`, [SHELF_EDGE_FLOOR]);
+      WHERE e.distance < $1`, [SHELF_BIND_FLOOR]);
     return r.rows;
   }
 
@@ -831,7 +853,7 @@ module.exports = {
   confirmedDupSlug,
   SHELVING_VIA,
   PAIR_LEDGER_KEY,
-  FLOORS: { NEIGHBOUR_K, EDGE_KEEP_FLOOR, SHELF_EDGE_FLOOR, MIN_SHELF, FIRST_LIGHT_MIN_CORPUS },
+  FLOORS: { NEIGHBOUR_K, EDGE_KEEP_FLOOR, SHELF_EDGE_FLOOR, SHELF_BIND_FLOOR, MIN_SHELF, FIRST_LIGHT_MIN_CORPUS },
   // elifant#15 — manner-mismatch notice: pure helper + the tunables/ids a test
   // needs to assert against without hardcoding this file's internals twice.
   mannerMismatchPrompt,

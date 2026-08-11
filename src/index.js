@@ -865,21 +865,21 @@ function _vectorLiteral(arr) {
 // one placeholder vector reused across deliberately-unrelated rows, which a
 // guard cannot tell apart from a real duplicate.)
 //
-// THRESHOLD: keeper.js's own SHELF_EDGE_FLOOR (0.12), read via its module
-// export (module-cached — this is NOT a second, independently-tunable copy,
-// it is the exact same number the Keeper's own shelving pass uses), NOT
-// RELEVANCE_FLOORS (0.33/0.40). Those are calibrated for query-to-memory
-// relevance — a looser question ("is this close enough to what was ASKED")
-// than memory-to-memory sameness ("do these two say the SAME THING").
-// keeper.js's header measured the two independently on the first real
-// corpus: genuinely-same-subject memory PAIRS land at 0.01-0.10, unrelated
-// pairs at 0.13-0.15+, while query-to-memory relevance only compresses that
-// tightly around 0.27-0.45. Reusing 0.33/0.40 here would either miss real
-// duplicates or — worse — fold distinct memories together. Conservative on
-// purpose: a false-positive collapse (hiding a real, distinct memory) is a
-// worse failure than an occasional missed duplicate.
-const { FLOORS: _NEARDUP_FLOORS } = require('./keeper');
-const NEAR_DUP_FLOOR = _NEARDUP_FLOORS.SHELF_EDGE_FLOOR;
+// THRESHOLD: 0.12, pinned here as its own literal — NOT keeper.js's FLOORS
+// export. Until 2026-08-10 this read keeper.js's SHELF_EDGE_FLOOR directly,
+// on the reasoning that near-dup and shelf-binding were the same "how close
+// is too close" question. They are not: SHELF_EDGE_FLOOR/0.12 measures
+// same-fact restatement, while shelf binding needs a much looser floor to
+// catch genuinely-related-but-distinct memories (keeper.js's SHELF_BIND_FLOOR,
+// 0.28 — see its own header for the measurement). Sharing one constant meant
+// raising the shelf floor to make shelving work would have silently loosened
+// the duplicate guard too. Pinned independently so the two can move apart.
+// NOT RELEVANCE_FLOORS (0.33/0.40) either — those are calibrated for
+// query-to-memory relevance, a looser question ("is this close enough to what
+// was ASKED") than memory-to-memory sameness ("do these two say the SAME
+// THING"). Conservative on purpose: a false-positive collapse (hiding a real,
+// distinct memory) is a worse failure than an occasional missed duplicate.
+const NEAR_DUP_FLOOR = 0.12;
 
 // Closest LIVE tier-1 keyholder-direct memory to `embedding`, other than
 // `excludeFilename` itself, WITHIN THE SAME layer. Same SOURCE_WHERE
