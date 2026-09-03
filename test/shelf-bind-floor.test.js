@@ -64,7 +64,7 @@ test('a trio at ~0.25 apart shelves under SHELF_BIND_FLOOR (0.28) — SHELF_EDGE
   const satelliteC = starVec(0, 2, cosTheta);     // distance from hub: exactly 0.25
 
   await brain.setMemory('related-a.md', 'the mrmags CI pipeline runs on the self-hosted GitLab', 'test', 'instance', hub);
-  await brain.setMemory('related-b.md', 'GitLab CI publishes the Abigail release to the CDN', 'test', 'instance', satelliteB);
+  await brain.setMemory('related-b.md', 'GitLab CI publishes the tagged release to the CDN', 'test', 'instance', satelliteB);
   await brain.setMemory('related-c.md', 'the release pipeline gates on the substrate audit script', 'test', 'instance', satelliteC);
 
   const receipt = await brain.keeperTick();

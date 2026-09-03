@@ -341,9 +341,9 @@ test('a pattern below the gates grows across ticks and promotes when it earns it
 });
 
 test('#20: a rolling-window host can promote on evidence depth alone — but only by opting in', async () => {
-  // askari/mind (Allen) keeps a ~24h rolling window, so a pattern's `born`
-  // — derived from the member rows' own updated_at — can never age past the
-  // window however much evidence stacks up. Without an escape hatch a
+  // A rolling-window host — one retaining only ~24h of evidence — has patterns
+  // whose `born`, derived from the member rows' own updated_at, can never age
+  // past the window however much evidence stacks up. Without an escape hatch a
   // 40-observation pattern sits in `forming` forever.
   await freshBrain();
   const T = Date.now();

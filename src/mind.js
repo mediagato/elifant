@@ -65,8 +65,8 @@
  *     tier-2-synthesized via the derived-write primitive, NEVER via
  *     setMemoryPin (which is the keyholder's tier-1 vouch and must stay so).
  *
- * CONFIDENCE IS THRESHOLD-MECHANICAL. askari/mind (the reference impl this
- * ports, built for Allen) floored recency at 0.3, which made its own <0.2
+ * CONFIDENCE IS THRESHOLD-MECHANICAL. The earlier host-side implementation
+ * this ports from floored recency at 0.3, which made its own <0.2
  * retirement threshold unreachable and forced a second, age-driven retirement
  * mechanism. The kernel drops the floor: recency decays linearly to ZERO at
  * horizonDays, so <0.4 revision and <0.2 retirement are genuinely reachable
@@ -81,7 +81,8 @@
  * shape to accept it.
  * SEAM RESERVED (detector B, fast-follow): capture-theme recurrence — hosts
  * emitting addCapture({data:{theme}}) — feeds the same interface too; that is
- * how Allen-on-kernel keeps Minecraft semantics host-side forever.
+ * how a host keeps its own domain vocabulary host-side forever, with the
+ * kernel seeing only opaque themes.
  *
  * IDENTITY SURVIVES ARCHIVE-AND-REFORM (elifant#18 — was the KNOWN GAP here).
  * A pattern's ledger id is the producer row it was first seen on ('shelf:' /
@@ -164,10 +165,10 @@ const DEFAULTS = {
   // hatch (elifant#20). Infinity by default: the gate is unconditional for
   // every existing consumer, and only a host that explicitly sets a finite
   // number opts in. It exists because `born` is derived from the member rows'
-  // own updated_at, so a host whose evidence lives in a ROLLING WINDOW (askari
-  // /mind, built for Allen's deathzone memory, keeps ~24h) has patterns whose
-  // born can never age past the window no matter how much evidence piles up —
-  // a 40-observation pattern would sit in `forming` forever. Depth of evidence
+  // own updated_at, so a host whose evidence lives in a ROLLING WINDOW (a
+  // downstream consumer retaining only ~24h, say) has patterns whose born can
+  // never age past the window no matter how much evidence piles up — a
+  // 40-observation pattern would sit in `forming` forever. Depth of evidence
   // substituting for elapsed time is a real, defensible signal; assuming every
   // host wants it is not, hence the opt-in default.
   promoteHighN: Infinity,
@@ -205,7 +206,7 @@ const MAX_ALIASES = 20;
 // ── pure helpers (exported for the test suite) ──────────────────────────────
 
 // Stable public grouping key — djb2 over the theme, so consumers thread events
-// without ever needing the raw pattern id (askari ports.js convention).
+// without ever needing the raw pattern id (a downstream ports convention).
 function threadKey(theme) {
   let h = 5381;
   const s = String(theme);
