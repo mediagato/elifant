@@ -1187,6 +1187,17 @@ export interface KeeperTickReceipt {
    *  general 'be more direct' steering rule and asks. */
   mannerMismatches: number;
   prunedEdges: number;
+  /** Oversized/incoherent components broken into coherent sub-groups this tick
+   *  rather than bound as one mega-shelf (0.26.0 shelf-cohesion gate). */
+  componentsDecomposed: number;
+  /** Components skipped this tick for exceeding MAX_COHESION_COMPONENT_SIZE —
+   *  too large to evaluate the O(n^2) cohesion check safely; left unshelved
+   *  and flagged rather than guessed at (0.26.0). */
+  oversizedComponentsFlagged: number;
+  /** Sub-groups a decomposition produced that still failed the whole-group
+   *  cohesion ceiling and were dropped rather than shelved (0.26.0 — expected
+   *  to stay 0; a nonzero value means SHELF_DECOMPOSE_CEILING is mis-tuned). */
+  undecomposableGroups: number;
   /** True when the pre-write snapshot guard fired (kernel-ethic #11). */
   snapshotTaken: boolean;
   /** The Mind's promotion-pass receipt (0.23.0 — rides the tail of every

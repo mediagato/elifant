@@ -594,3 +594,134 @@ test('a pair that grows into a shelf drops out of the pair ledger (no lingering 
     'the original pair ask stands; no new one is added once it graduates to a shelf');
   await brain.close();
 });
+
+// ── 0.26.0: shelf-cohesion gate (transitive single-linkage collapse) ────────
+//
+// components() is single-linkage: one edge under SHELF_BIND_FLOOR fuses two
+// groups with no check on whether the RESULT is coherent, so a chain of
+// individually-tight edges drags dozens of unrelated memories onto one shelf.
+// The gate: a component larger than SHELF_COHESION_MIN_SIZE must also clear
+// SHELF_COHESION_CEILING on its whole-set mean pairwise distance, or it is
+// broken into sub-groups that each clear SHELF_DECOMPOSE_CEILING on their own.
+
+// Equal weight on axes [start .. start+W], normalized. Two of these W axes
+// apart share (W+1-k) of W+1 axes, so cosine distance is exactly k/(W+1): a
+// sliding window makes a genuine single-linkage chain (adjacent pairs bind,
+// the endpoints are a full 1.0 apart).
+function windowVec(start, W) {
+  const v = new Array(DIM).fill(0);
+  for (let k = 0; k <= W; k++) v[start + k] = 1;
+  return normalize(v);
+}
+
+test('cohesion: an oversized incoherent chain is decomposed, never bound as one mega-shelf', async () => {
+  await freshBrain();
+  // 20 memories, each a 15-axis window one step along from the last: adjacent
+  // distance 0.067 (binds), c00<->c19 a full 1.0 apart. Single-linkage alone
+  // would put all 20 on one shelf.
+  for (let i = 0; i < 20; i++) {
+    await brain.setMemory(`chain-${String(i).padStart(2, '0')}.md`, `chain note number ${i} in a long thread`, 'test', 'instance', windowVec(i, 14));
+  }
+  const receipt = await brain.keeperTick({ mind: false });
+
+  assert.ok(receipt.componentsDecomposed >= 1, 'the 20-member incoherent component is decomposed, not shelved whole');
+  assert.equal(receipt.oversizedComponentsFlagged, 0, 'well under MAX_COHESION_COMPONENT_SIZE — evaluated, not skipped');
+
+  const shelfRows = (await brain._internal.query(
+    'SELECT filename, content, embedding::text AS vec FROM memories WHERE synthesized_via = $1 AND archived = false', [keeper.SHELVING_VIA]
+  )).rows;
+  assert.ok(shelfRows.length >= 2, `decomposition yields several coherent shelves, got ${shelfRows.length}`);
+  for (const s of shelfRows) {
+    const members = keeper.parseMembers(s.content);
+    assert.ok(members.length < 20, `no single shelf carries the whole chain — ${s.filename} has ${members.length}`);
+    // Per-shelf artifact check: every written shelf is itself coherent, not
+    // just "smaller than the mega". Rebuild each member's vector and measure.
+    const memberVecs = (await brain._internal.query(
+      'SELECT filename, embedding::text AS vec FROM memories WHERE filename = ANY($1::text[])', [members]
+    )).rows;
+    const vm = new Map(memberVecs.map((r) => [r.filename, keeper.parseVec(r.vec)]));
+    const mean = keeper.meanPairwiseCohesion(members, vm);
+    assert.ok(mean <= keeper.FLOORS.SHELF_COHESION_CEILING,
+      `${s.filename}: whole-shelf mean pairwise ${mean.toFixed(4)} must clear the accept ceiling ${keeper.FLOORS.SHELF_COHESION_CEILING}`);
+  }
+  assert.equal(receipt.undecomposableGroups, 0, 'every sub-group produced clears the ceiling — nothing dropped');
+  await brain.close();
+});
+
+test('cohesion: a near-dup pair single-linkage buried inside an incoherent component is pulled back out to the Bell', async () => {
+  await freshBrain();
+  // A 13-member chain, plus a near-dup pair (dupA/dupB ~0.15 apart) hanging off
+  // chain node c06: dupA binds to c06 (~0.27, an edge), dupB binds only to dupA
+  // (~0.38 to c06, no direct edge). Single-linkage swallows the pair into the
+  // 15-member component; the pair's own 2-node structure is gone from
+  // components() and it can never be asked about — unless decomposition
+  // recovers it.
+  for (let i = 0; i < 13; i++) {
+    await brain.setMemory(`c-${String(i).padStart(2, '0')}.md`, `thread note ${i}`, 'test', 'instance', windowVec(i, 14));
+  }
+  const c6 = windowVec(6, 9);
+  const dupA = normalize(c6.map((x, idx) => (idx === 200 ? 0.936 : x)));
+  const dupB = normalize(dupA.map((x, idx) => (idx === 201 ? 0.62 : x)));
+  await brain.setMemory('standup-a.md', 'the standup moved to 9am on tuesdays', 'test', 'instance', dupA);
+  await brain.setMemory('standup-b.md', 'on tuesdays the standup is now at 9am', 'test', 'instance', dupB);
+
+  await brain.keeperTick({ mind: false });
+
+  const nd = (await brain.getCaptures({ source: 'keeper', type: 'needs-decision' }));
+  const key = keeper.pairKey('standup-a.md', 'standup-b.md');
+  const entry = nd.find((c) => c.data && c.data.key === key);
+  assert.ok(entry, `the buried pair reaches the Bell as its own ask; needs-decision keys seen: ${nd.map((c) => c.data && c.data.key).join(', ')}`);
+  assert.equal(entry.data.kind, 'near-dup', 'symmetric phrasing -> near-dup, not contradiction');
+
+  // And it is NOT also sitting inside a shelf.
+  const shelfRows = (await brain._internal.query(
+    'SELECT content FROM memories WHERE synthesized_via = $1 AND archived = false', [keeper.SHELVING_VIA]
+  )).rows;
+  for (const s of shelfRows) {
+    const m = keeper.parseMembers(s.content);
+    assert.ok(!(m.includes('standup-a.md') && m.includes('standup-b.md')),
+      'the recovered pair is asked about, never shelved');
+  }
+  await brain.close();
+});
+
+test('cohesion: exceedsCohesionCap is a pure predicate, and cohesiveSubclusters is deterministic', () => {
+  assert.equal(keeper.exceedsCohesionCap(13, 12), true);
+  assert.equal(keeper.exceedsCohesionCap(12, 12), false);
+  assert.equal(keeper.exceedsCohesionCap(600), true, 'default cap is MAX_COHESION_COMPONENT_SIZE (500)');
+  assert.equal(keeper.exceedsCohesionCap(400), false);
+
+  // A 20-node incoherent chain: decompose it twice from the same vectors, the
+  // grouping must be byte-identical (every other clustering primitive in this
+  // file is deliberately deterministic — this one too).
+  const names = [];
+  const vm = new Map();
+  for (let i = 0; i < 20; i++) { const n = `n${String(i).padStart(2, '0')}.md`; names.push(n); vm.set(n, windowVec(i, 14)); }
+  const shuffled = [...names].reverse();
+  const a = keeper.cohesiveSubclusters(names, vm, keeper.FLOORS.SHELF_DECOMPOSE_CEILING);
+  const b = keeper.cohesiveSubclusters(shuffled, vm, keeper.FLOORS.SHELF_DECOMPOSE_CEILING);
+  assert.deepEqual(a, b, 'grouping is independent of input order and stable across runs');
+  for (const g of a) {
+    assert.ok(keeper.meanPairwiseCohesion(g, vm) <= keeper.FLOORS.SHELF_DECOMPOSE_CEILING,
+      `every emitted group clears the decompose ceiling on its OWN whole mean: ${JSON.stringify(g)}`);
+  }
+});
+
+test('cohesion: a large but genuinely coherent cluster is left as one shelf, not over-decomposed', async () => {
+  await freshBrain();
+  // 15 members, all mutually ~0.02 apart (one tight subject). Size 15 is over
+  // SHELF_COHESION_MIN_SIZE (12) so the ceiling IS consulted — and it passes.
+  // The gate must not punish a real cluster for being big.
+  for (let i = 0; i < 15; i++) {
+    await brain.setMemory(`coh-${String(i).padStart(2, '0')}.md`, `one subject, memory ${i}`, 'test', 'instance', nearVec(0, i + 1));
+  }
+  const receipt = await brain.keeperTick({ mind: false });
+  assert.equal(receipt.componentsDecomposed, 0, 'a coherent 15-member cluster is not decomposed');
+  assert.equal(receipt.shelvesWritten, 1, 'it binds as exactly one shelf');
+  const shelfRows = (await brain._internal.query(
+    'SELECT content FROM memories WHERE synthesized_via = $1 AND archived = false', [keeper.SHELVING_VIA]
+  )).rows;
+  assert.equal(shelfRows.length, 1);
+  assert.equal(keeper.parseMembers(shelfRows[0].content).length, 15, 'all 15 on the one shelf');
+  await brain.close();
+});

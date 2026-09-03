@@ -134,6 +134,36 @@ const SHELF_EDGE_FLOOR = 0.12;    // same-fact territory: feeds the near-dup gua
 // restatements, zero false collapses.
 const SHELF_BIND_FLOOR = 0.28;    // an edge tight enough to bind a shelf
 const MIN_SHELF = 3;              // pairs are near-dup territory (elifant#6), not a shelf
+
+// Shelf-cohesion gate (0.26.0). components() is single-linkage: one edge under
+// SHELF_BIND_FLOOR fuses two groups with no check on whether the RESULT is
+// coherent. On a real corpus a chain of individually-tight edges drags 50-95
+// topically-unrelated memories into one component whose whole-set pairwise
+// distance is nowhere near the floor (measured 2026-09-03: a 94-member
+// collapse means 0.34 pairwise while its adjacent edges mean 0.22 — every edge
+// honestly under 0.28, the whole nowhere near it). SHELF_BIND_FLOOR has no
+// single value that both stops this and still binds a genuine ~0.25-apart trio
+// (test/shelf-bind-floor.test.js pins the trio), so the bind decision gets a
+// second gate here rather than a floor retune. A component LARGER than
+// SHELF_COHESION_MIN_SIZE must also have whole-set mean pairwise distance
+// <= SHELF_COHESION_CEILING to bind as one shelf; otherwise it is broken into
+// sub-groups that each clear SHELF_DECOMPOSE_CEILING on their own whole-group
+// mean (complete-linkage-style — the textbook fix for single-linkage
+// chaining). Small components never reach the ceiling: transitive drift can't
+// accumulate across so few members (largest healthy real component seen was
+// ~10), and gating them would put the pinned 0.3125-mean trio at the mercy of
+// a threshold it has no margin against.
+const SHELF_COHESION_MIN_SIZE = 12;     // components this size or smaller bind without a cohesion check
+const SHELF_COHESION_CEILING = 0.30;    // whole-component mean pairwise cosine distance to bind as one shelf
+// SHELF_DECOMPOSE_CEILING: swept 0.16/0.18/0.20/0.25 against the real mrmags
+// eval harness on both corpus.yaml and corpus-diverse.yaml (2026-09-03,
+// mrmags/app/eval/TUNING.md finding #13) before picking a default. 0.16 wins
+// outright: corpus.yaml 15 PASS/2 FAIL/3 VOID (best of all four, vs 14/1/5 at
+// 0.18-0.20), corpus-diverse 14/3/3 tied for best. Looser values re-merge
+// enough that near-dup/contradiction pairs stay buried in a sub-shelf instead
+// of reaching the Bell; 0.25 is strictly worse than 0.16 on both corpora.
+const SHELF_DECOMPOSE_CEILING = 0.16;   // whole-group mean a decomposed sub-group must clear to become its own shelf
+const MAX_COHESION_COMPONENT_SIZE = 500; // hard skip: bigger than this is flagged, not evaluated (O(n^2) backstop)
 const QUEUE_BATCH = 50;           // bounded work per tick
 const FIRST_LIGHT_MIN_CORPUS = 8; // below this, everything is new territory — stay quiet
 const BULK_SNAPSHOT_ROWS = 100;   // kernel-ethic #11: snapshot before >100-row passes
@@ -363,6 +393,81 @@ function components(edges /* [{a, b}] */) {
   return [...groups.values()].map((g) => g.sort()).sort((x, y) => (x[0] < y[0] ? -1 : 1));
 }
 
+// Cosine distance, the same metric pgvector's `<=>` gives — computed here from
+// raw member vectors because memory_edges only stores each row's NEIGHBOUR_K
+// nearest under EDGE_KEEP_FLOOR and so cannot answer an arbitrary pair inside a
+// large component. denom === 0 (a zero vector) reads as maximally far.
+function _cosDist(a, b) {
+  let dot = 0, na = 0, nb = 0;
+  for (let i = 0; i < a.length; i++) { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; }
+  const denom = Math.sqrt(na) * Math.sqrt(nb);
+  return denom === 0 ? 1 : 1 - dot / denom;
+}
+
+// Mean cosine distance over every C(n,2) member pair — the whole-set cohesion
+// number the gate compares against a ceiling. n < 2 -> 0 (a lone member is
+// vacuously cohesive; callers gate on size first). Summed in a fixed order so
+// the result is deterministic.
+function meanPairwiseCohesion(members, vecByName) {
+  let sum = 0, n = 0;
+  for (let i = 0; i < members.length; i++) {
+    const vi = vecByName.get(members[i]);
+    for (let j = i + 1; j < members.length; j++) { sum += _cosDist(vi, vecByName.get(members[j])); n++; }
+  }
+  return n === 0 ? 0 : sum / n;
+}
+
+// Break a component into sub-groups that are each coherent AS A WHOLE, not just
+// along a spanning path. Greedy agglomerative: start with singletons, then
+// repeatedly make the one merge that yields the lowest merged-group whole mean
+// pairwise distance, accepting it only if that mean is <= ceiling; stop when no
+// legal merge remains. Acceptance is on the merged group's OWN whole mean (not
+// the cross-pair average), so every group returned is guaranteed <= ceiling.
+// Deterministic: the distance matrix is built from a sorted member list and a
+// tie in merged mean keeps the first pair encountered (lowest group indices),
+// so identical input always yields identical grouping. Returns string[][], each
+// group sorted, outer list sorted by first member.
+function cohesiveSubclusters(members, vecByName, ceiling) {
+  const names = [...members].sort();
+  const n = names.length;
+  const d = Array.from({ length: n }, () => new Array(n).fill(0));
+  for (let i = 0; i < n; i++) {
+    for (let j = i + 1; j < n; j++) {
+      const dist = _cosDist(vecByName.get(names[i]), vecByName.get(names[j]));
+      d[i][j] = dist; d[j][i] = dist;
+    }
+  }
+  let groups = names.map((_, i) => ({ idx: [i], sum: 0, pairs: 0 }));
+  for (;;) {
+    let best = null;
+    for (let i = 0; i < groups.length; i++) {
+      for (let j = i + 1; j < groups.length; j++) {
+        let cross = 0;
+        for (const a of groups[i].idx) for (const b of groups[j].idx) cross += d[a][b];
+        const sum = groups[i].sum + groups[j].sum + cross;
+        const pairs = groups[i].pairs + groups[j].pairs + groups[i].idx.length * groups[j].idx.length;
+        const mean = pairs === 0 ? 0 : sum / pairs;
+        if (mean <= ceiling && (best === null || mean < best.mean)) best = { i, j, sum, pairs, mean };
+      }
+    }
+    if (best === null) break;
+    const merged = { idx: groups[best.i].idx.concat(groups[best.j].idx), sum: best.sum, pairs: best.pairs };
+    groups = groups.filter((_, k) => k !== best.i && k !== best.j);
+    groups.push(merged);
+  }
+  return groups
+    .map((g) => g.idx.map((i) => names[i]).sort())
+    .sort((x, y) => (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0));
+}
+
+// Pure size predicate — a component bigger than the cap is skipped, not
+// evaluated: the cohesion gate is O(n^2) in member count and a runaway
+// component is exactly where that bites. Separate + exported so a test can pin
+// it without seeding hundreds of real rows.
+function exceedsCohesionCap(size, cap = MAX_COHESION_COMPONENT_SIZE) {
+  return size > cap;
+}
+
 // Match freshly computed clusters against the live shelves so a shelf keeps its
 // filename as it grows (continuity beats churn). A cluster claims the shelf it
 // overlaps most, needing >= half the smaller side; leftovers become new shelves;
@@ -557,15 +662,17 @@ function createKeeper(ctx) {
   /**
    * One bounded pass. Returns a receipt {processed, edges, firstLights,
    * shelvesWritten, shelvesArchived, thoughts, contradictions, nearDups,
-   * prunedEdges, snapshotTaken, at} — every number in it re-derives from the
-   * rows this tick wrote.
+   * prunedEdges, snapshotTaken, mannerMismatches, componentsDecomposed,
+   * oversizedComponentsFlagged, undecomposableGroups, at} — every number in it
+   * re-derives from the rows this tick wrote.
    */
   async function tick({ batch = QUEUE_BATCH } = {}) {
     const now = ts();
     const receipt = {
       at: now, processed: 0, firstLights: 0, shelvesWritten: 0, shelvesArchived: 0,
       thoughts: 0, contradictions: 0, nearDups: 0, prunedEdges: 0, snapshotTaken: false,
-      mannerMismatches: 0,
+      mannerMismatches: 0, componentsDecomposed: 0, oversizedComponentsFlagged: 0,
+      undecomposableGroups: 0,
     };
 
     // Plan the tick's write volume and run the snapshot guard BEFORE the first
@@ -609,7 +716,41 @@ function createKeeper(ctx) {
     // edge that never grows past two members is exactly the case MIN_SHELF
     // was designed to exclude from shelving, not to drop on the floor.
     const allComponents = components(await _strictEdges());
-    const clusters = allComponents.filter((c) => c.length >= MIN_SHELF);
+
+    // Whole-component cohesion gate (0.26.0). A component big enough for
+    // single-linkage chaining to have dragged in unrelated memories
+    // (> SHELF_COHESION_MIN_SIZE) only binds as one shelf if its whole-set mean
+    // pairwise distance clears SHELF_COHESION_CEILING; otherwise it is broken
+    // into sub-groups that each clear SHELF_DECOMPOSE_CEILING on their own whole
+    // mean. Small components bind exactly as before. Crisis rows are dropped
+    // from the GROUPING math here (their vectors would skew a mean or bridge
+    // two sub-groups), but the render loop below still re-fetches and
+    // re-filters crisis content immediately before it writes — that, not this
+    // pass, is elifant#17's shelving-override guarantee.
+    const clusters = [];       // string[][] — feeds matchClusters + the render loop unchanged
+    const recoveredPairs = []; // 2-member groups pulled back out by decomposition → the pair pass
+    for (const comp of allComponents) {
+      if (comp.length < MIN_SHELF) continue;
+      if (exceedsCohesionCap(comp.length)) { receipt.oversizedComponentsFlagged++; continue; }
+      const det = await _memberDetails(comp);
+      const grouping = det.filter((d) => !crisisMatch(d.content) && d.vec != null);
+      if (grouping.length < MIN_SHELF) { clusters.push(comp); continue; }
+      const names = grouping.map((d) => d.filename);
+      if (names.length <= SHELF_COHESION_MIN_SIZE) { clusters.push(comp); continue; }
+      const vecByName = new Map(grouping.map((d) => [d.filename, _parseVec(d.vec)]));
+      if (meanPairwiseCohesion(names, vecByName) <= SHELF_COHESION_CEILING) { clusters.push(comp); continue; }
+      receipt.componentsDecomposed++;
+      for (const g of cohesiveSubclusters(names, vecByName, SHELF_DECOMPOSE_CEILING)) {
+        if (g.length >= MIN_SHELF) {
+          if (meanPairwiseCohesion(g, vecByName) > SHELF_COHESION_CEILING) { receipt.undecomposableGroups++; continue; }
+          clusters.push(g);
+        } else if (g.length === 2) {
+          recoveredPairs.push([...g].sort());
+        }
+        // singletons: dropped — same honest silence as an isolated node today
+      }
+    }
+
     const shelves = await _liveShelves();
     const { clusterMatched, shelfTaken } = matchClusters(clusters, shelves);
     const shelfByName = new Map(shelves.map((s) => [s.filename, s]));
@@ -714,7 +855,11 @@ function createKeeper(ctx) {
     // would mean a pair of similar notes could climb toward pinned knowledge
     // on its own, which is a bigger call than either issue's acceptance
     // criterion asks for.
-    const pairClusters = allComponents.filter((c) => c.length === 2);
+    // Native 2-member components, plus any pair the cohesion gate pulled back
+    // out of an incoherent component it decomposed (0.26.0) — a near-dup or
+    // contradiction that single-linkage had buried inside a mega-component is
+    // exactly what elifant#6/#7 want to surface, not lose.
+    const pairClusters = allComponents.filter((c) => c.length === 2).concat(recoveredPairs);
     const priorPairLedger = await _pairLedger();
     const nextPairLedger = {};
     for (const [a, b] of pairClusters) {
@@ -843,6 +988,11 @@ module.exports = {
   components,
   matchClusters,
   parseVec: _parseVec,
+  // 0.26.0 — shelf-cohesion gate: pure helpers, exported for the test suite
+  cosDist: _cosDist,
+  meanPairwiseCohesion,
+  cohesiveSubclusters,
+  exceedsCohesionCap,
   // elifant#6/#7 — near-dup/contradiction pair detection, pure and order-independent
   pairKey,
   hasNegation,
@@ -853,7 +1003,10 @@ module.exports = {
   confirmedDupSlug,
   SHELVING_VIA,
   PAIR_LEDGER_KEY,
-  FLOORS: { NEIGHBOUR_K, EDGE_KEEP_FLOOR, SHELF_EDGE_FLOOR, SHELF_BIND_FLOOR, MIN_SHELF, FIRST_LIGHT_MIN_CORPUS },
+  FLOORS: {
+    NEIGHBOUR_K, EDGE_KEEP_FLOOR, SHELF_EDGE_FLOOR, SHELF_BIND_FLOOR, MIN_SHELF, FIRST_LIGHT_MIN_CORPUS,
+    SHELF_COHESION_MIN_SIZE, SHELF_COHESION_CEILING, SHELF_DECOMPOSE_CEILING, MAX_COHESION_COMPONENT_SIZE,
+  },
   // elifant#15 — manner-mismatch notice: pure helper + the tunables/ids a test
   // needs to assert against without hardcoding this file's internals twice.
   mannerMismatchPrompt,
